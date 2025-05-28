@@ -2,7 +2,7 @@
 Artefakt DAQ Application Package
 """
 
-__version__ = "0.2.0"
+__version__ = "1.0.1"
 __author__ = "artefact"
 __description__ = "Data Acquisition System for Laboratory Equipment"
 __license__ = "Proprietary"
@@ -10,7 +10,7 @@ __license__ = "Proprietary"
 # Version components for programmatic access
 VERSION_MAJOR = 1
 VERSION_MINOR = 0
-VERSION_PATCH = 0
+VERSION_PATCH = 1
 VERSION_BUILD = None  # For development builds
 
 def get_version_string():
