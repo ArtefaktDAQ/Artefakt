@@ -2,14 +2,14 @@
 Artefakt DAQ Application Package
 """
 
-__version__ = "1.0.1"
-__author__ = "artefact"
+__version__ = "0.2.1"
+__author__ = "Artefakt"
 __description__ = "Data Acquisition System for Laboratory Equipment"
 __license__ = "Proprietary"
 
 # Version components for programmatic access
-VERSION_MAJOR = 1
-VERSION_MINOR = 0
+VERSION_MAJOR = 0
+VERSION_MINOR = 2
 VERSION_PATCH = 1
 VERSION_BUILD = None  # For development builds
 

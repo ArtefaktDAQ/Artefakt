@@ -33,24 +33,30 @@ You can use Artefakt DAQ in two ways: as a standalone executable or by running f
 ### Option 1: Standalone Executable (Recommended for End Users)
 
 #### Download and Setup
-1. Download the latest `Artefakt_DAQ.exe` from the releases section
+**Note: Releases are coming soon! For now, please use Option 2 below to run from source code.**
+
+Once releases are available:
+1. Download the latest `Artefakt_DAQ_vX.X.X.exe` from the [releases section](https://github.com/ArtefaktDAQ/Artefakt/releases)
 2. Create a folder for the application (e.g., `C:\Artefakt_DAQ\`)
 3. Place the executable in this folder
+4. Double-click `Artefakt_DAQ_vX.X.X.exe` to launch
 
-#### Option 1: Run Artefakt_DAQ.exe
-Double-click `Artefakt_DAQ.exe` to launch
-
-### Option 2: Running from Source Code
+### Option 2: Running from Source Code (Currently Required)
 
 #### 1. Clone the Repository
 ```bash
-git clone <repository-url>
-cd "EvoLabs DAQ PY"
+git clone https://github.com/ArtefaktDAQ/Artefakt.git
+cd Artefakt
 ```
 
 #### 2. Install Python Dependencies
 ```bash
 pip install -r requirements.txt
+```
+
+#### 3. Run the Application
+```bash
+python main.py
 ```
 
 ## Additional Software
