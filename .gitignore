@@ -1,0 +1,147 @@
+# Artefakt DAQ - Git Ignore File
+# Files and directories that should NOT be published to GitHub
+
+# ============================================================================
+# SENSITIVE / PRIVATE FILES
+# ============================================================================
+
+# Development and build scripts (keep private)
+build.py
+release.py
+github_release.py
+quick_build.bat
+create_release.bat
+VERSION_MANAGEMENT.md
+DEVELOPMENT_WORKFLOW.md
+RELEASE_NOTES_TEMPLATE.md
+
+# Configuration files with sensitive data
+config.ini
+settings.json
+virtual_sensors.json
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Log files with potentially sensitive information
+*.log
+logs/
+debug.log
+
+# ============================================================================
+# BUILD ARTIFACTS (Generated files)
+# ============================================================================
+
+# PyInstaller build outputs
+dist/
+build/
+*.spec
+
+# Release packages
+release_v*/
+*_Release.zip
+version_info.txt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Virtual environments
+venv/
+env/
+test_env/
+.env
+
+# ============================================================================
+# DEVELOPMENT FILES
+# ============================================================================
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Test files and data
+test_data/
+sample_data/
+*.test
+
+# Documentation drafts
+NOTES.md
+TODO.md
+PRIVATE_NOTES.md
+
+# ============================================================================
+# SYSTEM FILES
+# ============================================================================
+
+# Windows
+desktop.ini
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+
+# ============================================================================
+# PROJECT SPECIFIC
+# ============================================================================
+
+# Large binary files
+*.msi
+*.dmg
+
+
+# Hardware-specific configurations
+device_configs/
+calibration_data/
+
+# User data and projects
+user_projects/
+saved_sessions/
+exports/
+
+# Backup files
+*.bak
+*.backup
+backup/
+
+# ============================================================================
+# OPTIONAL: Uncomment if needed
+# ============================================================================
+
+# Uncomment to hide specific source files:
+# app/sensitive_module.py
+# app/proprietary/
+
+# Uncomment to hide assets:
+# assets/proprietary_logos/
+# assets/licensed_content/
+
+# Uncomment to hide documentation:
+# docs/internal/
+# README_INTERNAL.md 

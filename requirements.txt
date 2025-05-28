@@ -1,0 +1,13 @@
+PyQt6>=6.7.0
+pyserial>=3.5
+numpy>=1.23.0
+opencv-python>=4.7.0
+pyqtdarktheme>=2.1.0
+pyqtgraph>=0.13.1
+pandas>=1.5.0,<2.0.0
+scipy>=1.9.0
+matplotlib>=3.6.0
+LabJackPython>=2.1.0  # For LabJack U3, U6, UE9 devices
+labjack-ljm>=1.22.0 # For LabJack T-series devices (T4, T7)
+ffmpeg-python>=0.2.0  # For reliable video encoding
+ndi-python>=5.1.0  # For NDI video streaming (requires NDI SDK installed separately) 
