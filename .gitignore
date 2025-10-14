@@ -85,6 +85,7 @@ tmp/
 test_data/
 sample_data/
 *.test
+test_client.py
 
 # Documentation drafts
 NOTES.md

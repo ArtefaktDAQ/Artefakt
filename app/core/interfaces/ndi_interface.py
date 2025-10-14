@@ -41,7 +41,7 @@ except ImportError:
 
 class NDIInterface:
     """Handles NDI video output streaming."""
-    def __init__(self, source_name="EvoLabs DAQ", width=1280, height=720, fps=30):
+    def __init__(self, source_name="Artefakt DAQ", width=1280, height=720, fps=30):
         self.source_name = source_name
         self.width = width
         self.height = height

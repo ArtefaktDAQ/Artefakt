@@ -83,6 +83,7 @@ class GraphController:
         if hasattr(self.main_window, 'update_graph'):
             self.main_window.update_graph()
             # --- Ensure all lines have the correct line width after update ---
+            # Preserve pen style (dashed/solid) when updating width
             if hasattr(self.main_window, 'plot_line_width') and hasattr(self.main_window, 'graph_widget'):
                 line_width = self.main_window.plot_line_width.value()
                 for item in self.main_window.graph_widget.listDataItems():
@@ -90,10 +91,13 @@ class GraphController:
                     if pen is not None:
                         if isinstance(pen, str):
                             color = pen
+                            style = pg.QtCore.Qt.PenStyle.SolidLine
                         else:
                             color = pen.color()
+                            # Preserve the pen style (dashed, solid, etc.)
+                            style = pen.style()
                         if hasattr(item, "setPen"):
-                            item.setPen(pg.mkPen(color=color, width=line_width))
+                            item.setPen(pg.mkPen(color=color, width=line_width, style=style))
 
     def update_dashboard_graph(self):
         """Update the dashboard graph"""
@@ -505,7 +509,26 @@ class GraphController:
             print(f"WARNING GRAPH: Unknown timespan unit after regex match: {unit}")
             return None
 
-    def update_specific_graph(self, graph_widget, primary_sensor_key, secondary_sensor_key, timespan, graph_type, multi_sensor_keys, window_size, histogram_bins, is_main_graph=False):
+    def _get_sensor_display_name(self, sensor_key):
+        """
+        Get display name for a sensor, handling both regular and control sensors.
+        
+        Args:
+            sensor_key: Sensor key (may have '_ctrl' suffix for control sensors)
+            
+        Returns:
+            Display name for the sensor
+        """
+        if sensor_key.endswith('_ctrl'):
+            # Control sensor - strip _ctrl suffix and add (Control) label
+            base_key = sensor_key[:-5]  # Remove '_ctrl'
+            return f"{base_key} (Control)"
+        else:
+            # Regular sensor - use sensor controller to get name
+            name = self.main_window.sensor_controller.get_sensor_name_by_historical_key(sensor_key)
+            return name if name else sensor_key
+    
+    def update_specific_graph(self, graph_widget, primary_sensor_key, secondary_sensor_key, timespan, graph_type, multi_sensor_keys, window_size, histogram_bins, is_main_graph=False, show_control_run=False, control_run_data=None):
         """Update a specific graph widget based on selected parameters using historical keys."""
         if not graph_widget:
             self.main_window.logger.error("update_specific_graph called with invalid graph_widget")
@@ -516,8 +539,8 @@ class GraphController:
             return
             
         # Use sensor controller to get display names from keys for logging/titles
-        primary_sensor_name = self.main_window.sensor_controller.get_sensor_name_by_historical_key(primary_sensor_key) if primary_sensor_key else "None"
-        secondary_sensor_name = self.main_window.sensor_controller.get_sensor_name_by_historical_key(secondary_sensor_key) if secondary_sensor_key else "None"
+        primary_sensor_name = self._get_sensor_display_name(primary_sensor_key) if primary_sensor_key else "None"
+        secondary_sensor_name = self._get_sensor_display_name(secondary_sensor_key) if secondary_sensor_key else "None"
         
         self.main_window.logger.info(f"Updating graph: Type='{graph_type}', Primary='{primary_sensor_name}' (key:{primary_sensor_key}), Timespan='{timespan}'")
 
@@ -579,22 +602,73 @@ class GraphController:
         # Debug logging for required sensor keys
         print(f"DEBUG GRAPH: Required sensor keys for graph: {required_sensor_keys}")
         
+        # Separate control sensor keys (ending with _ctrl) from regular keys
+        control_sensor_keys = [k for k in required_sensor_keys if k.endswith('_ctrl')]
+        regular_sensor_keys = [k for k in required_sensor_keys if not k.endswith('_ctrl')]
+        
+        if control_sensor_keys:
+            print(f"DEBUG GRAPH: Control sensor keys: {control_sensor_keys}")
+        if regular_sensor_keys:
+            print(f"DEBUG GRAPH: Regular sensor keys: {regular_sensor_keys}")
+        
         # Check for any OtherSerial sensors in the required keys
-        other_serial_keys = [k for k in required_sensor_keys if 'other_serial' in k]
+        other_serial_keys = [k for k in regular_sensor_keys if 'other_serial' in k]
         if other_serial_keys:
-            print(f"DEBUG GRAPH: OtherSerial sensors in required keys: {other_serial_keys}")
+            print(f"DEBUG GRAPH: OtherSerial sensors in regular keys: {other_serial_keys}")
         
         # Fetch data (assuming a method in DataCollectionController)
         try:
-            # This method needs to exist and return data in a suitable format, 
-            # e.g., {sensor_id: {'time': [t1, t2,...], 'value': [v1, v2,...]}}
-            historical_data = self.main_window.data_collection_controller.get_historical_data(
-                sensor_ids=required_sensor_keys, # Use KEYS here
-                timespan_seconds=timespan_seconds
-            )
+            # Fetch current/historical data for regular sensors
+            data_to_plot = {}
+            if regular_sensor_keys:
+                data_to_plot = self.main_window.data_collection_controller.get_historical_data(
+                    sensor_ids=regular_sensor_keys,
+                    timespan_seconds=timespan_seconds
+                )
+                print(f"DEBUG GRAPH: Fetched {len(data_to_plot)} regular sensors")
+            
+            # Handle control sensors
+            if control_sensor_keys:
+                if control_run_data is None:
+                    # Control sensors selected but no control run data available
+                    if hasattr(self.main_window, 'logger'):
+                        self.main_window.logger.warning(f"Control sensors selected but no control run configured or loaded")
+                    print(f"WARNING GRAPH: Control sensors selected ({control_sensor_keys}) but no control run data available")
+                else:
+                    # Add control run data for control sensors
+                    if hasattr(self.main_window, 'logger'):
+                        self.main_window.logger.debug(f"Adding control run data for {len(control_sensor_keys)} control sensors")
+                    
+                    for ctrl_key in control_sensor_keys:
+                        if ctrl_key in control_run_data:
+                            # Apply timespan filter if needed
+                            ctrl_data = control_run_data[ctrl_key]
+                            if timespan_seconds is not None and len(ctrl_data['time']) > 0:
+                                # Filter data to only include points within timespan
+                                # numpy is already imported at the top of the file
+                                times = np.array(ctrl_data['time'])
+                                values = np.array(ctrl_data['value'])
+                                max_time = times[-1] if len(times) > 0 else 0
+                                min_time = max_time - timespan_seconds
+                                mask = times >= min_time
+                                data_to_plot[ctrl_key] = {
+                                    'time': times[mask].tolist(),
+                                    'value': values[mask].tolist()
+                                }
+                            else:
+                                # No timespan filter, use all data
+                                data_to_plot[ctrl_key] = {
+                                    'time': ctrl_data['time'].copy() if isinstance(ctrl_data['time'], list) else ctrl_data['time'].tolist(),
+                                    'value': ctrl_data['value'].copy() if isinstance(ctrl_data['value'], list) else ctrl_data['value'].tolist()
+                                }
+                            if hasattr(self.main_window, 'logger'):
+                                self.main_window.logger.debug(f"Added control data for '{ctrl_key}': {len(data_to_plot[ctrl_key]['time'])} points")
+                        else:
+                            if hasattr(self.main_window, 'logger'):
+                                self.main_window.logger.warning(f"Control sensor '{ctrl_key}' not found in control run data")
             
             # Debug any OtherSerial data retrieved
-            for key, data in historical_data.items():
+            for key, data in data_to_plot.items():
                 if 'other_serial' in key:
                     print(f"DEBUG GRAPH: Found OtherSerial data for key '{key}': {len(data['time'])} points")
                     if len(data['time']) > 0:
@@ -609,7 +683,7 @@ class GraphController:
             graph_widget.setTitle("Error fetching data")
             return
 
-        if not historical_data:
+        if not data_to_plot:
             graph_widget.setTitle(f"No data available for selected sensors/timespan")
             self.main_window.logger.warning(f"No historical data returned for keys: {required_sensor_keys}, timespan: {timespan}")
             return
@@ -617,7 +691,7 @@ class GraphController:
         # Apply current formatting settings before plotting
         self.apply_plot_formatting() 
 
-        # --- Plotting Logic --- 
+        # --- Plotting Logic ---
         try:
             if graph_type == "Standard Time Series":
                 graph_widget.setTitle(f"Time Series - Timespan: {timespan}")
@@ -627,25 +701,58 @@ class GraphController:
                 sensors_keys_to_plot = list(set(filter(None, sensors_keys_to_plot))) # Unique, non-empty keys
                 
                 for sensor_key in sensors_keys_to_plot:
-                    if sensor_key in historical_data and len(historical_data[sensor_key]['time']) > 0:
-                        data = historical_data[sensor_key]
+                    if sensor_key in data_to_plot and len(data_to_plot[sensor_key]['time']) > 0:
+                        data = data_to_plot[sensor_key]
                         times = np.array(data['time'], dtype=float)
                         values = np.array(data['value'], dtype=float)
-                        sensor_name = self.main_window.sensor_controller.get_sensor_name_by_historical_key(sensor_key)
-                        sensor_obj = self.main_window.sensor_controller.get_sensor_by_name(sensor_name)
-                        color = getattr(sensor_obj, 'color', '#FFFFFF') if sensor_obj else '#FFFFFF'
-                        pen = pg.mkPen(color=color, width=getattr(self.main_window, 'plot_line_width_value', 2))
+                        
+                        # Get sensor display name
+                        sensor_name = self._get_sensor_display_name(sensor_key)
+                        
+                        # Determine if this is a control sensor
+                        is_control = sensor_key.endswith('_ctrl')
+                        
+                        # Get color - for control sensors, try to match the color of the corresponding current sensor
+                        if is_control:
+                            # Strip _ctrl and find matching sensor
+                            base_key = sensor_key[:-5]
+                            base_sensor_obj = self.main_window.sensor_controller.get_sensor_by_historical_key(base_key)
+                            color = getattr(base_sensor_obj, 'color', '#FFFFFF') if base_sensor_obj else '#FFFFFF'
+                        else:
+                            # Regular sensor
+                            sensor_obj = self.main_window.sensor_controller.get_sensor_by_historical_key(sensor_key)
+                            color = getattr(sensor_obj, 'color', '#FFFFFF') if sensor_obj else '#FFFFFF'
+                        
+                        # Create pen - dashed for control sensors, solid for regular sensors
+                        line_width = getattr(self.main_window, 'plot_line_width_value', 2)
+                        if is_control:
+                            pen = pg.mkPen(color=color, width=line_width, style=pg.QtCore.Qt.PenStyle.DashLine)
+                        else:
+                            pen = pg.mkPen(color=color, width=line_width)
+                        
                         # --- Append latest value to legend ---
                         value_str = "N/A"
-                        if sensor_obj is not None:
-                            if len(values) > 0:
-                                try:
-                                    value_str = f"{values[-1]:.2f}"
-                                except Exception:
-                                    value_str = str(values[-1])
-                            unit = getattr(sensor_obj, 'unit', None)
+                        if len(values) > 0:
+                            try:
+                                value_str = f"{values[-1]:.2f}"
+                            except Exception:
+                                value_str = str(values[-1])
+                            
+                            # Try to get unit - for control sensors, look up the base sensor
+                            unit = None
+                            if is_control:
+                                base_key = sensor_key[:-5]
+                                base_sensor_obj = self.main_window.sensor_controller.get_sensor_by_historical_key(base_key)
+                                if base_sensor_obj:
+                                    unit = getattr(base_sensor_obj, 'unit', None)
+                            else:
+                                sensor_obj = self.main_window.sensor_controller.get_sensor_by_historical_key(sensor_key)
+                                if sensor_obj:
+                                    unit = getattr(sensor_obj, 'unit', None)
+                            
                             if unit:
                                 value_str = f"{value_str} {unit}"
+                        
                         legend_name = f"{sensor_name} ({value_str})"
                         graph_widget.plot(times, values, pen=pen, name=legend_name)
                     else:
@@ -654,9 +761,9 @@ class GraphController:
             elif graph_type == "Temperature Difference":
                 graph_widget.setTitle(f"Temperature Difference ({primary_sensor_name} - {secondary_sensor_name}) - Timespan: {timespan}")
                 graph_widget.setLabel('left', 'Difference (°C or unit)')
-                if primary_sensor_key and secondary_sensor_key and primary_sensor_key in historical_data and secondary_sensor_key in historical_data:
-                    data1 = historical_data[primary_sensor_key]
-                    data2 = historical_data[secondary_sensor_key]
+                if primary_sensor_key and secondary_sensor_key and primary_sensor_key in data_to_plot and secondary_sensor_key in data_to_plot:
+                    data1 = data_to_plot[primary_sensor_key]
+                    data2 = data_to_plot[secondary_sensor_key]
                     
                     # Ensure data is numerical numpy arrays
                     t1 = np.array(data1['time'], dtype=float)
@@ -686,8 +793,8 @@ class GraphController:
             elif graph_type == "Rate of Change (dT/dt)":
                 graph_widget.setTitle(f"Rate of Change ({primary_sensor_name}) - Timespan: {timespan}")
                 graph_widget.setLabel('left', 'Rate (unit/s)')
-                if primary_sensor_key and primary_sensor_key in historical_data and len(historical_data[primary_sensor_key]['time']) > 1:
-                    data = historical_data[primary_sensor_key]
+                if primary_sensor_key and primary_sensor_key in data_to_plot and len(data_to_plot[primary_sensor_key]['time']) > 1:
+                    data = data_to_plot[primary_sensor_key]
                     # Ensure data is numerical numpy arrays
                     times = np.array(data['time'], dtype=float)
                     values = np.array(data['value'], dtype=float)
@@ -702,8 +809,8 @@ class GraphController:
             elif graph_type == "Moving Average":
                 graph_widget.setTitle(f"Moving Average ({primary_sensor_name}, Window: {window_size}) - Timespan: {timespan}")
                 graph_widget.setLabel('left', 'Smoothed Value')
-                if primary_sensor_key and primary_sensor_key in historical_data and window_size is not None and window_size > 1 and len(historical_data[primary_sensor_key]['time']) >= window_size:
-                    data = historical_data[primary_sensor_key]
+                if primary_sensor_key and primary_sensor_key in data_to_plot and window_size is not None and window_size > 1 and len(data_to_plot[primary_sensor_key]['time']) >= window_size:
+                    data = data_to_plot[primary_sensor_key]
                     # Ensure data is numerical numpy arrays
                     times = np.array(data['time'], dtype=float)
                     values = np.array(data['value'], dtype=float)
@@ -778,8 +885,8 @@ class GraphController:
                 graph_widget.setLabel('bottom', 'Frequency (Hz)')
                 graph_widget.setLabel('left', 'Amplitude')
                 legend.setVisible(False) # Legend not very useful for FFT
-                if primary_sensor_key and primary_sensor_key in historical_data and len(historical_data[primary_sensor_key]['time']) > 1:
-                    data = historical_data[primary_sensor_key]
+                if primary_sensor_key and primary_sensor_key in data_to_plot and len(data_to_plot[primary_sensor_key]['time']) > 1:
+                    data = data_to_plot[primary_sensor_key]
                     # Ensure data is numerical numpy arrays
                     times = np.array(data['time'], dtype=float)
                     values = np.array(data['value'], dtype=float)
@@ -809,9 +916,9 @@ class GraphController:
                 graph_widget.setLabel('bottom', 'Value Bins')
                 graph_widget.setLabel('left', 'Frequency')
                 legend.setVisible(False)
-                if primary_sensor_key and primary_sensor_key in historical_data and histogram_bins is not None and histogram_bins > 0 and len(historical_data[primary_sensor_key]['value']) > 0:
+                if primary_sensor_key and primary_sensor_key in data_to_plot and histogram_bins is not None and histogram_bins > 0 and len(data_to_plot[primary_sensor_key]['value']) > 0:
                     # Ensure data is numerical numpy arrays
-                    values = np.array(historical_data[primary_sensor_key]['value'], dtype=float)
+                    values = np.array(data_to_plot[primary_sensor_key]['value'], dtype=float)
                     
                     # Filter out NaN or inf values before histogramming
                     values = values[np.isfinite(values)]
@@ -843,8 +950,8 @@ class GraphController:
                 graph_widget.getAxis('left').setWidth(0) # Hide left axis ticks/line
                 graph_widget.getAxis('left').setStyle(showValues=False)
                 legend.setVisible(False)
-                if primary_sensor_key and primary_sensor_key in historical_data and len(historical_data[primary_sensor_key]['value']) > 0:
-                    values = np.array(historical_data[primary_sensor_key]['value'], dtype=float)
+                if primary_sensor_key and primary_sensor_key in data_to_plot and len(data_to_plot[primary_sensor_key]['value']) > 0:
+                    values = np.array(data_to_plot[primary_sensor_key]['value'], dtype=float)
                     values = values[np.isfinite(values)] # Filter NaNs/infs
 
                     if len(values) < 5: # Need at least a few points for meaningful stats
@@ -921,9 +1028,9 @@ class GraphController:
                 graph_widget.setLabel('bottom', f'{primary_sensor_name} Value')
                 graph_widget.setLabel('left', f'{secondary_sensor_name} Value')
                 legend.setVisible(False)
-                if primary_sensor_key and secondary_sensor_key and primary_sensor_key in historical_data and secondary_sensor_key in historical_data:
-                    data1 = historical_data[primary_sensor_key]
-                    data2 = historical_data[secondary_sensor_key]
+                if primary_sensor_key and secondary_sensor_key and primary_sensor_key in data_to_plot and secondary_sensor_key in data_to_plot:
+                    data1 = data_to_plot[primary_sensor_key]
+                    data2 = data_to_plot[secondary_sensor_key]
                     
                     # Ensure data is numerical numpy arrays
                     t1 = np.array(data1['time'], dtype=float)
@@ -970,8 +1077,31 @@ class GraphController:
             self.main_window.logger.error(traceback.format_exc())
             graph_widget.setTitle(f"Error plotting {graph_type}")
             
-        # Ensure autorange updates the view
-        graph_widget.enableAutoRange() 
+        # Set view range based only on regular (non-control) sensors
+        # This prevents control data from zooming out the view too much
+        if graph_type == "Standard Time Series" and data_to_plot:
+            # Collect time ranges only from non-control sensors
+            regular_times = []
+            for key in data_to_plot.keys():
+                if not key.endswith('_ctrl') and 'time' in data_to_plot[key]:
+                    regular_times.extend(data_to_plot[key]['time'])
+            
+            # If we have regular data, set range based on it
+            if regular_times:
+                min_time = min(regular_times)
+                max_time = max(regular_times)
+                # Add 5% padding for better visualization
+                time_range = max_time - min_time
+                padding = time_range * 0.05 if time_range > 0 else 1
+                graph_widget.setXRange(min_time - padding, max_time + padding, padding=0)
+                # Enable autorange only for Y axis
+                graph_widget.enableAutoRange(axis='y')
+            else:
+                # No regular data, use standard autorange
+                graph_widget.enableAutoRange()
+        else:
+            # For other graph types, use standard autorange
+            graph_widget.enableAutoRange() 
     
     def apply_plot_formatting(self):
         """Apply plot formatting based on settings"""
@@ -996,15 +1126,19 @@ class GraphController:
                 line_width
             )
             # Update line width for all existing plots on the main graph
+            # Preserve pen style (dashed/solid) when updating width
             for item in self.main_window.graph_widget.listDataItems():
                 pen = item.opts.get('pen', None)
                 if pen is not None:
                     if isinstance(pen, str):
                         color = pen
+                        style = pg.QtCore.Qt.PenStyle.SolidLine
                     else:
                         color = pen.color()
+                        # Preserve the pen style (dashed, solid, etc.)
+                        style = pen.style()
                     if hasattr(item, "setPen"):
-                        item.setPen(pg.mkPen(color=color, width=line_width))
+                        item.setPen(pg.mkPen(color=color, width=line_width, style=style))
             # Log the change
             if hasattr(self.main_window, 'logger'):
                 self.main_window.logger.log(f"Applied plot formatting: {style_preset}, size {font_size}pt, width {line_width}px")
@@ -1037,16 +1171,20 @@ class GraphController:
                 line_width
             )
             # Also update line width for all existing plots
+            # Preserve pen style (dashed/solid) when updating width
             for plot_info in self.dashboard_plot_data.values():
                 if 'plot_item' in plot_info and plot_info['plot_item'] is not None:
                     pen = plot_info['plot_item'].opts.get('pen', None)
                     if pen is not None:
                         if isinstance(pen, str):
                             color = pen
+                            style = pg.QtCore.Qt.PenStyle.SolidLine
                         else:
                             color = pen.color()
+                            # Preserve the pen style (dashed, solid, etc.)
+                            style = pen.style()
                         if hasattr(plot_info['plot_item'], "setPen"):
-                            plot_info['plot_item'].setPen(pg.mkPen(color=color, width=line_width))
+                            plot_info['plot_item'].setPen(pg.mkPen(color=color, width=line_width, style=style))
         except Exception as e:
             if hasattr(self.main_window, 'logger'):
                 self.main_window.logger.log(f"Error applying dashboard plot formatting: {str(e)}")
@@ -1126,6 +1264,12 @@ class GraphController:
             
     def start_main_graph_live_update(self):
         """Starts the timer for live updating the main graph."""
+        # Check if the live update checkbox is checked
+        if hasattr(self.main_window, 'graph_live_update_checkbox') and not self.main_window.graph_live_update_checkbox.isChecked():
+            self.main_window.logger.info("Main graph live update not started: checkbox is not checked")
+            print("Main graph live update not started: checkbox is not checked")
+            return
+            
         # Set timer interval to match sampling interval, but not faster than 1s
         update_interval_ms = 1500
         if hasattr(self.main_window, 'sampling_rate_spinbox'):
@@ -1137,7 +1281,7 @@ class GraphController:
             if not self.main_graph_update_timer.isActive():
                 self.main_window.logger.info(f"Starting main graph live update timer (interval: {update_interval_ms} ms).")
                 # Trigger an immediate update first
-                self.update_graph() 
+                self.update_graph()
                 self.main_graph_update_timer.start()
             else:
                 self.main_window.logger.info(f"Main graph live update timer already active. Updating interval to {update_interval_ms} ms.")
@@ -1158,12 +1302,23 @@ class GraphController:
             if self.main_window.graph_live_update_checkbox.isChecked():
                 # Only start if data collection is active
                 if hasattr(self.main_window, 'data_collection_controller') and self.main_window.data_collection_controller.collecting_data:
-                    self.start_main_graph_live_update()
+                    # Check if timer is already active to avoid restarting it unnecessarily
+                    if not self.main_graph_update_timer.isActive():
+                        self.start_main_graph_live_update()
+                        print("DEBUG: Started main graph live update timer from ensure_main_graph_live_update")
+                    else:
+                        # Timer is already active, just update the interval if needed
+                        update_interval_ms = 1500
+                        if hasattr(self.main_window, 'sampling_rate_spinbox'):
+                            interval = self.main_window.sampling_rate_spinbox.value()
+                            update_interval_ms = max(int(interval * 1000), 1000)
+                        self.main_graph_update_timer.setInterval(update_interval_ms)
+                        print("DEBUG: Main graph live update timer already active, updated interval")
                 else:
                     self.main_window.logger.info(f"Main graph live update not started: data collection not active")
                     print(f"Main graph live update not started as data collection is not active")
             else:
-                self.stop_main_graph_live_update() 
+                self.stop_main_graph_live_update()
 
     def clear_graphs(self):
         """Clear all graphs and plot data buffers"""
@@ -1261,4 +1416,70 @@ class GraphController:
         
         # Set auto range so all data is visible
         graph_widget.autoRange()
-        print("DEBUG: Historical data plotting completed") 
+        print("DEBUG: Historical data plotting completed")
+    
+    def _merge_control_and_current_data(self, control_data, current_data, required_sensor_keys):
+        """
+        Merge control run data with current data for seamless visualization.
+        Both datasets are kept separate and will be plotted with different styles.
+        
+        Args:
+            control_data: Control run data in format {sensor_id: {'time': [...], 'value': [...]}}
+            current_data: Current data in format {sensor_id: {'time': [...], 'value': [...]}}
+            required_sensor_keys: List of sensor keys to include in the merged data
+            
+        Returns:
+            Merged data in the same format as input - contains all sensors from both datasets
+        """
+        if not control_data and not current_data:
+            return {}
+            
+        merged_data = {}
+        
+        # First, add all current data
+        for sensor_key, data in current_data.items():
+            merged_data[sensor_key] = {
+                'time': data['time'].copy() if isinstance(data['time'], list) else data['time'].tolist(),
+                'value': data['value'].copy() if isinstance(data['value'], list) else data['value'].tolist()
+            }
+        
+        # Then, add all control data (don't merge, keep separate so they can be plotted differently)
+        # Control data is already merged with current data in the time series
+        # We just need to ensure all sensors are available
+        for sensor_key in required_sensor_keys:
+            # If sensor exists only in control data, add it
+            if sensor_key in control_data and sensor_key not in merged_data:
+                ctrl_data = control_data[sensor_key]
+                if 'time' in ctrl_data and 'value' in ctrl_data:
+                    merged_data[sensor_key] = {
+                        'time': ctrl_data['time'].copy() if isinstance(ctrl_data['time'], list) else ctrl_data['time'].tolist(),
+                        'value': ctrl_data['value'].copy() if isinstance(ctrl_data['value'], list) else ctrl_data['value'].tolist()
+                    }
+            # If sensor exists in both, merge the time series
+            elif sensor_key in control_data and sensor_key in merged_data:
+                ctrl_data = control_data[sensor_key]
+                if 'time' in ctrl_data and 'value' in ctrl_data:
+                    # Convert to numpy arrays for easier manipulation
+                    ctrl_times = np.array(ctrl_data['time'], dtype=float)
+                    ctrl_values = np.array(ctrl_data['value'], dtype=float)
+                    cur_times = np.array(merged_data[sensor_key]['time'], dtype=float)
+                    cur_values = np.array(merged_data[sensor_key]['value'], dtype=float)
+                    
+                    # Combine and sort by time
+                    all_times = np.concatenate([ctrl_times, cur_times])
+                    all_values = np.concatenate([ctrl_values, cur_values])
+                    
+                    # Sort by time
+                    sort_indices = np.argsort(all_times)
+                    all_times = all_times[sort_indices]
+                    all_values = all_values[sort_indices]
+                    
+                    merged_data[sensor_key] = {
+                        'time': all_times.tolist(),
+                        'value': all_values.tolist()
+                    }
+                    
+                    if hasattr(self.main_window, 'logger'):
+                        self.main_window.logger.debug(f"Merged {len(all_times)} data points for sensor {sensor_key}")
+        
+        return merged_data

@@ -167,10 +167,31 @@ class SensorController(QObject):
             
     def toggle_sensor_in_graph(self, sensor, state):
         """Toggle sensor visibility in graphs"""
-        sensor.show_in_graph = state == Qt.CheckState.Checked
-        # Update graphs if necessary
+        # PyQt6 sends the integer value of CheckState, not the enum itself
+        # Checked = 2, Unchecked = 0
+        sensor.show_in_graph = int(state) == Qt.CheckState.Checked.value
+        
+        # Save the updated sensor configuration
+        self.save_sensors()
+        
+        # Update the main analysis graph
         if hasattr(self.main_window, 'update_graph'):
             self.main_window.update_graph()
+        
+        # Reinitialize the dashboard graph if data collection is active
+        if (hasattr(self.main_window, 'data_collection_controller') and 
+            hasattr(self.main_window.data_collection_controller, 'collecting_data') and
+            self.main_window.data_collection_controller.collecting_data):
+            
+            if (hasattr(self.main_window, 'graph_controller') and 
+                hasattr(self.main_window.graph_controller, 'live_plotting_active') and
+                self.main_window.graph_controller.live_plotting_active):
+                
+                # Reinitialize the dashboard with the updated sensor list
+                print(f"DEBUG: Reinitializing dashboard graph due to sensor toggle: {sensor.name}")
+                start_time = self.main_window.data_collection_controller.start_time
+                if start_time is not None:
+                    self.main_window.graph_controller.start_live_dashboard_update(start_time)
             
     def update_graph_sensor_dropdowns(self):
         """Update graph sensor dropdowns"""
@@ -180,12 +201,28 @@ class SensorController(QObject):
             self.main_window.graph_primary_sensor.clear()
             
             current_index_to_restore = -1
+            
+            # Add currently configured sensors
             for i, sensor in enumerate(self.sensors):
                 if sensor.enabled:  # Only add enabled sensors
                     historical_key = self.get_historical_buffer_key(sensor)
                     self.main_window.graph_primary_sensor.addItem(sensor.name, userData=historical_key)
                     if sensor.name == current_text:
                         current_index_to_restore = self.main_window.graph_primary_sensor.count() - 1 # Index of the just added item
+            
+            # Add sensors from control run if available and checkbox is checked
+            # Control sensors have '_ctrl' suffix, so they won't conflict with current sensors
+            show_control = False
+            if hasattr(self.main_window, 'show_control_run_checkbox'):
+                show_control = self.main_window.show_control_run_checkbox.isChecked()
+            
+            if show_control and hasattr(self.main_window, 'control_run_controller'):
+                control_sensors = self.main_window.control_run_controller.get_control_run_sensors()
+                for sensor_key, sensor_name in control_sensors:
+                    display_name = f"{sensor_name} (Control)"
+                    self.main_window.graph_primary_sensor.addItem(display_name, userData=sensor_key)
+                    if display_name == current_text:
+                        current_index_to_restore = self.main_window.graph_primary_sensor.count() - 1
                     
             # Try to restore the previously selected sensor
             if current_index_to_restore != -1:
@@ -199,11 +236,27 @@ class SensorController(QObject):
             self.main_window.graph_secondary_sensor.clear()
             
             current_index_to_restore = -1
+            
+            # Add currently configured sensors
             for i, sensor in enumerate(self.sensors):
                 if sensor.enabled:  # Only add enabled sensors
                     historical_key = self.get_historical_buffer_key(sensor)
                     self.main_window.graph_secondary_sensor.addItem(sensor.name, userData=historical_key)
                     if sensor.name == current_text:
+                        current_index_to_restore = self.main_window.graph_secondary_sensor.count() - 1
+            
+            # Add sensors from control run if available and checkbox is checked
+            # Control sensors have '_ctrl' suffix, so they won't conflict with current sensors
+            show_control = False
+            if hasattr(self.main_window, 'show_control_run_checkbox'):
+                show_control = self.main_window.show_control_run_checkbox.isChecked()
+            
+            if show_control and hasattr(self.main_window, 'control_run_controller'):
+                control_sensors = self.main_window.control_run_controller.get_control_run_sensors()
+                for sensor_key, sensor_name in control_sensors:
+                    display_name = f"{sensor_name} (Control)"
+                    self.main_window.graph_secondary_sensor.addItem(display_name, userData=sensor_key)
+                    if display_name == current_text:
                         current_index_to_restore = self.main_window.graph_secondary_sensor.count() - 1
                     
             # Try to restore the previously selected sensor
@@ -227,6 +280,8 @@ class SensorController(QObject):
             self.main_window.multi_sensor_list.clear()
             
             items_to_reselect = []
+            
+            # Add currently configured sensors
             for sensor in self.sensors:
                 if sensor.enabled:  # Only add enabled sensors
                     historical_key = self.get_historical_buffer_key(sensor)
@@ -234,6 +289,22 @@ class SensorController(QObject):
                     item.setData(Qt.ItemDataRole.UserRole, historical_key)
                     self.main_window.multi_sensor_list.addItem(item)
                     if historical_key in selected_keys:
+                        items_to_reselect.append(item)
+            
+            # Add sensors from control run if available and checkbox is checked
+            # Control sensors have '_ctrl' suffix, so they won't conflict with current sensors
+            show_control = False
+            if hasattr(self.main_window, 'show_control_run_checkbox'):
+                show_control = self.main_window.show_control_run_checkbox.isChecked()
+            
+            if show_control and hasattr(self.main_window, 'control_run_controller'):
+                control_sensors = self.main_window.control_run_controller.get_control_run_sensors()
+                for sensor_key, sensor_name in control_sensors:
+                    display_name = f"{sensor_name} (Control)"
+                    item = QListWidgetItem(display_name)
+                    item.setData(Qt.ItemDataRole.UserRole, sensor_key)
+                    self.main_window.multi_sensor_list.addItem(item)
+                    if sensor_key in selected_keys:
                         items_to_reselect.append(item)
             
             # Reselect items that were selected before
@@ -722,6 +793,21 @@ class SensorController(QObject):
                 if hasattr(self.main_window, 'update_status_indicators'):
                     self.main_window.update_status_indicators()
                 
+                # Reinitialize the dashboard graph if data collection is active
+                if (hasattr(self.main_window, 'data_collection_controller') and 
+                    hasattr(self.main_window.data_collection_controller, 'collecting_data') and
+                    self.main_window.data_collection_controller.collecting_data):
+                    
+                    if (hasattr(self.main_window, 'graph_controller') and 
+                        hasattr(self.main_window.graph_controller, 'live_plotting_active') and
+                        self.main_window.graph_controller.live_plotting_active):
+                        
+                        # Reinitialize the dashboard with the updated sensor list
+                        print(f"DEBUG: Reinitializing dashboard graph due to sensor addition: {new_sensor.name}")
+                        start_time = self.main_window.data_collection_controller.start_time
+                        if start_time is not None:
+                            self.main_window.graph_controller.start_live_dashboard_update(start_time)
+                
             # After adding, emit the status changed signal
             self.status_changed.emit()
             return True
@@ -917,6 +1003,9 @@ class SensorController(QObject):
                 # Replace the old sensor with the updated one
                 self.sensors[row] = updated_sensor
                 
+                # Save the updated sensor configuration
+                self.save_sensors()
+                
                 # Update the UI
                 self.update_sensor_table()
                 
@@ -1096,6 +1185,9 @@ class SensorController(QObject):
                     
                     # Replace the old sensor with the updated one
                     self.sensors[row] = updated_sensor
+                    
+                    # Save the updated sensor configuration
+                    self.save_sensors()
                 
                 # Update the UI
                 self.update_sensor_table()
@@ -1126,6 +1218,7 @@ class SensorController(QObject):
                     # Save
                     if hasattr(self.main_window, 'save_virtual_sensors'):
                         self.main_window.save_virtual_sensors()
+                    self.save_sensors()
                     self.update_sensor_table()
                     self.status_changed.emit()
                     self.main_window.logger.log(f"Updated OtherSerial sensor: {updated_sensor_dict['name']}")
@@ -1275,6 +1368,21 @@ class SensorController(QObject):
                 self.main_window.other_sensors = [vs for vs in self.main_window.other_sensors if not ((isinstance(vs, dict) and vs.get('name') == removed_sensor.name) or (hasattr(vs, 'name') and vs.name == removed_sensor.name))]
                 if hasattr(self.main_window, 'save_virtual_sensors'):
                     self.main_window.save_virtual_sensors()
+            
+            # Reinitialize the dashboard graph if data collection is active
+            if (hasattr(self.main_window, 'data_collection_controller') and 
+                hasattr(self.main_window.data_collection_controller, 'collecting_data') and
+                self.main_window.data_collection_controller.collecting_data):
+                
+                if (hasattr(self.main_window, 'graph_controller') and 
+                    hasattr(self.main_window.graph_controller, 'live_plotting_active') and
+                    self.main_window.graph_controller.live_plotting_active):
+                    
+                    # Reinitialize the dashboard with the updated sensor list
+                    print(f"DEBUG: Reinitializing dashboard graph due to sensor removal: {removed_sensor.name}")
+                    start_time = self.main_window.data_collection_controller.start_time
+                    if start_time is not None:
+                        self.main_window.graph_controller.start_live_dashboard_update(start_time)
         
         # After removing, emit the status changed signal
         self.status_changed.emit()
@@ -1493,6 +1601,7 @@ class SensorController(QObject):
                 self.main_window.logger.log(f"  - Port: {sensor.port}")
                 self.main_window.logger.log(f"  - Unit: {sensor.unit}")
                 self.main_window.logger.log(f"  - Color: {sensor.color}")
+                self.main_window.logger.log(f"  - Show in Graph: {sensor.show_in_graph}")
                 
                 # Make sure all important attributes are present in the dictionary
                 sensor_dict = sensor.to_dict()
@@ -2863,6 +2972,9 @@ class SensorController(QObject):
                 # Update sensor color
                 sensor.color = color.name()
                 
+                # Save the updated sensor configuration
+                self.save_sensors()
+                
                 # Update the table to show the new color
                 self.update_sensor_table()
                 
@@ -3289,6 +3401,16 @@ class SensorController(QObject):
         """Find and return a sensor object by its display name."""
         for sensor in self.sensors:
             if hasattr(sensor, 'name') and sensor.name == name:
+                return sensor
+        return None
+    
+    def get_sensor_by_historical_key(self, key):
+        """Find and return a sensor object by its historical buffer key."""
+        if not key:
+            return None
+        # Iterate through sensors and find matching historical key
+        for sensor in self.sensors:
+            if self.get_historical_buffer_key(sensor) == key:
                 return sensor
         return None
         

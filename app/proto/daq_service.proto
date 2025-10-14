@@ -1,0 +1,184 @@
+syntax = "proto3";
+
+package daq;
+
+service DAQService {
+  // Master functions (data source)
+  rpc StartStreaming(StreamingRequest) returns (StreamingResponse);
+  rpc StopStreaming(StopRequest) returns (StopResponse);
+  rpc GetStreamingStatus(StatusRequest) returns (StreamingStatusResponse);
+  
+  // Client functions (stream participants)
+  rpc ConnectToStream(ConnectRequest) returns (ConnectResponse);
+  rpc DisconnectFromStream(DisconnectRequest) returns (DisconnectResponse);
+  rpc GetAvailableSensors(SensorsRequest) returns (AvailableSensorsResponse);
+  rpc GetAvailableVideo(VideoRequest) returns (AvailableVideoResponse);
+  
+  // Streaming endpoints
+  rpc StreamSensorData(StreamRequest) returns (stream SensorData);
+  rpc StreamVideo(VideoRequest) returns (stream VideoFrame);
+  rpc StreamCombinedData(CombinedRequest) returns (stream CombinedData);
+  
+  // Remote control (with security)
+  rpc SendRemoteCommand(RemoteCommand) returns (CommandResponse);
+  rpc RequestRemoteControl(ControlRequest) returns (ControlResponse);
+  
+  // Authentication & security
+  rpc Authenticate(AuthRequest) returns (AuthResponse);
+  rpc ValidatePermission(PermissionRequest) returns (PermissionResponse);
+}
+
+message StreamingRequest {
+  bool enable_sensors = 1;
+  bool enable_video = 2;
+  bool enable_remote_control = 3;
+  string stream_name = 4;
+  string password = 5;
+  string description = 6;
+}
+
+message StreamingResponse {
+  bool success = 1;
+  string message = 2;
+  string stream_id = 3;
+  int32 port = 4;
+}
+
+message ConnectRequest {
+  string master_address = 1;
+  string stream_name = 2;
+  string password = 3;
+  bool request_sensors = 4;
+  bool request_video = 5;
+  string client_name = 6;
+}
+
+message ConnectResponse {
+  bool success = 1;
+  string message = 2;
+  string session_id = 3;
+  repeated RemoteSensor available_sensors = 4;
+  bool video_available = 5;
+}
+
+message AvailableSensorsResponse {
+  repeated RemoteSensor sensors = 1;
+}
+
+message RemoteSensor {
+  string id = 1;
+  string name = 2;
+  string unit = 3;
+  double current_value = 4;
+  string interface_type = 5;
+  bool available = 6;
+  string color = 7;
+}
+
+message AvailableVideoResponse {
+  bool available = 1;
+  int32 width = 2;
+  int32 height = 3;
+  int32 fps = 4;
+}
+
+message RemoteCommand {
+  string command_type = 1;
+  string target = 2;
+  map<string, string> parameters = 3;
+  string auth_token = 4;
+  int32 permission_level = 5;
+}
+
+message CommandResponse {
+  bool success = 1;
+  string message = 2;
+  string command_id = 3;
+}
+
+message ControlRequest {
+  string requested_permission = 1;
+  string auth_token = 2;
+  string reason = 3;
+  string client_name = 4;
+}
+
+message ControlResponse {
+  bool granted = 1;
+  string message = 2;
+  int32 permission_level = 3;
+  string access_token = 4;
+}
+
+message AuthRequest {
+  string client_id = 1;
+  string password = 2;
+}
+
+message AuthResponse {
+  bool success = 1;
+  string message = 2;
+  string session_token = 3;
+}
+
+message PermissionRequest {
+  string session_token = 1;
+  string resource = 2;
+  string action = 3;
+}
+
+message PermissionResponse {
+  bool granted = 1;
+  string message = 2;
+  int32 permission_level = 3;
+}
+
+message StatusRequest {}
+
+message StopRequest {}
+message StopResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message DisconnectRequest {}
+message DisconnectResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message SensorsRequest {}
+message VideoRequest {}
+message CombinedRequest {}
+message StreamRequest {}
+
+message StreamingStatusResponse {
+  bool is_streaming = 1;
+  string stream_name = 2;
+  int32 connected_clients = 3;
+  bool sensors_enabled = 4;
+  bool video_enabled = 5;
+  bool remote_control_enabled = 6;
+}
+
+message SensorData {
+  string sensor_id = 1;
+  double value = 2;
+  string unit = 3;
+  int64 timestamp = 4;
+  string sensor_name = 5;
+}
+
+message VideoFrame {
+  bytes frame_data = 1;
+  int64 timestamp = 2;
+  int32 width = 3;
+  int32 height = 4;
+  int32 channels = 5;
+}
+
+message CombinedData {
+  repeated SensorData sensors = 1;
+  VideoFrame video = 2;
+  int64 timestamp = 3;
+} 

@@ -1,0 +1,6 @@
+{
+  "typeCheckingMode": "off",
+  "reportMissingTypeStubs": false,
+  "reportMissingParameterType": false,
+  "reportMissingReturnType": false
+}

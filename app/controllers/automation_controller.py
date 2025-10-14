@@ -735,7 +735,7 @@ class AutomationController(QObject):
         active_sequences = self.manager.active_sequences # CORRECTED: Use public attribute
 
         # Log current update for debugging
-        print(f"Updating dashboard table - {len(active_sequences)}/{len(all_sequences)} sequences active")
+        # print(f"Updating dashboard table - {len(active_sequences)}/{len(all_sequences)} sequences active")
 
         # Combine and sort: running first, then by name
         def sort_key(seq):

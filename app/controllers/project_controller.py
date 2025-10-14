@@ -112,9 +112,7 @@ class ProjectController(QObject):
         self.main_window.new_test_series_btn.clicked.connect(self.on_create_test_series_clicked)
         self.main_window.load_project_btn.clicked.connect(self.on_load_run_clicked)
         
-        # Connect Export Data button to the export_project function
-        if hasattr(self.main_window, 'save_project_btn'):
-            self.main_window.save_project_btn.clicked.connect(self.export_project)
+        # Export Data button is connected in main_window.py to avoid duplicate connections
         
         # Connect project tree click to store the selection
         self.main_window.project_tree.clicked.connect(self.on_project_tree_clicked)
@@ -457,6 +455,12 @@ class ProjectController(QObject):
     
     def on_load_run_clicked(self):
         """Called when the Load Run button is clicked to load a selected run"""
+        # Check if a run is currently active
+        if hasattr(self.main_window, 'running') and self.main_window.running:
+            self.main_window.logger.log("Cannot load a new run while a run is currently active. Please stop the current run first.", "WARN")
+            self.update_status_text("Error: Cannot load run while another run is active", "red")
+            return
+            
         self.load_run()
     
     def browse_base_directory(self):
@@ -853,6 +857,32 @@ class ProjectController(QObject):
         
         # Load sensor configuration from the run directory
         self.load_sensors_from_run(run_dir)
+        
+        # Load control run configuration from the run directory
+        if hasattr(self.main_window, 'control_run_controller'):
+            try:
+                if self.main_window.control_run_controller.load_control_run_config(run_dir):
+                    self.main_window.logger.log(f"Control run configuration loaded from {run_dir}")
+                    
+                    # Update the UI with the loaded control run info
+                    if hasattr(self.main_window, 'populate_control_run_selector'):
+                        self.main_window.populate_control_run_selector()
+                        
+                    # Set the control run selector to the loaded control run
+                    if hasattr(self.main_window, 'control_run_selector'):
+                        control_run_name = self.main_window.control_run_controller.control_run_name
+                        if control_run_name:
+                            index = self.main_window.control_run_selector.findText(control_run_name)
+                            if index >= 0:
+                                self.main_window.control_run_selector.setCurrentIndex(index)
+                                
+                    # Set the time offset in the UI
+                    if hasattr(self.main_window, 'control_run_time_offset'):
+                        self.main_window.control_run_time_offset.setValue(
+                            self.main_window.control_run_controller.time_offset
+                        )
+            except Exception as e:
+                self.main_window.logger.log(f"Error loading control run configuration: {str(e)}", "WARN")
         
         # Call main window's load_project_state method if it exists
         if hasattr(self.main_window, 'load_project_state'):
@@ -1470,6 +1500,19 @@ class ProjectController(QObject):
             except Exception as e:
                 self.main_window.logger.log(f"Error updating automation controller: {str(e)}", "WARN")
         
+        # Save control run configuration and copy control run data
+        if hasattr(self.main_window, 'control_run_controller'):
+            try:
+                # Save the control run config to the new run directory
+                self.main_window.control_run_controller.save_control_run_config(run_dir)
+                
+                # Copy the control run data CSV to the new run directory
+                self.main_window.control_run_controller.copy_control_run_data_to_run(run_dir)
+                
+                self.main_window.logger.log(f"Control run configuration and data saved to run directory", "INFO")
+            except Exception as e:
+                self.main_window.logger.log(f"Error saving control run data: {str(e)}", "WARN")
+        
         # Save current project and test series in config for next startup
         if hasattr(self.main_window, 'config'):
             self.main_window.config["last_project"] = project_name
@@ -1824,6 +1867,10 @@ class ProjectController(QObject):
                 series_dir = os.path.join(base_dir, export_project, export_series)
                 ensure_directory_structure(series_dir)
                     
+            # Track if control run data is found
+            control_run_config_found = False
+            control_run_data_found = False
+            
             # Now add all files from the source directory
             for root, dirs, files in os.walk(source_dir):
                 # Ensure this directory's structure is preserved
@@ -1831,6 +1878,14 @@ class ProjectController(QObject):
                 
                 for file in files:
                     file_path = os.path.join(root, file)
+                    
+                    # Track control run files
+                    if file == "control_run_config.json":
+                        control_run_config_found = True
+                        self.main_window.logger.log("Control run configuration found in export", "INFO")
+                    elif file == "control_run_data.csv":
+                        control_run_data_found = True
+                        self.main_window.logger.log("Control run data CSV found in export", "INFO")
                     
                     # Skip video files if not including videos
                     if not include_videos and file.lower().endswith(('.mp4', '.avi', '.mov', '.wmv')):
@@ -1850,6 +1905,13 @@ class ProjectController(QObject):
                         
                     if progress.wasCanceled():
                         return
+            
+            # Log control run export status
+            if control_run_config_found or control_run_data_found:
+                self.main_window.logger.log(
+                    f"Export includes control run data: config={control_run_config_found}, data={control_run_data_found}", 
+                    "INFO"
+                )
             
             # Create zip file
             progress.setLabelText("Creating zip file...")

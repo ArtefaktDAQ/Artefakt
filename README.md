@@ -169,8 +169,15 @@ This project includes `ffmpeg.exe` for video processing capabilities. FFmpeg is 
 
 For commercial use or redistribution, please review FFmpeg's licensing requirements at: https://ffmpeg.org/legal.html
 
-#### Other Dependencies
-All Python dependencies are listed in `requirements.txt` with their respective licenses. Most are permissively licensed (MIT, BSD, Apache 2.0).
+### Trademarks and Logos
+
+While this software is licensed under the GPL v3.0, all logos, trademarks, and brand assets used in this application remain the property of their respective owners. The GPL license applies only to the source code and does not grant any rights to use company logos, trademarks, or brand assets.
+
+- **Artefakt Logo**: All rights reserved
+- **Company Branding**: All rights reserved
+- **Usage**: You may modify and redistribute the source code under GPL terms, but must remove or replace any proprietary logos and branding elements
+
+If you fork or redistribute this software, please ensure you remove or replace all proprietary visual assets and branding elements.
 
 ## License Text
 

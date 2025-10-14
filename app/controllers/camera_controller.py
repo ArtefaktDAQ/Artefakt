@@ -1515,7 +1515,7 @@ class CameraController(QObject):
         
         # Get NDI settings from application settings
         enable_ndi = self.settings.get_value("enable_ndi", "false").lower() == "true"
-        ndi_source_name = self.settings.get_value("ndi_source_name", "EvoLabs DAQ")
+        ndi_source_name = self.settings.get_value("ndi_source_name", "Artefakt DAQ")
         ndi_with_overlays = self.settings.get_value("ndi_with_overlays", "true").lower() == "true"
         
         # Log the NDI settings
@@ -1882,6 +1882,26 @@ class CameraController(QObject):
             tooltip += "\nRecording in progress"
         
         return (StatusState.READY, tooltip)
+
+    def get_current_frame(self):
+        """Get the current raw frame as a numpy array for streaming"""
+        if not self.is_connected or not self.camera_thread:
+            return None
+        
+        try:
+            # Try to get the current frame from the camera thread
+            if hasattr(self.camera_thread, 'cap') and self.camera_thread.cap:
+                # Read a frame directly from the camera
+                ret, frame = self.camera_thread.cap.read()
+                if ret and frame is not None:
+                    # Apply overlays if any
+                    if hasattr(self.camera_thread, 'apply_overlays'):
+                        frame = self.camera_thread.apply_overlays(frame)
+                    return frame
+        except Exception as e:
+            self.logger.log(f"Error getting current frame: {str(e)}", "ERROR")
+        
+        return None
 
     def reconnect_camera_buttons(self):
         """Explicitly reconnect all camera tab buttons"""

@@ -27,6 +27,7 @@ from app.controllers.automation_controller import AutomationController
 from app.controllers.data_collection_controller import DataCollectionController
 from app.controllers.export_controller import ExportController
 from app.controllers.notes_controller import NotesController
+from app.controllers.control_run_controller import ControlRunController
 
 # Import models
 from app.models.settings_model import SettingsModel
@@ -54,7 +55,7 @@ class DAQApp(QMainWindow):
         super().__init__()
         
         # Set application settings
-        self.settings = QSettings("EvoLabs", "DAQ")
+        self.settings = QSettings("Artefakt", "DAQ")
         self.settings_model = SettingsModel(self.settings)
         
         # Load application configuration
@@ -165,6 +166,11 @@ class DAQApp(QMainWindow):
                 print(f"Auto-connect LabJack failed: {e}")
 
         self.other_sensors = []  # Liste für virtuelle Sensoren
+        
+        # Ensure the graph live update checkbox state is properly handled after all initialization
+        # This fixes the issue where the checkbox is checked but the graph doesn't refresh on startup
+        if hasattr(self, 'graph_controller'):
+            self.graph_controller.ensure_main_graph_live_update()
 
     def init_timers(self):
         """Initialize application timers"""
@@ -187,6 +193,9 @@ class DAQApp(QMainWindow):
         # Connect project save/load buttons
         if hasattr(self, 'save_project_btn') and hasattr(self, 'project_controller'):
             self.save_project_btn.clicked.connect(self.project_controller.save_project)
+            
+        if hasattr(self, 'export_project_btn') and hasattr(self, 'project_controller'):
+            self.export_project_btn.clicked.connect(self.project_controller.export_project)
             
         if hasattr(self, 'load_project_btn') and hasattr(self, 'project_controller'):
             self.load_project_btn.clicked.connect(self.project_controller.on_load_run_clicked)
@@ -282,11 +291,18 @@ class DAQApp(QMainWindow):
             self.graph_secondary_sensor.currentIndexChanged.connect(self.graph_controller.update_graph)
             self.graph_timespan.currentIndexChanged.connect(self.graph_controller.on_timespan_changed)
             self.dashboard_timespan.currentIndexChanged.connect(self.graph_controller.on_dashboard_timespan_changed)
-            # Ensure initial state of the live update checkbox is handled after setup
-            self.graph_controller.ensure_main_graph_live_update()
             # Connect multi-sensor list changes to update the graph immediately
             if hasattr(self, 'multi_sensor_list'):
                 self.multi_sensor_list.itemChanged.connect(self.graph_controller.update_graph)
+        
+        # Connect control run controls
+        if hasattr(self, 'control_run_selector') and hasattr(self, 'control_run_controller'):
+            self.control_run_selector.currentIndexChanged.connect(self.on_control_run_selected)
+            self.control_run_time_offset.valueChanged.connect(self.on_control_run_time_offset_changed)
+            # Connect to update both graph and sensor dropdowns when control run changes
+            self.control_run_controller.control_run_changed.connect(self.on_control_run_changed_update)
+            # Populate control run selector on startup
+            self.populate_control_run_selector()
 
     def on_tab_changed(self, index):
         """Handle tab change event"""
@@ -683,6 +699,8 @@ class DAQApp(QMainWindow):
             if hasattr(self, 'graph_controller'):
                 print("[TOGGLE] Starting live dashboard graph updates...")
                 self.graph_controller.start_live_dashboard_update(self.start_time)
+                # Ensure main graph live update is started if checkbox is checked
+                self.graph_controller.ensure_main_graph_live_update()
             
             # Start video recording if camera is active and recording is enabled
             if hasattr(self, 'camera_controller') and self.camera_controller.is_connected and self.settings.value("camera/record_on_start", "true", type=str).lower() == "true":
@@ -1325,6 +1343,71 @@ class DAQApp(QMainWindow):
         """Test LabJack connection"""
         self.sensor_controller.test_labjack()
     
+    # Control Run related methods
+    def populate_control_run_selector(self):
+        """Populate the control run selector with available runs"""
+        if not hasattr(self, 'control_run_selector') or not hasattr(self, 'control_run_controller'):
+            return
+            
+        # Save current selection
+        current_text = self.control_run_selector.currentText()
+        
+        # Clear and repopulate
+        self.control_run_selector.clear()
+        self.control_run_selector.addItem("None")
+        
+        # Get available runs
+        available_runs = self.control_run_controller.get_available_runs()
+        
+        for run_path, run_display_name in available_runs:
+            self.control_run_selector.addItem(run_display_name, run_path)
+            
+        # Restore selection if it still exists
+        index = self.control_run_selector.findText(current_text)
+        if index >= 0:
+            self.control_run_selector.setCurrentIndex(index)
+        
+        if hasattr(self, 'logger'):
+            self.logger.log(f"Populated control run selector with {len(available_runs)} runs", "INFO")
+    
+    def on_control_run_selected(self, index):
+        """Handle control run selection change"""
+        if not hasattr(self, 'control_run_selector') or not hasattr(self, 'control_run_controller'):
+            return
+            
+        if index == 0:  # "None" selected
+            self.control_run_controller.clear_control_run()
+        else:
+            run_path = self.control_run_selector.currentData()
+            run_name = self.control_run_selector.currentText()
+            if run_path:
+                self.control_run_controller.set_control_run(run_path, run_name)
+    
+    def on_control_run_time_offset_changed(self, value):
+        """Handle time offset change for control run"""
+        if not hasattr(self, 'control_run_controller'):
+            return
+            
+        self.control_run_controller.set_time_offset(value)
+    
+    def on_control_run_changed_update(self):
+        """Handle control run change - update sensor dropdowns and graph"""
+        # Update sensor dropdowns to include/exclude control run sensors
+        if hasattr(self, 'sensor_controller'):
+            self.sensor_controller.update_graph_sensor_dropdowns()
+        
+        # Update graph
+        self.update_graph()
+    
+    def on_show_control_run_changed(self, state):
+        """Handle show control run checkbox change"""
+        # Update sensor dropdowns to add/remove control sensors based on checkbox state
+        if hasattr(self, 'sensor_controller'):
+            self.sensor_controller.update_graph_sensor_dropdowns()
+        
+        # Update graph to show/hide control run data
+        self.update_graph()
+    
     # Graph-related methods
     def update_graph(self):
         """Update the main analysis graph based on UI selections."""
@@ -1338,8 +1421,8 @@ class DAQApp(QMainWindow):
             
         # Ensure UI elements exist before accessing them
         required_attrs = [
-            'graph_type_combo', 'graph_primary_sensor', 'graph_secondary_sensor', 
-            'graph_timespan', 'multi_sensor_list', 'window_size_spinbox', 
+            'graph_type_combo', 'graph_primary_sensor', 'graph_secondary_sensor',
+            'graph_timespan', 'multi_sensor_list', 'window_size_spinbox',
             'histogram_bins_spinbox'
         ]
         for attr in required_attrs:
@@ -1351,7 +1434,7 @@ class DAQApp(QMainWindow):
         # Get parameters from UI
         graph_type = self.graph_type_combo.currentText()
         # Get the HISTORICAL KEY from the selected item's userData
-        primary_sensor_key = self.graph_primary_sensor.currentData() 
+        primary_sensor_key = self.graph_primary_sensor.currentData()
         secondary_sensor_key = self.graph_secondary_sensor.currentData() if self.graph_secondary_sensor.isVisible() else None
         timespan = self.graph_timespan.currentText()
         
@@ -1360,6 +1443,40 @@ class DAQApp(QMainWindow):
         if self.multi_sensor_list.isVisible():
             selected_items = self.multi_sensor_list.selectedItems()
             multi_sensor_keys = [item.data(Qt.ItemDataRole.UserRole) for item in selected_items if item.data(Qt.ItemDataRole.UserRole) is not None]
+        
+        # Check if we need to load control run data
+        # Load if: checkbox is checked OR any selected sensor has _ctrl suffix
+        show_control_run = False
+        control_run_data = None
+        
+        # Collect all selected sensor keys
+        all_selected_keys = [primary_sensor_key, secondary_sensor_key] + multi_sensor_keys
+        all_selected_keys = [k for k in all_selected_keys if k is not None]
+        
+        # Check if any selected sensor is a control sensor (ends with _ctrl)
+        has_control_sensors = any(key.endswith('_ctrl') for key in all_selected_keys)
+        
+        # Load control run data if checkbox is checked OR control sensors are selected
+        if hasattr(self, 'show_control_run_checkbox') and self.show_control_run_checkbox.isChecked():
+            show_control_run = True
+            
+        if show_control_run or has_control_sensors:
+            if hasattr(self, 'logger'):
+                if show_control_run:
+                    self.logger.debug("Control run checkbox is checked, loading control run data")
+                if has_control_sensors:
+                    self.logger.debug(f"Control sensors selected, loading control run data")
+            
+            # Get control run data from control run controller
+            if hasattr(self, 'control_run_controller'):
+                try:
+                    control_run_data = self.control_run_controller.load_control_run_data()
+                    if hasattr(self, 'logger'):
+                        self.logger.debug(f"Retrieved control run data for {len(control_run_data)} sensors with offset {self.control_run_controller.time_offset}s")
+                except Exception as e:
+                    if hasattr(self, 'logger'):
+                        self.logger.error(f"Error retrieving control run data: {e}")
+                    control_run_data = None
 
         # Get specific parameters based on graph type
         window_size = self.window_size_spinbox.value() if self.window_size_spinbox.isVisible() else None
@@ -1367,19 +1484,21 @@ class DAQApp(QMainWindow):
         
         # Log the keys being sent
         if hasattr(self, 'logger'):
-             self.logger.debug(f"Calling update_specific_graph with: type={graph_type}, primary_key={primary_sensor_key}, secondary_key={secondary_sensor_key}, multi_keys={multi_sensor_keys}, timespan={timespan}")
+             self.logger.debug(f"Calling update_specific_graph with: type={graph_type}, primary_key={primary_sensor_key}, secondary_key={secondary_sensor_key}, multi_keys={multi_sensor_keys}, timespan={timespan}, show_control_run={show_control_run}")
 
         # Delegate plotting to the GraphController using historical keys
         self.graph_controller.update_specific_graph(
-            graph_widget=self.graph_widget, 
+            graph_widget=self.graph_widget,
             primary_sensor_key=primary_sensor_key, # Pass key
             secondary_sensor_key=secondary_sensor_key, # Pass key
-            timespan=timespan, 
-            graph_type=graph_type, 
+            timespan=timespan,
+            graph_type=graph_type,
             multi_sensor_keys=multi_sensor_keys, # Pass keys
             window_size=window_size,
             histogram_bins=histogram_bins,
-            is_main_graph=True # Indicate this is for the main analysis graph
+            is_main_graph=True, # Indicate this is for the main analysis graph
+            show_control_run=show_control_run,
+            control_run_data=control_run_data
         )
 
     def update_dashboard_graph(self):
@@ -1569,6 +1688,28 @@ class DAQApp(QMainWindow):
         
         # Initialize Notes Controller
         self.notes_controller = NotesController(self)
+        
+        # Initialize Control Run Controller
+        self.control_run_controller = ControlRunController(self)
+        self.logger.log("Control run controller initialized", "INFO")
+
+        # Initialize Stream Controller
+        try:
+            from app.controllers.stream_controller import StreamController
+            self.stream_controller = StreamController(self)
+            self.logger.log("Stream controller initialized", "INFO")
+        except ImportError as e:
+            self.logger.log(f"Failed to initialize stream controller: {e}", "WARNING")
+            self.stream_controller = None
+
+        # Initialize Remote Control Controller
+        try:
+            from app.controllers.remote_control_controller import RemoteControlController
+            self.remote_control_controller = RemoteControlController(self)
+            self.logger.log("Remote control controller initialized", "INFO")
+        except ImportError as e:
+            self.logger.log(f"Failed to initialize remote control controller: {e}", "WARNING")
+            self.remote_control_controller = None
 
         # Initialize the data collection controller to set up timers
         self.data_collection_controller.initialize()
@@ -2018,7 +2159,7 @@ class DAQApp(QMainWindow):
         
         # --- HOW-TO BOX AND EXAMPLES (Placed AFTER Arduino settings) ---
         howto_text = (
-            '<b>How to use Arduino with EvoLabs DAQ:</b><br>'
+            '<b>How to use Arduino with Artefakt DAQ:</b><br>'
             '<ul>'
             '<li>Upload the provided Arduino example code to your Arduino board.</li>'
             '<li>Connect the Arduino to your PC via USB and select the correct port and baud rate.</li>'
@@ -2583,7 +2724,7 @@ class DAQApp(QMainWindow):
         
         # NDI Source Name
         ndi_layout.addWidget(QLabel("Source Name:"), 1, 0)
-        ndi_source_name = QLineEdit(self.settings.value("ndi_source_name", "EvoLabs DAQ"))
+        ndi_source_name = QLineEdit(self.settings.value("ndi_source_name", "Artefakt DAQ"))
         ndi_layout.addWidget(ndi_source_name, 1, 1)
         
         # Include overlays in NDI output
@@ -3003,6 +3144,11 @@ class DAQApp(QMainWindow):
                 
             # Connect signals - this is where the buttons get connected to methods
             self.setup_sensor_tab_signals()
+            
+            # Add stream button if stream controller is available
+            if hasattr(self, 'stream_controller') and self.stream_controller:
+                self.stream_controller.add_stream_button_to_ui()
+            
             print("Sensor tab UI setup complete")
         except Exception as e:
             print(f"Error in setup_sensor_tab: {e}")
@@ -3259,7 +3405,11 @@ class DAQApp(QMainWindow):
             # Call the correct start/stop methods for the MAIN graph live update
             if is_checked:
                 print("DEBUG: Starting main graph live update...")
-                self.graph_controller.start_main_graph_live_update()
+                # Check if data collection is active before starting
+                if hasattr(self, 'data_collection_controller') and self.data_collection_controller.collecting_data:
+                    self.graph_controller.start_main_graph_live_update()
+                else:
+                    print("DEBUG: Data collection not active, not starting graph live update")
             else:
                 print("DEBUG: Stopping main graph live update...")
                 self.graph_controller.stop_main_graph_live_update()

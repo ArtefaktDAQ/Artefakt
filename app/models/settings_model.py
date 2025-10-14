@@ -58,7 +58,7 @@ class SettingsModel:
             
             # NDI settings
             "enable_ndi": "false",
-            "ndi_source_name": "EvoLabs DAQ",
+            "ndi_source_name": "Artefakt DAQ",
             "ndi_with_overlays": "true",
             
             # Project settings

@@ -317,7 +317,7 @@ def setup_ui(self):
     # Add logo image below toggle button
     logo_label = QLabel()
     try:
-        logo_pixmap = QPixmap(resource_path("assets/Evo-Labs_logo.png"))
+        logo_pixmap = QPixmap(resource_path("assets/Artefakt_logo.png"))
         if not logo_pixmap.isNull():
             scaled_pixmap = logo_pixmap.scaled(140, 40, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             logo_label.setPixmap(scaled_pixmap)
@@ -1003,7 +1003,7 @@ def setup_ui(self):
     
     # Create a fixed-width container for sensors content
     sensors_container = QWidget()
-    sensors_container.setFixedWidth(800)  # Set a reasonable fixed width
+    sensors_container.setFixedWidth(1000)  # Increased width to accommodate 4 columns
     sensors_container_layout = QVBoxLayout(sensors_container)
     sensors_container_layout.setContentsMargins(0, 0, 0, 0)
     
@@ -1517,7 +1517,40 @@ def setup_ui(self):
     self.graph_live_update_checkbox.setToolTip("Check to update graph periodically with live data during a run")
     self.graph_live_update_checkbox.setChecked(True)  # Checked by default
     # Add checkbox to layout, spanning 2 columns for better spacing
-    graph_params_layout.addWidget(self.graph_live_update_checkbox, 3, 0, 1, 2) 
+    graph_params_layout.addWidget(self.graph_live_update_checkbox, 3, 0, 1, 2)
+    
+    # Control Run Section
+    control_run_label = QLabel("Control Run:")
+    graph_params_layout.addWidget(control_run_label, 4, 0)
+    
+    self.control_run_selector = QComboBox()
+    self.control_run_selector.setToolTip("Select a run to use as control data for comparison")
+    self.control_run_selector.addItem("None")
+    # The controller will populate this with available runs
+    self.control_run_selector.setMinimumWidth(200)
+    graph_params_layout.addWidget(self.control_run_selector, 4, 1)
+    
+    # Control Run Time Offset
+    time_offset_label = QLabel("Time Offset (s):")
+    graph_params_layout.addWidget(time_offset_label, 5, 0)
+    
+    self.control_run_time_offset = QDoubleSpinBox()
+    self.control_run_time_offset.setRange(-3600.0, 3600.0)  # +/- 1 hour
+    self.control_run_time_offset.setValue(0.0)
+    self.control_run_time_offset.setDecimals(2)
+    self.control_run_time_offset.setSingleStep(1.0)
+    self.control_run_time_offset.setSuffix(" s")
+    self.control_run_time_offset.setToolTip("Adjust the start time of the control run data (positive = shift right, negative = shift left)")
+    graph_params_layout.addWidget(self.control_run_time_offset, 5, 1)
+    
+    # Show Control Run Checkbox
+    self.show_control_run_checkbox = QCheckBox("Show Control Run")
+    self.show_control_run_checkbox.setToolTip("Check to display control run data on the graph")
+    self.show_control_run_checkbox.setChecked(False)  # Unchecked by default
+    # Connect the checkbox to update sensor lists and graph when toggled
+    self.show_control_run_checkbox.stateChanged.connect(self.on_show_control_run_changed)
+    # Add checkbox to layout, spanning 2 columns for better spacing
+    graph_params_layout.addWidget(self.show_control_run_checkbox, 6, 0, 1, 2)
     
     # Plot Format Settings
     plot_format_group = QGroupBox("Plot Format")
@@ -1871,7 +1904,7 @@ def setup_ui(self):
     self.enable_ndi.setChecked(self.settings.value("enable_ndi", "false") == "true")
     hidden_layout.addWidget(self.enable_ndi)
     
-    self.ndi_source_name = QLineEdit(self.settings.value("ndi_source_name", "EvoLabs DAQ"))
+    self.ndi_source_name = QLineEdit(self.settings.value("ndi_source_name", "Artefakt DAQ"))
     hidden_layout.addWidget(self.ndi_source_name)
     
     self.ndi_with_overlays = QCheckBox("Include overlays in NDI output")
@@ -1902,9 +1935,10 @@ def setup_ui(self):
     
     # Create a fixed-width container for project content
     project_container = QWidget()
-    project_container.setFixedWidth(980)  # Increased width for better layout and to move content left
+    project_container.setMinimumWidth(1200)  # Use minimum width instead of fixed to allow expansion
+    project_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)  # Allow expansion
     project_container_layout = QVBoxLayout(project_container)
-    project_container_layout.setContentsMargins(10, 20, 10, 20)  # Reduced left/right margin to move content left
+    project_container_layout.setContentsMargins(10, 20, 20, 20)  # Increased right margin to ensure full visibility
     project_container_layout.setSpacing(15)  # Increase spacing between elements
     
     # Center the container in the tab
@@ -1918,7 +1952,7 @@ def setup_ui(self):
     
     # Create a horizontal layout for the main content
     main_content_layout = QHBoxLayout()
-    main_content_layout.setSpacing(30)  # Reduce spacing between columns (was 40)
+    main_content_layout.setSpacing(20)  # Further reduced spacing between columns for more space
     
     # Left column for project structure
     left_column_layout = QVBoxLayout()
@@ -2093,11 +2127,17 @@ def setup_ui(self):
     project_actions_layout.setContentsMargins(15, 15, 15, 15)
     project_actions_group.setFont(sub_font)  # Reuse the same font
     
-    # Export project button (renamed from Save Project)
-    self.save_project_btn = QPushButton("Export Data")
+    # Save project button
+    self.save_project_btn = QPushButton("Save Project")
     self.save_project_btn.setIcon(QIcon.fromTheme("document-save"))
     self.save_project_btn.setMinimumWidth(120)
     project_actions_layout.addWidget(self.save_project_btn)
+    
+    # Export project button
+    self.export_project_btn = QPushButton("Export Data")
+    self.export_project_btn.setIcon(QIcon.fromTheme("document-export"))
+    self.export_project_btn.setMinimumWidth(120)
+    project_actions_layout.addWidget(self.export_project_btn)
     
     # Load project button
     self.load_project_btn = QPushButton("Load Run")
@@ -2121,9 +2161,10 @@ def setup_ui(self):
     
     # Project browser section
     project_browser_group = QGroupBox("Project Browser")
-    project_browser_group.setMinimumWidth(520)  # Reduced width from 550 to 520
+    project_browser_group.setMinimumWidth(750)  # Further increased minimum width to ensure all buttons are visible
+    project_browser_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)  # Allow expansion
     project_browser_layout = QVBoxLayout(project_browser_group)
-    project_browser_layout.setContentsMargins(10, 15, 10, 15)  # Reduce left/right margins
+    project_browser_layout.setContentsMargins(5, 15, 5, 15)  # Further reduced left/right margins for more space
     
     # Set larger font for the title
     browser_font = project_browser_group.font()
@@ -2147,8 +2188,8 @@ def setup_ui(self):
     self.project_model.setHorizontalHeaderLabels(["Name", "Description", "Date"])
     self.project_tree.setModel(self.project_model)
     self.project_tree.setColumnWidth(0, 200)
-    self.project_tree.setColumnWidth(1, 270)  # Reduce Description column
-    self.project_tree.setColumnWidth(2, 120)  # Increase Date column width
+    self.project_tree.setColumnWidth(1, 320)  # Increased Description column width
+    self.project_tree.setColumnWidth(2, 120)  # Date column width
     self.project_tree.setAlternatingRowColors(True)
     project_browser_layout.addWidget(self.project_tree)
     
