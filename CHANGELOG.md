@@ -1,5 +1,13 @@
 # Changelog
 
+# Changelog
+
+## Version 0.2.2 - 2025-10-14
+
+### Changes:
+- Release v0.2.2: Added gRPC remote streaming and control run visualization (87507e0)
+
+
 ## Version 0.2.2 - 2025-10-14
 
 ### Changes:
