@@ -14,6 +14,7 @@ create_release.bat
 VERSION_MANAGEMENT.md
 DEVELOPMENT_WORKFLOW.md
 RELEASE_NOTES_TEMPLATE.md
+PUBLISH_INSTRUCTIONS.md
 
 # Configuration files with sensitive data
 config.ini
@@ -58,9 +59,11 @@ __pycache__/
 
 # Virtual environments
 venv/
+venv_build/
 env/
 test_env/
 .env
+.venv
 
 # ============================================================================
 # DEVELOPMENT FILES
@@ -69,6 +72,7 @@ test_env/
 # IDE and editor files
 .vscode/
 .idea/
+.cursor/
 *.swp
 *.swo
 *~
@@ -80,12 +84,26 @@ Thumbs.db
 *.temp
 temp/
 tmp/
+.ipynb_checkpoints/
 
 # Test files and data
 test_data/
 sample_data/
 *.test
 test_client.py
+
+# Testing / Coverage
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.mypy_cache/
 
 # Documentation drafts
 NOTES.md
@@ -115,6 +133,9 @@ desktop.ini
 # Large binary files
 *.msi
 *.dmg
+*.exe
+!ffmpeg.exe
+*.bin
 
 
 # Hardware-specific configurations
@@ -125,6 +146,7 @@ calibration_data/
 user_projects/
 saved_sessions/
 exports/
+data/
 
 # Backup files
 *.bak

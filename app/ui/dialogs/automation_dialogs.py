@@ -6,10 +6,12 @@ from PyQt6.QtWidgets import (
     QWidget, QFileDialog, QMessageBox
 )
 from PyQt6.QtCore import Qt, QTime
+from app.ui.theme import GroupBoxStyles, DialogStyles
 from app.models.automation import (  # Adjusted import
     TimeDurationTrigger, TimeSpecificTrigger, SensorValueTrigger, EventTrigger,
+    OpticalEventTrigger, AudioEventTrigger, CompoundTrigger,
     ArduinoCommandAction, LabJackCommandAction, SerialCommandAction, SystemAction,
-    SetVariableAction,
+    SetVariableAction, JumpToStepAction, ConditionAction, InfoMarkerAction,
     AutomationStep, AutomationSequence
 )
 
@@ -33,6 +35,7 @@ class TriggerDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Configure Trigger")
         self.resize(500, 400)
+        self.setStyleSheet(DialogStyles.dark_dialog())
         self.trigger = trigger
         self.sensors = sensors or []
         
@@ -57,7 +60,10 @@ class TriggerDialog(QDialog):
             "After Duration (Wait)",
             "At Specific Time",
             "When Sensor Value",
-            "When Event Occurs"
+            "When Event Occurs",
+            "When Optical Event",  # For camera-based sensors
+            "When Audio Event",  # For audio sensors
+            "Compound (AND/OR)"  # Combined triggers
         ])
         self.trigger_type.currentIndexChanged.connect(self.update_trigger_options)
         form_layout.addRow("Trigger Type:", self.trigger_type)
@@ -84,6 +90,18 @@ class TriggerDialog(QDialog):
         self.event_widget = self.create_event_options()
         self.trigger_options.addTab(self.event_widget, "Event")
         
+        # Optical event trigger options
+        self.optical_widget = self.create_optical_options()
+        self.trigger_options.addTab(self.optical_widget, "Optical")
+        
+        # Audio event trigger options
+        self.audio_widget = self.create_audio_options()
+        self.trigger_options.addTab(self.audio_widget, "Audio")
+        
+        # Compound trigger options
+        self.compound_widget = self.create_compound_options()
+        self.trigger_options.addTab(self.compound_widget, "Compound")
+        
         layout.addWidget(self.trigger_options)
         
         # Buttons
@@ -105,6 +123,7 @@ class TriggerDialog(QDialog):
     def create_duration_options(self):
         """Create options for duration trigger"""
         widget = QGroupBox("Wait for Duration")
+        widget.setStyleSheet(GroupBoxStyles.compact())
         layout = QFormLayout(widget)
         
         self.duration_minutes = QSpinBox()
@@ -123,6 +142,7 @@ class TriggerDialog(QDialog):
     def create_time_options(self):
         """Create options for specific time trigger"""
         widget = QGroupBox("At Specific Time")
+        widget.setStyleSheet(GroupBoxStyles.compact())
         layout = QFormLayout(widget)
         
         self.specific_time = QTimeEdit()
@@ -136,11 +156,13 @@ class TriggerDialog(QDialog):
     def create_sensor_options(self):
         """Create options for sensor value trigger"""
         widget = QGroupBox("Sensor Value Condition")
+        widget.setStyleSheet(GroupBoxStyles.compact())
         layout = QFormLayout(widget)
         
         self.sensor_name = QComboBox()
-        # Ensure sensors list contains only strings
-        self.sensor_name.addItems([str(s) for s in self.sensors])
+        # Use sensor names for display
+        sensor_names = [s.name if hasattr(s, 'name') else str(s) for s in self.sensors]
+        self.sensor_name.addItems(sensor_names)
         
         self.sensor_operator = QComboBox()
         self.sensor_operator.addItems([">", "<", "==", ">=", "<="])
@@ -150,15 +172,23 @@ class TriggerDialog(QDialog):
         self.sensor_threshold.setDecimals(2)
         self.sensor_threshold.setSingleStep(0.1)
         
+        self.sensor_hysteresis = QDoubleSpinBox()
+        self.sensor_hysteresis.setRange(0, 999999)
+        self.sensor_hysteresis.setDecimals(2)
+        self.sensor_hysteresis.setSingleStep(0.01)
+        self.sensor_hysteresis.setToolTip("Hysteresis prevents rapid triggering near the threshold")
+        
         layout.addRow("Sensor:", self.sensor_name)
         layout.addRow("Operator:", self.sensor_operator)
         layout.addRow("Threshold:", self.sensor_threshold)
+        layout.addRow("Hysteresis:", self.sensor_hysteresis)
         
         return widget
         
     def create_event_options(self):
         """Create options for event trigger"""
         widget = QGroupBox("Event")
+        widget.setStyleSheet(GroupBoxStyles.compact())
         layout = QFormLayout(widget)
         
         self.event_type = QComboBox()
@@ -172,6 +202,341 @@ class TriggerDialog(QDialog):
         layout.addRow("Event Type:", self.event_type)
         
         return widget
+    
+    def create_optical_options(self):
+        """Create options for optical sensor event trigger"""
+        widget = QGroupBox("Optical Sensor Event")
+        widget.setStyleSheet(GroupBoxStyles.compact())
+        layout = QFormLayout(widget)
+        
+        # Optical sensor selection (filter to show only optical sensors)
+        self.optical_sensor_name = QComboBox()
+        # Filter sensors to show only optical sensors
+        self.optical_sensors = [s for s in self.sensors if hasattr(s, 'interface_type') and s.interface_type == 'OpticalSensor']
+        
+        if not self.optical_sensors:
+            # Fallback if no proper SensorModel objects found
+            optical_sensor_names = [str(s) for s in self.sensors if 'Optical' in str(s) or 'optical' in str(s).lower()]
+            if not optical_sensor_names:
+                optical_sensor_names = [s.name if hasattr(s, 'name') else str(s) for s in self.sensors]
+            self.optical_sensor_name.addItems(optical_sensor_names)
+        else:
+            self.optical_sensor_name.addItems([s.name for s in self.optical_sensors])
+            
+        self.optical_sensor_name.currentTextChanged.connect(self._on_optical_sensor_changed)
+        layout.addRow("Optical Sensor:", self.optical_sensor_name)
+        
+        # Event type selection
+        self.optical_event_type = QComboBox()
+        self.optical_event_type.addItems([
+            "light_event",           # Light Event Detected
+            "brightness_above",       # Brightness Above Threshold
+            "brightness_below",       # Brightness Below Threshold
+            "fill_level_above",       # Fill Level Above Threshold
+            "fill_level_below",       # Fill Level Below Threshold
+            "particle_count_above",   # Particle Count Above Threshold
+            "color_detected",         # Target Color Detected
+            "position_changed"        # Position Changed Significantly
+        ])
+        self.optical_event_type.currentIndexChanged.connect(self._update_optical_threshold_visibility)
+        layout.addRow("Event Type:", self.optical_event_type)
+        
+        # Event type descriptions
+        self.optical_event_desc = QLabel("Triggers when a light event is detected")
+        self.optical_event_desc.setWordWrap(True)
+        self.optical_event_desc.setStyleSheet("color: gray; font-style: italic;")
+        layout.addRow("", self.optical_event_desc)
+        
+        # Threshold for value-based events
+        self.optical_threshold = QDoubleSpinBox()
+        self.optical_threshold.setRange(0, 100000)
+        self.optical_threshold.setDecimals(1)
+        self.optical_threshold.setValue(50)
+        self.optical_threshold_label = QLabel("Threshold:")
+        layout.addRow(self.optical_threshold_label, self.optical_threshold)
+        
+        # Threshold type indicator
+        self.optical_threshold_unit = QLabel("%")
+        layout.addRow("", self.optical_threshold_unit)
+        
+        # Initially hide threshold for light_event
+        self._update_optical_threshold_visibility()
+        
+        # Trigger initial sensor-based mode selection
+        self._on_optical_sensor_changed()
+        
+        return widget
+
+    def _on_optical_sensor_changed(self):
+        """Update event type based on selected optical sensor's configuration"""
+        sensor_name = self.optical_sensor_name.currentText()
+        
+        # Find the sensor object
+        sensor = None
+        for s in self.sensors:
+            if hasattr(s, 'name') and s.name == sensor_name:
+                sensor = s
+                break
+        
+        if sensor and hasattr(sensor, 'optical_config'):
+            mode = sensor.optical_config.get('mode')
+            
+            # Map optical sensor modes to automation event types
+            mode_to_event = {
+                'light_events': 'light_event',
+                'brightness': 'brightness_above',
+                'particle_count': 'particle_count_above',
+                'color': 'color_detected',
+                'position': 'position_changed',
+                'fill_level': 'fill_level_above'
+            }
+            
+            event_type = mode_to_event.get(mode)
+            if event_type:
+                index = self.optical_event_type.findText(event_type)
+                if index >= 0:
+                    self.optical_event_type.setCurrentIndex(index)
+                    # For specific modes, we might want to auto-populate the threshold
+                    if mode == 'fill_level':
+                        target_pct = sensor.optical_config.get('fill_threshold_percent', 50)
+                        self.optical_threshold.setValue(target_pct)
+                    elif mode == 'light_events':
+                        # No threshold needed
+                        pass
+                    # Add other mode-specific threshold loading if helpful
+    
+    def _update_optical_threshold_visibility(self):
+        """Update threshold visibility based on selected optical event type"""
+        event_type = self.optical_event_type.currentText()
+        
+        # Descriptions for each event type
+        descriptions = {
+            "light_event": "Triggers when a light event (bright spot) is detected",
+            "brightness_above": "Triggers when average brightness exceeds threshold",
+            "brightness_below": "Triggers when average brightness falls below threshold",
+            "fill_level_above": "Triggers when fill level exceeds threshold percentage",
+            "fill_level_below": "Triggers when fill level falls below threshold percentage",
+            "particle_count_above": "Triggers when particle count exceeds threshold",
+            "color_detected": "Triggers when target color coverage exceeds threshold %",
+            "position_changed": "Triggers when tracked position moves more than threshold %"
+        }
+        self.optical_event_desc.setText(descriptions.get(event_type, ""))
+        
+        # Show/hide threshold based on event type
+        needs_threshold = event_type != "light_event"
+        self.optical_threshold.setVisible(needs_threshold)
+        self.optical_threshold_label.setVisible(needs_threshold)
+        self.optical_threshold_unit.setVisible(needs_threshold)
+        
+        # Set appropriate range and unit
+        if event_type in ["fill_level_above", "fill_level_below", "color_detected", "position_changed"]:
+            self.optical_threshold.setRange(0, 100)
+            self.optical_threshold_unit.setText("% (percentage)")
+            self.optical_threshold.setValue(50 if "above" in event_type else 20)
+        elif event_type in ["brightness_above", "brightness_below"]:
+            self.optical_threshold.setRange(0, 255)
+            self.optical_threshold_unit.setText("(0-255 brightness)")
+            self.optical_threshold.setValue(128)
+        elif event_type == "particle_count_above":
+            self.optical_threshold.setRange(0, 10000)
+            self.optical_threshold_unit.setText("(count)")
+            self.optical_threshold.setValue(10)
+    
+    def create_compound_options(self):
+        """Create options for compound trigger"""
+        widget = QGroupBox("Logic Combination")
+        widget.setStyleSheet(GroupBoxStyles.compact())
+        layout = QVBoxLayout(widget)
+        
+        self.compound_logic = QComboBox()
+        self.compound_logic.addItems(["AND", "OR"])
+        layout.addLayout(QFormLayout())
+        layout.itemAt(0).layout().addRow("Logic:", self.compound_logic)
+        
+        label = QLabel("Note: Compound triggers can currently only be created by combining two existing triggers.")
+        label.setWordWrap(True)
+        label.setStyleSheet("color: gray; font-style: italic;")
+        layout.addWidget(label)
+        
+        # We'll just show buttons to configure two sub-triggers
+        self.sub_trigger1 = None
+        self.sub_trigger2 = None
+        
+        self.btn_trig1 = QPushButton("Configure Trigger 1")
+        self.btn_trig1.clicked.connect(self._edit_sub_trigger1)
+        self.label_trig1 = QLabel("Not configured")
+        
+        self.btn_trig2 = QPushButton("Configure Trigger 2")
+        self.btn_trig2.clicked.connect(self._edit_sub_trigger2)
+        self.label_trig2 = QLabel("Not configured")
+        
+        layout.addWidget(self.btn_trig1)
+        layout.addWidget(self.label_trig1)
+        layout.addWidget(self.btn_trig2)
+        layout.addWidget(self.label_trig2)
+        
+        return widget
+
+    def _edit_sub_trigger1(self):
+        dialog = TriggerDialog(self, self.sub_trigger1, self.sensors)
+        if dialog.exec():
+            self.sub_trigger1 = dialog.get_trigger()
+            self.label_trig1.setText(self.sub_trigger1.description if self.sub_trigger1 else "Not configured")
+
+    def _edit_sub_trigger2(self):
+        dialog = TriggerDialog(self, self.sub_trigger2, self.sensors)
+        if dialog.exec():
+            self.sub_trigger2 = dialog.get_trigger()
+            self.label_trig2.setText(self.sub_trigger2.description if self.sub_trigger2 else "Not configured")
+
+    def create_audio_options(self):
+        """Create options for audio sensor event trigger"""
+        widget = QGroupBox("Audio Sensor Event")
+        widget.setStyleSheet(GroupBoxStyles.compact())
+        layout = QFormLayout(widget)
+        
+        # Audio sensor selection (filter to show only audio sensors)
+        self.audio_sensor_name = QComboBox()
+        # Filter sensors to show only audio sensors
+        self.audio_sensors = [s for s in self.sensors if hasattr(s, 'interface_type') and s.interface_type == 'AudioSensor']
+        
+        if not self.audio_sensors:
+            audio_sensor_names = [str(s) for s in self.sensors if 'Audio' in str(s) or 'audio' in str(s).lower()]
+            if not audio_sensor_names:
+                audio_sensor_names = [s.name if hasattr(s, 'name') else str(s) for s in self.sensors]
+            self.audio_sensor_name.addItems(audio_sensor_names)
+        else:
+            self.audio_sensor_name.addItems([s.name for s in self.audio_sensors])
+            
+        self.audio_sensor_name.currentTextChanged.connect(self._on_audio_sensor_changed)
+        layout.addRow("Audio Sensor:", self.audio_sensor_name)
+        
+        # Event type selection
+        self.audio_event_type = QComboBox()
+        self.audio_event_type.addItems([
+            "rms_above",           # RMS Level Above Threshold
+            "rms_below",            # RMS Level Below Threshold
+            "peak_above",           # Peak Amplitude Above Threshold
+            "peak_below",           # Peak Amplitude Below Threshold
+            "frequency_above",      # Frequency Above Threshold
+            "frequency_below",      # Frequency Below Threshold
+            "frequency_stable",     # Frequency Stable (within range)
+            "frequency_unstable",   # Frequency Unstable (outside range)
+            "db_above",            # dB Level Above Threshold
+            "db_below",            # dB Level Below Threshold
+            "band_energy_above",   # Band Energy Above Threshold
+            "band_energy_below",   # Band Energy Below Threshold
+        ])
+        self.audio_event_type.currentIndexChanged.connect(self._update_audio_threshold_visibility)
+        layout.addRow("Event Type:", self.audio_event_type)
+        
+        # Event type descriptions
+        self.audio_event_desc = QLabel("Triggers when RMS level exceeds threshold")
+        self.audio_event_desc.setWordWrap(True)
+        self.audio_event_desc.setStyleSheet("color: gray; font-style: italic;")
+        layout.addRow("", self.audio_event_desc)
+        
+        # Threshold for value-based events
+        self.audio_threshold = QDoubleSpinBox()
+        self.audio_threshold.setRange(0, 100000)
+        self.audio_threshold.setDecimals(2)
+        self.audio_threshold.setValue(0.5)
+        self.audio_threshold_label = QLabel("Threshold:")
+        layout.addRow(self.audio_threshold_label, self.audio_threshold)
+        
+        # Threshold unit indicator
+        self.audio_threshold_unit = QLabel("(0-1 range)")
+        layout.addRow("", self.audio_threshold_unit)
+        
+        # Initially update visibility
+        self._update_audio_threshold_visibility()
+        
+        return widget
+    
+    def _update_audio_threshold_visibility(self):
+        """Update threshold visibility and settings based on selected audio event type"""
+        event_type = self.audio_event_type.currentText()
+        
+        # Descriptions for each event type
+        descriptions = {
+            "rms_above": "Triggers when RMS level exceeds threshold (0-1 range)",
+            "rms_below": "Triggers when RMS level falls below threshold (0-1 range)",
+            "peak_above": "Triggers when peak amplitude exceeds threshold (0-1 range)",
+            "peak_below": "Triggers when peak amplitude falls below threshold (0-1 range)",
+            "frequency_above": "Triggers when dominant frequency exceeds threshold (Hz)",
+            "frequency_below": "Triggers when dominant frequency falls below threshold (Hz)",
+            "frequency_stable": "Triggers when frequency stability (std dev) is within threshold (Hz)",
+            "frequency_unstable": "Triggers when frequency stability (std dev) exceeds threshold (Hz)",
+            "db_above": "Triggers when dB level exceeds threshold (dB, typically -60 to 0)",
+            "db_below": "Triggers when dB level falls below threshold (dB, typically -60 to 0)",
+            "band_energy_above": "Triggers when band energy exceeds threshold (0-1 range)",
+            "band_energy_below": "Triggers when band energy falls below threshold (0-1 range)",
+        }
+        self.audio_event_desc.setText(descriptions.get(event_type, ""))
+        
+        # All audio events need a threshold
+        self.audio_threshold.setVisible(True)
+        self.audio_threshold_label.setVisible(True)
+        self.audio_threshold_unit.setVisible(True)
+        
+        # Set appropriate range and unit based on event type
+        if event_type in ["rms_above", "rms_below", "peak_above", "peak_below", "band_energy_above", "band_energy_below"]:
+            self.audio_threshold.setRange(0, 1)
+            self.audio_threshold.setDecimals(3)
+            self.audio_threshold.setSingleStep(0.01)
+            self.audio_threshold.setValue(0.5 if "above" in event_type else 0.1)
+            self.audio_threshold_unit.setText("(0-1 range)")
+        elif event_type in ["frequency_above", "frequency_below"]:
+            self.audio_threshold.setRange(20, 20000)
+            self.audio_threshold.setDecimals(1)
+            self.audio_threshold.setSingleStep(10)
+            self.audio_threshold.setValue(1000 if "above" in event_type else 100)
+            self.audio_threshold_unit.setText("(Hz)")
+        elif event_type in ["frequency_stable", "frequency_unstable"]:
+            self.audio_threshold.setRange(0.1, 100)
+            self.audio_threshold.setDecimals(2)
+            self.audio_threshold.setSingleStep(0.5)
+            self.audio_threshold.setValue(5.0 if "stable" in event_type else 10.0)
+            self.audio_threshold_unit.setText("(Hz std dev)")
+        elif event_type in ["db_above", "db_below"]:
+            self.audio_threshold.setRange(-60, 0)
+            self.audio_threshold.setDecimals(1)
+            self.audio_threshold.setSingleStep(1)
+            self.audio_threshold.setValue(-20 if "above" in event_type else -40)
+            self.audio_threshold_unit.setText("(dB)")
+
+    def _on_audio_sensor_changed(self):
+        """Update event type based on selected audio sensor's configuration"""
+        sensor_name = self.audio_sensor_name.currentText()
+        
+        # Find the sensor object
+        sensor = None
+        for s in self.sensors:
+            if hasattr(s, 'name') and s.name == sensor_name:
+                sensor = s
+                break
+        
+        if sensor and hasattr(sensor, 'audio_config'):
+            mode = sensor.audio_config.get('mode')
+            
+            # Map audio sensor modes to automation event types
+            mode_to_event = {
+                'rms': 'rms_above',
+                'peak': 'peak_above',
+                'freq': 'frequency_above',
+                'band_energy': 'band_energy_above',
+                'db': 'db_above'
+            }
+            
+            event_type = mode_to_event.get(mode)
+            if event_type:
+                index = self.audio_event_type.findText(event_type)
+                if index >= 0:
+                    self.audio_event_type.setCurrentIndex(index)
+                    
+                    # Auto-populate threshold from gate if available
+                    if 'noise_gate' in sensor.audio_config:
+                        self.audio_threshold.setValue(sensor.audio_config['noise_gate'])
         
     def update_trigger_options(self):
         """Update the visible trigger options based on selected type"""
@@ -202,9 +567,51 @@ class TriggerDialog(QDialog):
                  
             self.sensor_operator.setCurrentText(trigger.operator)
             self.sensor_threshold.setValue(trigger.threshold)
+            self.sensor_hysteresis.setValue(getattr(trigger, 'hysteresis', 0.0))
         elif isinstance(trigger, EventTrigger):
             self.trigger_type.setCurrentIndex(3)
             self.event_type.setCurrentText(trigger.event_type)
+        elif isinstance(trigger, OpticalEventTrigger):
+            self.trigger_type.setCurrentIndex(4)
+            # Set sensor name
+            sensor_name_str = str(trigger.sensor_name)
+            if self.optical_sensor_name.findText(sensor_name_str) != -1:
+                self.optical_sensor_name.setCurrentText(sensor_name_str)
+            else:
+                self.optical_sensor_name.addItem(sensor_name_str)
+                self.optical_sensor_name.setCurrentText(sensor_name_str)
+            # Set event type
+            self.optical_event_type.setCurrentText(trigger.event_type)
+            # Set threshold
+            if trigger.threshold_percent is not None:
+                self.optical_threshold.setValue(trigger.threshold_percent)
+            elif trigger.threshold is not None:
+                self.optical_threshold.setValue(trigger.threshold)
+        elif isinstance(trigger, AudioEventTrigger):
+            self.trigger_type.setCurrentIndex(5)
+            # Set sensor name
+            sensor_name_str = str(trigger.sensor_name)
+            if self.audio_sensor_name.findText(sensor_name_str) != -1:
+                self.audio_sensor_name.setCurrentText(sensor_name_str)
+            else:
+                self.audio_sensor_name.addItem(sensor_name_str)
+                self.audio_sensor_name.setCurrentText(sensor_name_str)
+            # Set event type
+            self.audio_event_type.setCurrentText(trigger.event_type)
+            # Set threshold
+            if trigger.threshold is not None:
+                self.audio_threshold.setValue(trigger.threshold)
+            elif trigger.threshold_percent is not None:
+                self.audio_threshold.setValue(trigger.threshold_percent)
+        elif isinstance(trigger, CompoundTrigger):
+            self.trigger_type.setCurrentIndex(6)
+            self.compound_logic.setCurrentText(trigger.logic)
+            if len(trigger.triggers) >= 1:
+                self.sub_trigger1 = trigger.triggers[0]
+                self.label_trig1.setText(self.sub_trigger1.description)
+            if len(trigger.triggers) >= 2:
+                self.sub_trigger2 = trigger.triggers[1]
+                self.label_trig2.setText(self.sub_trigger2.description)
             
         # Ensure the correct tab is visible after loading
         self.update_trigger_options()
@@ -225,10 +632,51 @@ class TriggerDialog(QDialog):
             sensor_name = self.sensor_name.currentText()
             operator = self.sensor_operator.currentText()
             threshold = self.sensor_threshold.value()
-            return SensorValueTrigger(name, sensor_name, operator, threshold)
+            hysteresis = self.sensor_hysteresis.value()
+            return SensorValueTrigger(name, sensor_name, operator, threshold, hysteresis)
         elif trigger_type == 3:  # Event
             event_type = self.event_type.currentText()
             return EventTrigger(name, event_type)
+        elif trigger_type == 4:  # Optical Event
+            sensor_name = self.optical_sensor_name.currentText()
+            event_type = self.optical_event_type.currentText()
+            threshold_value = self.optical_threshold.value()
+            
+            # Determine if threshold is percentage or absolute value
+            if event_type in ["fill_level_above", "fill_level_below", "color_detected", "position_changed"]:
+                return OpticalEventTrigger(name, sensor_name, event_type, 
+                                          threshold=None, threshold_percent=threshold_value)
+            elif event_type == "light_event":
+                return OpticalEventTrigger(name, sensor_name, event_type)
+            else:
+                return OpticalEventTrigger(name, sensor_name, event_type, 
+                                          threshold=threshold_value, threshold_percent=None)
+        elif trigger_type == 5:  # Audio Event
+            sensor_name = self.audio_sensor_name.currentText().strip()
+            event_type = self.audio_event_type.currentText().strip()
+            threshold_value = self.audio_threshold.value()
+            
+            # Validate that sensor name and event type are not empty
+            if not sensor_name:
+                QMessageBox.warning(self, "Missing Sensor", "Please select an audio sensor.")
+                return None
+            if not event_type:
+                QMessageBox.warning(self, "Missing Event Type", "Please select an event type.")
+                return None
+            
+            return AudioEventTrigger(name, sensor_name, event_type, 
+                                    threshold=threshold_value, threshold_percent=None)
+        elif trigger_type == 6: # Compound
+            logic = self.compound_logic.currentText()
+            triggers = []
+            if self.sub_trigger1: triggers.append(self.sub_trigger1)
+            if self.sub_trigger2: triggers.append(self.sub_trigger2)
+            
+            if not triggers:
+                QMessageBox.warning(self, "Missing Triggers", "Please configure at least one sub-trigger.")
+                return None
+                
+            return CompoundTrigger(name, triggers, logic)
         
         return None
 
@@ -239,6 +687,7 @@ class ActionDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Configure Action")
         self.resize(500, 400)
+        self.setStyleSheet(DialogStyles.dark_dialog())
         self.action = action
         self.available_ports = available_ports or []
         self.app_context = app_context # Used to get LabJack channels, etc.
@@ -249,7 +698,8 @@ class ActionDialog(QDialog):
             "Send LabJack Command": LabJackCommandAction,
             "Send Serial Command": SerialCommandAction,
             "System Action": SystemAction,
-            "Set Variable": SetVariableAction
+            "Set Variable": SetVariableAction,
+            "Info Marker": InfoMarkerAction
         }
         
         self.setup_ui()
@@ -276,8 +726,9 @@ class ActionDialog(QDialog):
             "Send Serial Command",
             "System Action",
             "Set Variable",
-            #"Delay", # Needs corresponding class in automation.py
-            #"System Command" # Needs corresponding class in automation.py
+            "Info Marker",
+            "Jump to Step",
+            "Condition (If/Else Jump)"
         ])
         self.action_type.currentIndexChanged.connect(self.update_action_options)
         form_layout.addRow("Action Type:", self.action_type)
@@ -308,13 +759,17 @@ class ActionDialog(QDialog):
         self.set_variable_widget = self.create_set_variable_options()
         self.action_options.addTab(self.set_variable_widget, "Variable")
         
-        # Placeholder for Delay options
-        #self.delay_widget = self.create_delay_options()
-        #self.action_options.addTab(self.delay_widget, "Delay")
-
-        # Placeholder for System Command options
-        #self.sys_cmd_widget = self.create_sys_cmd_options()
-        #self.action_options.addTab(self.sys_cmd_widget, "Sys Cmd")
+        # Info Marker options
+        self.info_marker_widget = self.create_info_marker_options()
+        self.action_options.addTab(self.info_marker_widget, "Marker")
+        
+        # Jump options
+        self.jump_widget = self.create_jump_options()
+        self.action_options.addTab(self.jump_widget, "Jump")
+        
+        # Condition options
+        self.condition_widget = self.create_condition_options()
+        self.action_options.addTab(self.condition_widget, "Condition")
 
         layout.addWidget(self.action_options)
         
@@ -337,6 +792,7 @@ class ActionDialog(QDialog):
     def create_arduino_options(self):
         """Create options for Arduino command"""
         widget = QGroupBox("Arduino Command")
+        widget.setStyleSheet(GroupBoxStyles.compact())
         layout = QFormLayout(widget)
         
         self.arduino_command = QLineEdit()
@@ -349,6 +805,7 @@ class ActionDialog(QDialog):
     def create_labjack_options(self):
         """Create options for LabJack command"""
         widget = QGroupBox("LabJack Command")
+        widget.setStyleSheet(GroupBoxStyles.compact())
         layout = QFormLayout(widget)
         
         # Channel selection
@@ -408,6 +865,7 @@ class ActionDialog(QDialog):
     def create_serial_options(self):
         """Create options for serial command"""
         widget = QGroupBox("Serial Command")
+        widget.setStyleSheet(GroupBoxStyles.compact())
         layout = QFormLayout(widget)
         
         self.serial_port = QComboBox()
@@ -425,6 +883,7 @@ class ActionDialog(QDialog):
     def create_system_options(self):
         """Create options for system action"""
         widget = QGroupBox("System Action")
+        widget.setStyleSheet(GroupBoxStyles.compact())
         layout = QVBoxLayout(widget)
         
         # Action type selection
@@ -455,6 +914,7 @@ class ActionDialog(QDialog):
     def create_set_variable_options(self):
         """Create options for Set Variable action"""
         widget = QGroupBox("Set Automation Variable")
+        widget.setStyleSheet(GroupBoxStyles.compact())
         layout = QFormLayout(widget)
         
         self.variable_name_input = QLineEdit()
@@ -472,6 +932,64 @@ class ActionDialog(QDialog):
         help_label.setWordWrap(True)
         layout.addRow(help_label)
 
+        return widget
+
+    def create_info_marker_options(self):
+        """Create options for Info Marker action"""
+        widget = QGroupBox("Info Marker on Graph")
+        widget.setStyleSheet(GroupBoxStyles.compact())
+        layout = QFormLayout(widget)
+        
+        self.marker_text_input = QLineEdit()
+        self.marker_text_input.setPlaceholderText("Enter text for the graph event marker")
+        
+        layout.addRow("Marker Text:", self.marker_text_input)
+        
+        # Add a small help label
+        help_label = QLabel("This text will appear on the graph as an event marker. Use {variable_name} or {sensor_name} for substitutions.")
+        help_label.setStyleSheet("font-size: 9pt; color: gray;")
+        help_label.setWordWrap(True)
+        layout.addRow(help_label)
+
+        return widget
+
+    def create_jump_options(self):
+        """Create options for Jump action"""
+        widget = QGroupBox("Jump to Step")
+        widget.setStyleSheet(GroupBoxStyles.compact())
+        layout = QFormLayout(widget)
+        
+        self.jump_target = QSpinBox()
+        self.jump_target.setRange(1, 100)
+        self.jump_target.setPrefix("Step ")
+        
+        layout.addRow("Target Step:", self.jump_target)
+        layout.addRow(QLabel("Note: Steps are 1-indexed in the UI."))
+        
+        return widget
+
+    def create_condition_options(self):
+        """Create options for Condition action"""
+        widget = QGroupBox("Conditional Branching")
+        widget.setStyleSheet(GroupBoxStyles.compact())
+        layout = QFormLayout(widget)
+        
+        self.cond_expression = QLineEdit()
+        self.cond_expression.setPlaceholderText("e.g., {temp} > 100")
+        
+        self.cond_true_target = QSpinBox()
+        self.cond_true_target.setRange(1, 100)
+        self.cond_true_target.setPrefix("Step ")
+        
+        self.cond_false_target = QSpinBox()
+        self.cond_false_target.setRange(1, 100)
+        self.cond_false_target.setPrefix("Step ")
+        self.cond_false_target.setSpecialValueText("Continue (Next Step)")
+        
+        layout.addRow("Condition:", self.cond_expression)
+        layout.addRow("If True, Jump to:", self.cond_true_target)
+        layout.addRow("If False, Jump to:", self.cond_false_target)
+        
         return widget
         
     def update_system_action_options(self):
@@ -554,8 +1072,9 @@ class ActionDialog(QDialog):
             "Send Serial Command": 2,
             "System Action": 3,
             "Set Variable": 4,
-            #"Delay": 4, # Placeholder index
-            #"System Command": 5 # Placeholder index
+            "Info Marker": 5,
+            "Jump to Step": 6,
+            "Condition (If/Else Jump)": 7
         }
         action_text = self.action_type.currentText()
         index = type_map.get(action_text, 0) # Default to first tab if not found
@@ -571,8 +1090,9 @@ class ActionDialog(QDialog):
             SerialCommandAction: ("Send Serial Command", self.serial_command, "command"), # Port handling needed
             SystemAction: ("System Action", None, None), # Special handling
             SetVariableAction: ("Set Variable", None, None), # <<< Added, special handling
-            #DelayAction: ("Delay", self.delay_seconds, "seconds"), # Placeholder
-            #SystemCommandAction: ("System Command", self.system_command, "command") # Placeholder
+            InfoMarkerAction: ("Info Marker", None, None),
+            JumpToStepAction: ("Jump to Step", None, None),
+            ConditionAction: ("Condition (If/Else Jump)", None, None)
         }
 
         action_type_text = ""
@@ -628,6 +1148,18 @@ class ActionDialog(QDialog):
                      self.variable_name_input.setText(action.variable_name)
                  if hasattr(self, 'variable_expression_input'):
                      self.variable_expression_input.setText(action.expression)
+            elif isinstance(action, InfoMarkerAction):
+                 if hasattr(self, 'marker_text_input'):
+                     self.marker_text_input.setText(action.marker_text)
+            elif isinstance(action, JumpToStepAction):
+                self.jump_target.setValue(action.target_step_index + 1)
+            elif isinstance(action, ConditionAction):
+                self.cond_expression.setText(action.condition_expression)
+                self.cond_true_target.setValue(action.if_true_step + 1)
+                if action.if_false_step is not None:
+                    self.cond_false_target.setValue(action.if_false_step + 1)
+                else:
+                    self.cond_false_target.setValue(0) # Special value for continue
 
         else:
              print(f"Warning: Could not load action of type {type(action).__name__}")
@@ -684,13 +1216,27 @@ class ActionDialog(QDialog):
                  return None # Prevent accepting dialog
              return SetVariableAction(name, var_name, var_expression)
 
-        # --- Placeholder Actions ---
-        #elif action_type == "Delay":
-        #    seconds = self.delay_seconds.value()
-        #    return DelayAction(name, seconds) # Requires DelayAction class
-        #elif action_type == "System Command":
-        #    command = self.system_command.text().strip()
-        #    return SystemCommandAction(name, command) # Requires SystemCommandAction class
+        elif action_type == "Info Marker":
+            marker_text = self.marker_text_input.text().strip()
+            return InfoMarkerAction(name, marker_text)
+
+        elif action_type == "Jump to Step":
+            target = self.jump_target.value() - 1
+            return JumpToStepAction(name, target)
+            
+        elif action_type == "Condition (If/Else Jump)":
+            expression = self.cond_expression.text().strip()
+            true_target = self.cond_true_target.value() - 1
+            false_target = self.cond_false_target.value() - 1
+            
+            if false_target < 0:
+                false_target = None
+                
+            if not expression:
+                 QMessageBox.warning(self, "Missing Condition", "Condition expression cannot be empty.")
+                 return None
+                 
+            return ConditionAction(name, expression, true_target, false_target)
             
         return None
 
@@ -701,6 +1247,7 @@ class StepDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Configure Automation Step")
         self.resize(700, 500)
+        self.setStyleSheet(DialogStyles.dark_dialog())
         self.step = step
         self.sensors = sensors or []
         self.available_ports = available_ports or []
@@ -722,6 +1269,7 @@ class StepDialog(QDialog):
         
         # Trigger configuration
         trigger_group = QGroupBox("Trigger (When)")
+        trigger_group.setStyleSheet(GroupBoxStyles.default())
         trigger_layout = QVBoxLayout(trigger_group)
         
         # Trigger info display
@@ -738,6 +1286,7 @@ class StepDialog(QDialog):
         
         # Action configuration
         action_group = QGroupBox("Action (Do)")
+        action_group.setStyleSheet(GroupBoxStyles.default())
         action_layout = QVBoxLayout(action_group)
         
         # Action info display
@@ -838,6 +1387,7 @@ class SequenceDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Configure Automation Sequence")
         self.resize(800, 600)
+        self.setStyleSheet(DialogStyles.dark_dialog())
         
         # Store context needed by StepDialog
         self.sensors = sensors or []
@@ -880,6 +1430,7 @@ class SequenceDialog(QDialog):
         
         # Steps list
         steps_group = QGroupBox("Sequence Steps")
+        steps_group.setStyleSheet(GroupBoxStyles.elevated())
         steps_layout = QVBoxLayout(steps_group)
 
         self.steps_table = QTableWidget()
@@ -894,6 +1445,8 @@ class SequenceDialog(QDialog):
         self.steps_table.verticalHeader().setVisible(False)
         self.steps_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers) # Don't allow editing in table
         self.steps_table.itemSelectionChanged.connect(self.update_button_states) # Enable/disable buttons
+        # Connect double-click to edit step
+        self.steps_table.cellDoubleClicked.connect(self._on_step_double_clicked)
 
         steps_layout.addWidget(self.steps_table)
         
@@ -1072,6 +1625,14 @@ class SequenceDialog(QDialog):
             self.steps[row], self.steps[row+1] = self.steps[row+1], self.steps[row]
             self.update_steps_table()
             self.steps_table.selectRow(row + 1) # Select the moved item
+    
+    def _on_step_double_clicked(self, row, column):
+        """Handle double-click on a step row to open it in edit mode."""
+        if 0 <= row < len(self.steps):
+            # Select the row first
+            self.steps_table.selectRow(row)
+            # Then edit the step
+            self.edit_step()
             
     def load_sequence(self, sequence):
         """Load values from an existing sequence"""

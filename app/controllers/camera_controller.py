@@ -5,7 +5,7 @@ Manages camera operations, recording, and overlays.
 """
 import sys
 import traceback
-from PyQt6.QtCore import QObject, pyqtSlot, Qt, pyqtSignal
+from PyQt6.QtCore import QObject, pyqtSlot, Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QColor, QPainter, QBrush
 from PyQt6.QtWidgets import QComboBox, QPushButton, QLabel, QMessageBox, QCheckBox, QSlider, QSpinBox
 import os
@@ -14,8 +14,10 @@ from datetime import datetime
 import cv2
 import numpy as np
 import random
+import threading
 
 from app.core.direct_camera import DirectCameraThread  # New direct camera implementation
+from app.core.overlay_manager import BaseOverlay, TextOverlay, TimestampOverlay, SensorOverlay, RectangleOverlay, MotionOverlay
 
 from app.settings.settings_manager import SettingsManager
 from app.core.logger import Logger
@@ -26,6 +28,8 @@ class CameraController(QObject):
 
     # Signal that will be emitted when the camera status changes
     status_changed = pyqtSignal()
+    # Signal emitted when a snapshot is taken
+    snapshot_taken = pyqtSignal(str)
 
     def __init__(self, main_window, settings_model, project_controller):
         """
@@ -99,11 +103,27 @@ class CameraController(QObject):
         self.drag_offset_y = 0
         self.scale_x = 1.0
         self.scale_y = 1.0
+        self.original_width = 1280
+        self.original_height = 720
         self.overlays = []
         self.selected_overlay = None
+
+        # Timer for updating sensor overlay data (pushing data to thread)
+        self.sensor_push_timer = QTimer()
+        self.sensor_push_timer.timeout.connect(self.push_sensor_data_to_thread)
+        self.sensor_push_timer.start(200)  # Update 5 times per second (200ms)
         
-        # Initialize camera
-        self.init_camera()
+        # Timer for clearing automation events after they've been processed
+        self.event_clear_timer = QTimer()
+        self.event_clear_timer.timeout.connect(self._clear_automation_events)
+        self.event_clear_timer.setSingleShot(True)
+        
+        # Track previous motion detection state for edge detection
+        self._last_motion_detected = False
+        
+        # Initialize camera lazily after the event loop starts to keep the
+        # main window paint fast.
+        QTimer.singleShot(0, self.init_camera)
         
         # --- Initial Motion Detection Config --- START
         # Call handlers AFTER init_camera ensures thread exists and connections are made
@@ -129,6 +149,195 @@ class CameraController(QObject):
         
         self.logger.log("Camera controller initialized")
         
+    def _update_run_metadata(self, updates: dict):
+        """Merge video-related metadata into the current run record."""
+        if not updates:
+            return
+        try:
+            if hasattr(self.main_window, "project_controller"):
+                run_dir = self.main_window.project_controller.get_current_run_directory()
+                if run_dir:
+                    self.main_window.project_controller.update_run_metadata(run_dir, updates)
+        except Exception:
+            # Metadata persistence must not break recording
+            pass
+
+    def _append_video_segment_metadata(self, segment: dict):
+        """Append or replace a video segment entry in run metadata."""
+        if not segment:
+            return
+        try:
+            project_controller = getattr(self.main_window, "project_controller", None)
+            if not project_controller:
+                return
+            run_dir = project_controller.get_current_run_directory()
+            if not run_dir:
+                return
+
+            meta = project_controller.get_run_metadata(run_dir) or {}
+            videos = meta.get("videos", [])
+            path = segment.get("path")
+            # Replace any existing segment with the same path
+            if path:
+                videos = [v for v in videos if v.get("path") != path]
+            videos.append(segment)
+            meta["videos"] = videos
+            project_controller.update_run_metadata(run_dir, meta)
+        except Exception:
+            # Metadata persistence must not break recording
+            pass
+
+    def _add_automation_event(self, event_name: str):
+        """Add an event to the automation context for trigger detection"""
+        if not hasattr(self.main_window, 'automation_controller'):
+            return
+        
+        try:
+            # Initialize events dictionary if it doesn't exist
+            if 'events' not in self.main_window.automation_controller.manager.app_context:
+                self.main_window.automation_controller.manager.app_context['events'] = set()
+            
+            # Add event to the context
+            events = self.main_window.automation_controller.manager.app_context['events']
+            if isinstance(events, set):
+                events.add(event_name)
+            elif isinstance(events, dict):
+                events[event_name] = True
+            else:
+                # Convert to set if it's not the right type
+                self.main_window.automation_controller.manager.app_context['events'] = {event_name}
+            
+            # Update the context for running sequences
+            self.main_window.automation_controller.update_context({})
+            
+            # Schedule event clearing after 2 seconds (enough time for triggers to detect it)
+            # Note: motion_detected events are managed manually and should not be cleared by timer
+            if event_name != 'motion_detected':
+                if self.event_clear_timer.isActive():
+                    self.event_clear_timer.stop()
+                self.event_clear_timer.start(2000)  # Clear events after 2 seconds
+            
+        except Exception as e:
+            # Don't break functionality if automation context update fails
+            if hasattr(self, 'logger'):
+                self.logger.log(f"Error updating automation context with event '{event_name}': {e}", "ERROR")
+    
+    def _remove_automation_event(self, event_name: str):
+        """Remove a specific event from the automation context"""
+        if not hasattr(self.main_window, 'automation_controller'):
+            return
+        
+        try:
+            if 'events' in self.main_window.automation_controller.manager.app_context:
+                events = self.main_window.automation_controller.manager.app_context['events']
+                if isinstance(events, set):
+                    events.discard(event_name)
+                elif isinstance(events, dict):
+                    events.pop(event_name, None)
+                
+                # Update the context for running sequences
+                self.main_window.automation_controller.update_context({})
+        except Exception as e:
+            if hasattr(self, 'logger'):
+                self.logger.log(f"Error removing automation event '{event_name}': {e}", "ERROR")
+    
+    def _clear_automation_events(self):
+        """Clear automation events from the context after they've been processed"""
+        if not hasattr(self.main_window, 'automation_controller'):
+            return
+        
+        try:
+            if 'events' in self.main_window.automation_controller.manager.app_context:
+                events = self.main_window.automation_controller.manager.app_context['events']
+                if isinstance(events, set):
+                    events.clear()
+                elif isinstance(events, dict):
+                    events.clear()
+                # Update context to notify sequences
+                self.main_window.automation_controller.update_context({})
+        except Exception as e:
+            if hasattr(self, 'logger'):
+                self.logger.log(f"Error clearing automation events: {e}", "ERROR")
+
+    def _finalize_video_segment_metadata(self, end_ts: float, start_ts: float | None = None):
+        """Update the latest video segment with end/duration information."""
+        try:
+            project_controller = getattr(self.main_window, "project_controller", None)
+            if not project_controller:
+                return
+            run_dir = project_controller.get_current_run_directory()
+            if not run_dir:
+                return
+
+            meta = project_controller.get_run_metadata(run_dir) or {}
+            videos = meta.get("videos", [])
+            path = getattr(self.camera_thread, "output_file", "") if hasattr(self, "camera_thread") else ""
+
+            updated = False
+            for seg in videos:
+                if path and seg.get("path") == path:
+                    seg["end_epoch"] = end_ts
+                    if start_ts:
+                        seg["duration_sec"] = max(0.0, end_ts - start_ts)
+                        seg["start_epoch"] = seg.get("start_epoch") or start_ts
+                    updated = True
+                    break
+
+            if not updated and path:
+                videos.append(
+                    {
+                        "path": path,
+                        "start_epoch": start_ts,
+                        "end_epoch": end_ts,
+                        "duration_sec": max(0.0, end_ts - start_ts) if start_ts else None,
+                    }
+                )
+
+            updates = {
+                "videos": videos,
+                "video_path": path,
+                "video_end_epoch": end_ts,
+            }
+            if start_ts:
+                updates["video_duration_sec"] = max(0.0, end_ts - start_ts)
+                updates["video_start_epoch"] = start_ts
+
+            project_controller.update_run_metadata(run_dir, updates)
+        except Exception:
+            pass
+
+    # Dashboard preview toggle (called from main_window.switch_dashboard_camera_source)
+    def set_dashboard_display(self, enabled: bool):
+        """
+        No-op placeholder for dashboard camera preview selection.
+        Keeps compatibility with callers expecting this method.
+        """
+        # If future dashboard-specific camera behavior is needed, implement it here.
+        return
+        
+    def push_sensor_data_to_thread(self):
+        """Push latest sensor values to the camera thread for overlays"""
+        if not self.camera_thread or not self.camera_thread.isRunning():
+            return
+            
+        sensor_overlays = [o for o in self.overlays if isinstance(o, SensorOverlay)]
+        if not sensor_overlays:
+            return
+            
+        if not hasattr(self.main_window, 'sensor_controller') or not self.main_window.sensor_controller:
+            return
+            
+        for overlay in sensor_overlays:
+            sensor = self.main_window.sensor_controller.get_sensor_by_name(overlay.sensor_name)
+            if sensor and hasattr(sensor, 'current_value') and sensor.current_value is not None:
+                try:
+                    value = f"{float(sensor.current_value):.2f}"
+                except (ValueError, TypeError):
+                    value = str(sensor.current_value)
+                
+                unit = getattr(sensor, 'unit', "")
+                self.camera_thread.update_sensor_overlay_data(overlay.sensor_name, value, unit)
+
     def init_camera(self):
         """Initialize the camera"""
         try:
@@ -157,15 +366,16 @@ class CameraController(QObject):
             self.camera_thread.frame_captured.connect(self.update_frame_display)
             self.camera_thread.recording_status_signal.connect(self.handle_recording_status)
             self.camera_thread.motion_detected_signal.connect(self._update_motion_indicator)
+            self.camera_thread.framerate_warning_signal.connect(self.handle_framerate_warning)
             
             print("Camera thread initialized")
             
             # Set initial motion detection state from settings
-            if self.settings_model:
+            if self.settings:
                 # Read settings
-                enable_motion = self.settings_model.value("camera/motion_detection", "false").lower() == "true"
-                motion_sensitivity = int(self.settings_model.value("camera/motion_sensitivity", 20))
-                motion_min_area = int(self.settings_model.value("camera/motion_min_area", 500))
+                enable_motion = self.settings.get_bool("motion_detection_enabled", False)
+                motion_sensitivity = self.settings.get_int("motion_detection_sensitivity", 20)
+                motion_min_area = self.settings.get_int("motion_detection_min_area", 500)
                 
                 # Set initial state in camera thread
                 self.camera_thread.set_motion_detection_enabled(enable_motion)
@@ -216,12 +426,8 @@ class CameraController(QObject):
             # Always reconnect camera buttons after toggling camera connection
             self.reconnect_camera_buttons()
             
-            # Update UI based on the new state
-            if self.camera_connect_btn:
-                button_text = "Disconnect" if self.is_connected else "Connect"
-                print(f"Setting button text to: {button_text}")
-                self.camera_connect_btn.setText(button_text)
-                self.camera_connect_btn.repaint()
+            # Note: Button text is updated by handle_connection_status which is called
+            # by connect_camera/disconnect_camera, so we don't need to set it here again
             
         except Exception as e:
             self.logger.log(f"Error toggling camera: {str(e)}", "ERROR")
@@ -232,6 +438,18 @@ class CameraController(QObject):
         try:
             # Get camera settings from UI
             camera_id = self.camera_select.value() if hasattr(self.camera_select, 'value') else 0
+            
+            # Check if camera is being used as an optical sensor
+            if hasattr(self.main_window, 'sensor_controller') and self.main_window.sensor_controller:
+                if self.main_window.sensor_controller.is_camera_used_as_sensor(camera_id):
+                    from PyQt6.QtWidgets import QMessageBox
+                    QMessageBox.warning(
+                        self.main_window,
+                        "Camera in Use",
+                        f"Camera {camera_id} is currently being used as an Optical Sensor.\n\n"
+                        "Please disconnect the optical sensor first, or select a different camera."
+                    )
+                    return
             
             # Get settings with proper defaults
             resolution = self.settings.get_value('camera/resolution', "1280x720")
@@ -298,6 +516,29 @@ class CameraController(QObject):
             success = self.camera_thread.connect(camera_id, resolution, fps)
             
             if success:
+                # Add default timestamp overlay if it doesn't exist
+                timestamp_exists = any(getattr(o, 'get_type', lambda: '')() == 'timestamp' for o in self.overlays)
+                if not timestamp_exists:
+                    overlay_count = len(self.overlays) + 1
+                    overlay_name = f"Timestamp {overlay_count}"
+                    new_overlay = TimestampOverlay(overlay_count, overlay_name, "%Y-%m-%d %H:%M:%S")
+                    
+                    # Set requested defaults
+                    new_overlay.position = (0.70, 0.98)  # Adjusted for font scale 1.0 to avoid clipping
+                    new_overlay.font_scale = 1.0          # Set font scale to 1.0 as requested
+                    new_overlay.text_color = (255, 255, 255)  # White (BGR)
+                    new_overlay.bg_color = (0, 0, 0)      # Black (BGR)
+                    new_overlay.bg_alpha = 0.5            # 50% opacity
+                    
+                    self.overlays.append(new_overlay)
+                    self.update_overlay_selector()
+                    
+                    # Pass overlays to camera thread
+                    if self.camera_thread and hasattr(self.camera_thread, 'set_overlays'):
+                        self.camera_thread.set_overlays(self.overlays)
+                    
+                    self.logger.log(f"Added default timestamp overlay to camera {camera_id}")
+
                 # -- Apply Motion Detection Settings AFTER Successful Connect --
                 print("--> Entering Apply Motion Settings block in connect_camera") # LOG
                 try:
@@ -537,26 +778,34 @@ class CameraController(QObject):
     def update_frame_display(self, pixmap):
         """Update the camera display with the captured frame"""
         try:
+            # Don't update dashboard camera label if replay mode is active
+            replay_mode_active = False
+            if hasattr(self.main_window, 'replay_mode_enabled'):
+                replay_mode_active = getattr(self.main_window, 'replay_mode_enabled', False)
+            
             if self.camera_label:
                 # Save the current frame for potential processing
                 self.current_frame = pixmap.copy()
                 
                 # Scale the pixmap to fit the display while maintaining aspect ratio
+                # Use FastTransformation for smoother live performance (Optimization 1)
                 scaled_pixmap = pixmap.scaled(self.camera_label.width(), self.camera_label.height(), 
                                             Qt.AspectRatioMode.KeepAspectRatio, 
-                                            Qt.TransformationMode.SmoothTransformation)
+                                            Qt.TransformationMode.FastTransformation)
                 
                 self.camera_label.setPixmap(scaled_pixmap)
                 
-                # Update the dashboard camera preview if it exists
-                if hasattr(self.main_window, 'dashboard_camera_label'):
-                    # Create a smaller version for the dashboard
-                    dashboard_pixmap = pixmap.scaled(self.main_window.dashboard_camera_label.width(), 
-                                                    self.main_window.dashboard_camera_label.height(),
-                                                    Qt.AspectRatioMode.KeepAspectRatio, 
-                                                    Qt.TransformationMode.SmoothTransformation)
-                    
-                    self.main_window.dashboard_camera_label.setPixmap(dashboard_pixmap)
+                # Update the dashboard camera preview if it exists and replay is not active
+                if hasattr(self.main_window, 'dashboard_camera_label') and not replay_mode_active:
+                    # Only scale and update if the dashboard label is actually visible (Optimization 3)
+                    if self.main_window.dashboard_camera_label.isVisible():
+                        # Create a smaller version for the dashboard
+                        dashboard_pixmap = pixmap.scaled(self.main_window.dashboard_camera_label.width(), 
+                                                        self.main_window.dashboard_camera_label.height(),
+                                                        Qt.AspectRatioMode.KeepAspectRatio, 
+                                                        Qt.TransformationMode.FastTransformation)
+                        
+                        self.main_window.dashboard_camera_label.setPixmap(dashboard_pixmap)
                 
                 # Update the recording label if we're recording
                 if self.is_recording:
@@ -572,11 +821,14 @@ class CameraController(QObject):
                     # Set the processed pixmap
                     self.camera_label.setPixmap(recording_pixmap)
                 
-                # Update FPS information in status bar if available
+                # Update FPS information in status bar and camera tab if available
                 if self.camera_thread and hasattr(self.camera_thread, 'get_actual_fps'):
-                    fps = self.camera_thread.get_actual_fps()
-                    if fps > 0:
-                        self.main_window.statusBar().showMessage(f"FPS: {fps:.1f}")
+                    actual_fps = self.camera_thread.get_actual_fps()
+                    target_fps = self.camera_thread.fps
+                    if actual_fps > 0:
+                        self.main_window.statusBar().showMessage(f"FPS: {actual_fps:.1f}")
+                        if hasattr(self.main_window, 'camera_fps_display'):
+                            self.main_window.camera_fps_display.setText(f"{actual_fps:.1f} / {target_fps:.1f} FPS")
 
                 # Send frame to NDI if enabled
                 if hasattr(self, 'ndi_interface') and hasattr(self, '_ndi_enabled') and self._ndi_enabled:
@@ -644,6 +896,17 @@ class CameraController(QObject):
             print(f"Error handling recording status: {str(e)}")
             traceback.print_exc()
     
+    @pyqtSlot(float, float)
+    def handle_framerate_warning(self, expected_fps, actual_fps):
+        """Handle framerate warning when camera doesn't deliver expected framerate"""
+        try:
+            # We no longer show a warning message box to the user.
+            # The UI now displays actual vs target FPS.
+            self.logger.log(f"Framerate lower than expected: Expected {expected_fps:.1f} FPS, but camera is delivering {actual_fps:.1f} FPS. Frames will be duplicated to maintain sync.", "INFO")
+        except Exception as e:
+            print(f"Error logging framerate warning: {str(e)}")
+            traceback.print_exc()
+    
     @pyqtSlot()
     def toggle_recording(self):
         """Toggle recording on/off"""
@@ -672,6 +935,16 @@ class CameraController(QObject):
                 
             # Stop recording in the camera thread
             self.camera_thread.stop_recording()
+            end_ts = time.time()
+            start_ts = getattr(self.camera_thread, "recording_start_time", None)
+            video_meta = {
+                "video_end_epoch": end_ts,
+            }
+            if start_ts:
+                video_meta["video_duration_sec"] = max(0.0, end_ts - start_ts)
+            self._update_run_metadata(video_meta)
+            # Finalize the latest segment entry with end/duration
+            self._finalize_video_segment_metadata(end_ts, start_ts)
             
             # Update UI state
             self.main_window.record_btn.setText("Start Recording")
@@ -680,6 +953,13 @@ class CameraController(QObject):
             self.is_recording = False
             
             self.logger.log("Stopped recording")
+            
+            # Add event to dashboard and graph
+            if hasattr(self.main_window, 'add_dashboard_event'):
+                self.main_window.add_dashboard_event("Camera recording stopped", "WARNING")
+            
+            # Add recording_stopped event to automation context
+            self._add_automation_event('recording_stopped')
             
         except Exception as e:
             self.logger.log(f"Error stopping recording: {str(e)}")
@@ -763,6 +1043,7 @@ class CameraController(QObject):
             except Exception:
                 pass
             self.main_window.camera_tab_focus_slider.valueChanged.connect(self.main_window.update_focus_value_label)
+            self.main_window.camera_tab_focus_slider.valueChanged.connect(self.main_window.apply_camera_focus_exposure)
             self.main_window.camera_tab_focus_slider.sliderReleased.connect(self.main_window.apply_camera_focus_exposure)
         
         if hasattr(self.main_window, 'camera_tab_manual_exposure') and hasattr(self.main_window, 'camera_tab_exposure_slider'):
@@ -778,18 +1059,45 @@ class CameraController(QObject):
             except Exception:
                 pass
             self.main_window.camera_tab_exposure_slider.valueChanged.connect(self.main_window.update_exposure_value_label)
+            self.main_window.camera_tab_exposure_slider.valueChanged.connect(self.main_window.apply_camera_focus_exposure)
             self.main_window.camera_tab_exposure_slider.sliderReleased.connect(self.main_window.apply_camera_focus_exposure)
+
+        # Connect motion detection controls
+        if self.motion_enabled_widget:
+            try:
+                self.motion_enabled_widget.stateChanged.disconnect()
+            except Exception:
+                pass
+            self.motion_enabled_widget.stateChanged.connect(lambda state: self._handle_motion_enabled_changed(state == 2))
+            
+        if self.motion_sensitivity_widget:
+            try:
+                self.motion_sensitivity_widget.valueChanged.disconnect()
+            except Exception:
+                pass
+            self.motion_sensitivity_widget.valueChanged.connect(self._handle_motion_settings_changed)
+            
+        if self.motion_min_area_widget:
+            try:
+                self.motion_min_area_widget.valueChanged.disconnect()
+            except Exception:
+                pass
+            self.motion_min_area_widget.valueChanged.connect(self._handle_motion_settings_changed)
     
     def take_snapshot(self):
-        """Take a snapshot from the camera"""
+        """Take a snapshot from the camera
+        
+        Returns:
+            str: Path to the saved snapshot if successful, None otherwise
+        """
         try:
             if not self.camera_thread or not self.is_connected:
                 self.logger.log("Cannot take snapshot: No camera connected")
-                return
+                return None
 
             if not self.current_frame:
                 self.logger.log("Cannot take snapshot: No frame available")
-                return
+                return None
 
             # Determine the save directory using the project controller's new helper method
             run_dir = None
@@ -814,23 +1122,51 @@ class CameraController(QObject):
             # Create the snapshots directory if it doesn't exist
             os.makedirs(snapshots_dir, exist_ok=True)
 
-            # Generate filename with timestamp
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            # Generate filename with timestamp (including milliseconds to avoid collisions)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
             filename = os.path.join(snapshots_dir, f"snapshot_{timestamp}.png")
 
-            # Save the frame
-            self.current_frame.save(filename, "PNG")
-
-            self.logger.log(f"Snapshot saved: {filename}")
+            # CRITICAL: Convert QPixmap to QImage BEFORE passing to background thread.
+            # QPixmap is tied to window system resources and is NOT thread-safe for saving
+            # or access in non-UI threads. QImage is a pure data representation and is safe.
+            # This fixes potential UI hangs and slowness during snapshots.
+            image_to_save = self.current_frame.toImage()
             
+            def save_frame_async(image, path, logger, signal_emitter=None):
+                try:
+                    image.save(path, "PNG")
+                    if logger:
+                        logger.log(f"Snapshot saved: {path}")
+                    else:
+                        print(f"Snapshot saved: {path}")
+                    
+                    # Emit signal AFTER saving is complete
+                    if signal_emitter:
+                        signal_emitter.emit(path)
+                except Exception as e:
+                    if logger:
+                        logger.log(f"Error saving snapshot in background: {str(e)}", "ERROR")
+                    else:
+                        print(f"Error saving snapshot in background: {str(e)}")
+
+            save_thread = threading.Thread(
+                target=save_frame_async, 
+                args=(image_to_save, filename, getattr(self, 'logger', None), self.snapshot_taken),
+                daemon=True
+            )
+            save_thread.start()
+
             # Optionally, if the camera is recording to video and we need to show confirmation in UI
             if hasattr(self.main_window, 'statusBar'):
                 self.main_window.statusBar().showMessage(f"Snapshot saved to {os.path.basename(os.path.dirname(snapshots_dir))}/Snapshots", 3000)
+            
+            return filename
 
         except Exception as e:
             self.logger.log(f"Error taking snapshot: {str(e)}", "ERROR")
             import traceback
             self.logger.log(traceback.format_exc(), "ERROR")
+            return None
     
     def add_overlay(self):
         """Add a new overlay to the camera feed"""
@@ -853,7 +1189,7 @@ class CameraController(QObject):
             type_layout.addWidget(QLabel("Overlay type:"))
             
             overlay_type_combo = QComboBox()
-            overlay_type_combo.addItems(["Text", "Timestamp", "Rectangle", "Sensor"])
+            overlay_type_combo.addItems(["Text", "Timestamp", "Rectangle", "Sensor", "Motion Indicator"])
             type_layout.addWidget(overlay_type_combo)
             
             layout.addLayout(type_layout)
@@ -892,13 +1228,19 @@ class CameraController(QObject):
             # Show/hide input fields based on overlay type
             def on_type_changed(index):
                 selected_type = overlay_type_combo.currentText()
-                text_input.setVisible(selected_type == "Text")
+                text_input.setVisible(selected_type in ["Text", "Timestamp"])
                 sensor_combo.setVisible(selected_type == "Sensor")
                 
                 if selected_type == "Text":
                     text_layout.itemAt(0).widget().setText("Text:")
+                    if text_input.text() == "%Y-%m-%d %H:%M:%S" or not text_input.text():
+                        text_input.setText("New Overlay")
                 elif selected_type == "Timestamp":
                     text_layout.itemAt(0).widget().setText("Format:")
+                    if text_input.text() == "New Overlay" or not text_input.text():
+                        text_input.setText("%Y-%m-%d %H:%M:%S")
+                else:
+                    text_layout.itemAt(0).widget().setText("Name:") # Fallback
                 
                 # Enable/disable OK button if Sensor is selected but no sensors available
                 if selected_type == "Sensor" and (not sensor_names or sensor_names[0] == "No sensors available"):
@@ -925,35 +1267,41 @@ class CameraController(QObject):
             
             # Create a new overlay object
             overlay_count = len(self.overlays) + 1
-            
-            # Default overlay properties with BGR color format (OpenCV uses BGR)
-            # Green text (0, 255, 0) in RGB becomes (0, 255, 0) in BGR
-            # Black background (0, 0, 0) in RGB becomes (0, 0, 0) in BGR
-            new_overlay = {
-                "id": overlay_count,
-                "name": f"{overlay_type.capitalize()} {overlay_count}",
-                "type": overlay_type,
-                "position": (50, 50 + (overlay_count - 1) * 30),
-                "font_scale": 0.7,
-                "thickness": 2,
-                "text_color": (0, 255, 0),  # BGR format (Green)
-                "bg_color": (0, 0, 0),      # BGR format (Black)
-                "bg_alpha": 50,
-                "visible": True
-            }
-            
-            # Add type-specific properties
+            overlay_name = f"{overlay_type.capitalize()} {overlay_count}"
+            rel_pos = (0.05, 0.05 + (overlay_count - 1) * 0.05)
+
             if overlay_type == "text":
-                new_overlay["text"] = text_input.text()
+                new_overlay = TextOverlay(overlay_count, overlay_name, text_input.text())
             elif overlay_type == "timestamp":
-                new_overlay["text"] = "Current Time"  # Just a placeholder, will be replaced
+                new_overlay = TimestampOverlay(overlay_count, overlay_name, text_input.text() if text_input.text() else "%Y-%m-%d %H:%M:%S")
+                # Set requested defaults for timestamp overlay
+                new_overlay.position = (0.70, 0.98)  # Adjusted for font scale 1.0 to avoid clipping
+                new_overlay.font_scale = 1.0          # Set font scale to 1.0 as requested
+                new_overlay.text_color = (255, 255, 255)  # White (BGR)
+                new_overlay.bg_color = (0, 0, 0)      # Black (BGR)
+                new_overlay.bg_alpha = 0.5            # 50% opacity
             elif overlay_type == "rectangle":
-                new_overlay["width"] = 150
-                new_overlay["height"] = 80
+                new_overlay = RectangleOverlay(overlay_count, overlay_name, 0.15, 0.1)
             elif overlay_type == "sensor":
                 selected_sensor = sensor_combo.currentText()
-                new_overlay["sensor_name"] = selected_sensor
-                new_overlay["text"] = f"{selected_sensor}: N/A"  # Default text, will be updated dynamically
+                new_overlay = SensorOverlay(overlay_count, overlay_name, selected_sensor)
+            elif overlay_type == "motion indicator":
+                new_overlay = MotionOverlay(overlay_count, overlay_name)
+            else:
+                return
+
+            new_overlay.position = rel_pos
+            if overlay_type != "timestamp":
+                new_overlay.text_color = (0, 255, 0)  # BGR format (Green)
+                new_overlay.bg_color = (0, 0, 0)      # BGR format (Black)
+                new_overlay.bg_alpha = 0.5
+            else:
+                # Use customized defaults for timestamp
+                new_overlay.position = (0.70, 0.98)
+                new_overlay.font_scale = 1.0
+                new_overlay.text_color = (255, 255, 255)
+                new_overlay.bg_color = (0, 0, 0)
+                new_overlay.bg_alpha = 0.5
             
             self.overlays.append(new_overlay)
             self.selected_overlay = new_overlay
@@ -964,6 +1312,9 @@ class CameraController(QObject):
             # Pass overlays to camera thread
             if self.camera_thread and hasattr(self.camera_thread, 'set_overlays'):
                 self.camera_thread.set_overlays(self.overlays)
+            
+            # Save overlays to run directory
+            self.save_overlays_to_run()
             
             self.logger.log(f"Added {overlay_type} overlay #{overlay_count}")
             
@@ -987,12 +1338,20 @@ class CameraController(QObject):
         self.main_window.overlay_selector.clear()
         
         for overlay in self.overlays:
-            self.main_window.overlay_selector.addItem(overlay["name"])
+            if isinstance(overlay, BaseOverlay):
+                self.main_window.overlay_selector.addItem(overlay.name)
+            else:
+                self.main_window.overlay_selector.addItem(overlay["name"])
         
         # Set the current item to the selected overlay
         if self.selected_overlay:
-            index = self.overlays.index(self.selected_overlay)
-            self.main_window.overlay_selector.setCurrentIndex(index)
+            try:
+                index = self.overlays.index(self.selected_overlay)
+                self.main_window.overlay_selector.setCurrentIndex(index)
+            except ValueError:
+                self.main_window.overlay_selector.setCurrentIndex(-1)
+        else:
+            self.main_window.overlay_selector.setCurrentIndex(-1)
             
         # Connect signal to handle overlay selection changes
         self.main_window.overlay_selector.currentIndexChanged.connect(self.on_overlay_selected)
@@ -1013,48 +1372,76 @@ class CameraController(QObject):
             return
             
         # Update UI controls with the selected overlay's properties
-        self.main_window.overlay_font_scale.setValue(self.selected_overlay["font_scale"])
-        self.main_window.overlay_thickness.setValue(self.selected_overlay["thickness"])
-        
-        # Get overlay type
-        overlay_type = self.selected_overlay.get("type", "text")
+        if isinstance(self.selected_overlay, BaseOverlay):
+            self.main_window.overlay_font_scale.setValue(self.selected_overlay.font_scale)
+            self.main_window.overlay_thickness.setValue(self.selected_overlay.thickness)
+            overlay_type = self.selected_overlay.get_type()
+            text_color = self.selected_overlay.text_color
+            bg_color = self.selected_overlay.bg_color
+            bg_alpha = int(self.selected_overlay.bg_alpha * 100)
+        else:
+            # Fallback for dict (should not happen after migration)
+            self.main_window.overlay_font_scale.setValue(self.selected_overlay.get("font_scale", 0.7))
+            self.main_window.overlay_thickness.setValue(self.selected_overlay.get("thickness", 2))
+            overlay_type = self.selected_overlay.get("type", "text")
+            text_color = self.selected_overlay.get("text_color", (0, 255, 0))
+            bg_color = self.selected_overlay.get("bg_color", (0, 0, 0))
+            bg_alpha = self.selected_overlay.get("bg_alpha", 50)
         
         # Show/hide type-specific controls - Use setExpanded for CollapsibleBox
         if hasattr(self.main_window, 'overlay_text_content_group'):
-            # Set expansion state based on overlay type
+            self.main_window.overlay_text_content_group.setVisible(overlay_type not in ["motion"])
             self.main_window.overlay_text_content_group.setExpanded(overlay_type in ["text", "timestamp", "sensor"])
             
         if hasattr(self.main_window, 'overlay_text_content'):
-            # For timestamp overlays, disable text editing but show the field
             if overlay_type == "timestamp":
                 self.main_window.overlay_text_content.setText("Current Time (Automatic)")
                 self.main_window.overlay_text_content.setEnabled(False)
             elif overlay_type == "sensor":
-                sensor_name = self.selected_overlay.get("sensor_name", "Unknown")
+                sensor_name = getattr(self.selected_overlay, "sensor_name", "Unknown") if isinstance(self.selected_overlay, BaseOverlay) else self.selected_overlay.get("sensor_name", "Unknown")
                 self.main_window.overlay_text_content.setText(f"{sensor_name} (Automatic)")
                 self.main_window.overlay_text_content.setEnabled(False)
             else:
-                self.main_window.overlay_text_content.setText(self.selected_overlay.get("text", ""))
+                text = getattr(self.selected_overlay, "text", "") if isinstance(self.selected_overlay, BaseOverlay) else self.selected_overlay.get("text", "")
+                self.main_window.overlay_text_content.setText(text)
                 self.main_window.overlay_text_content.setEnabled(overlay_type == "text")
         
         # Handle rectangle dimensions if available
         if hasattr(self.main_window, 'overlay_dimensions_group'):
-            # Set expansion state based on overlay type
             self.main_window.overlay_dimensions_group.setExpanded(overlay_type == "rectangle")
             
             if overlay_type == "rectangle" and hasattr(self.main_window, 'overlay_width') and hasattr(self.main_window, 'overlay_height'):
-                self.main_window.overlay_width.setValue(self.selected_overlay.get("width", 150))
-                self.main_window.overlay_height.setValue(self.selected_overlay.get("height", 80))
+                w_val = getattr(self.selected_overlay, "width", 0.1) if isinstance(self.selected_overlay, BaseOverlay) else self.selected_overlay.get("width", 0.1)
+                h_val = getattr(self.selected_overlay, "height", 0.1) if isinstance(self.selected_overlay, BaseOverlay) else self.selected_overlay.get("height", 0.1)
+                
+                # Convert relative back to pixels for UI
+                self.main_window.overlay_width.setValue(int(w_val * self.original_width))
+                self.main_window.overlay_height.setValue(int(h_val * self.original_height))
         
         # Update color preview boxes - Convert BGR to RGB for display
-        b, g, r = self.selected_overlay["text_color"]
+        b, g, r = text_color
         self.main_window.text_color_preview.setStyleSheet(f"background-color: rgb({r}, {g}, {b}); border: 1px solid #888;")
-        
-        b, g, r = self.selected_overlay["bg_color"]
+
+        b, g, r = bg_color
         self.main_window.bg_color_preview.setStyleSheet(f"background-color: rgb({r}, {g}, {b}); border: 1px solid #888;")
-        
+
+        # Update hidden color spinboxes
+        if hasattr(self.main_window, 'overlay_text_color_r'):
+            self.main_window.overlay_text_color_r.setValue(r)
+        if hasattr(self.main_window, 'overlay_text_color_g'):
+            self.main_window.overlay_text_color_g.setValue(g)
+        if hasattr(self.main_window, 'overlay_text_color_b'):
+            self.main_window.overlay_text_color_b.setValue(b)
+
+        if hasattr(self.main_window, 'overlay_bg_color_r'):
+            self.main_window.overlay_bg_color_r.setValue(r)
+        if hasattr(self.main_window, 'overlay_bg_color_g'):
+            self.main_window.overlay_bg_color_g.setValue(g)
+        if hasattr(self.main_window, 'overlay_bg_color_b'):
+            self.main_window.overlay_bg_color_b.setValue(b)
+
         # Update opacity
-        self.main_window.overlay_bg_alpha.setValue(self.selected_overlay["bg_alpha"])
+        self.main_window.overlay_bg_alpha.setValue(bg_alpha)
     
     def apply_overlay_settings(self):
         """Apply settings to the selected overlay"""
@@ -1062,56 +1449,122 @@ class CameraController(QObject):
             if not self.selected_overlay:
                 return
                 
-            # Get values from UI
-            self.selected_overlay["font_scale"] = self.main_window.overlay_font_scale.value()
-            self.selected_overlay["thickness"] = self.main_window.overlay_thickness.value()
-            
-            # Get overlay type
-            overlay_type = self.selected_overlay.get("type", "text")
-            
-            # Get type-specific settings
-            if overlay_type == "text":
-                self.selected_overlay["text"] = self.main_window.overlay_text_content.text()
-            elif overlay_type == "rectangle" and hasattr(self.main_window, 'overlay_width') and hasattr(self.main_window, 'overlay_height'):
-                self.selected_overlay["width"] = self.main_window.overlay_width.value()
-                self.selected_overlay["height"] = self.main_window.overlay_height.value()
-            
-            # Get colors from hidden spinboxes
-            if hasattr(self.main_window, 'overlay_text_color_r') and \
-               hasattr(self.main_window, 'overlay_text_color_g') and \
-               hasattr(self.main_window, 'overlay_text_color_b'):
+            if isinstance(self.selected_overlay, BaseOverlay):
+                # Get values from UI
+                self.selected_overlay.font_scale = self.main_window.overlay_font_scale.value()
+                self.selected_overlay.thickness = self.main_window.overlay_thickness.value()
+                
+                overlay_type = self.selected_overlay.get_type()
+                
+                # Get type-specific settings
+                if overlay_type == "text":
+                    self.selected_overlay.text = self.main_window.overlay_text_content.text()
+                elif overlay_type == "rectangle" and hasattr(self.main_window, 'overlay_width') and hasattr(self.main_window, 'overlay_height'):
+                    # Convert UI pixels to relative units based on current frame size
+                    self.selected_overlay.width = self.main_window.overlay_width.value() / float(self.original_width)
+                    self.selected_overlay.height = self.main_window.overlay_height.value() / float(self.original_height)
+                
                 # BGR format for OpenCV
-                self.selected_overlay["text_color"] = (
+                self.selected_overlay.text_color = (
                     self.main_window.overlay_text_color_b.value(),
                     self.main_window.overlay_text_color_g.value(),
                     self.main_window.overlay_text_color_r.value()
                 )
-                
-            if hasattr(self.main_window, 'overlay_bg_color_r') and \
-               hasattr(self.main_window, 'overlay_bg_color_g') and \
-               hasattr(self.main_window, 'overlay_bg_color_b'):
-                # BGR format for OpenCV
-                self.selected_overlay["bg_color"] = (
+                    
+                self.selected_overlay.bg_color = (
                     self.main_window.overlay_bg_color_b.value(),
                     self.main_window.overlay_bg_color_g.value(),
                     self.main_window.overlay_bg_color_r.value()
                 )
-                
-            # Get opacity (bg_alpha) - applied to all overlay types
-            if hasattr(self.main_window, 'overlay_bg_alpha'):
-                self.selected_overlay["bg_alpha"] = self.main_window.overlay_bg_alpha.value()
-                print(f"Applied opacity: {self.main_window.overlay_bg_alpha.value()} to overlay type: {overlay_type}")
+                    
+                # Get opacity (bg_alpha)
+                self.selected_overlay.bg_alpha = self.main_window.overlay_bg_alpha.value() / 100.0
             
             # Update camera thread with the updated overlays
             if self.camera_thread and hasattr(self.camera_thread, 'set_overlays'):
                 self.camera_thread.set_overlays(self.overlays)
-                print(f"Updated overlays with new settings. Current opacity value: {self.selected_overlay.get('bg_alpha', 'N/A')}")
+            
+            # Save overlays to run directory
+            self.save_overlays_to_run()
             
             self.logger.log("Applied overlay settings")
             
         except Exception as e:
             self.logger.log(f"Error applying overlay settings: {str(e)}")
             traceback.print_exc()
+
+    def save_overlays_to_run(self):
+        """Save overlays to the current run directory or global config"""
+        try:
+            run_dir = None
+            is_replay = getattr(self.main_window, 'is_replay_mode', False)
+            
+            if not is_replay:
+                run_dir = getattr(self.project_controller, 'current_run_folder', None)
+            
+            if run_dir and os.path.isdir(run_dir):
+                save_path = run_dir
+                self.logger.log(f"Saving overlays to run directory: {save_path}")
+            else:
+                # Fallback to global config directory
+                save_path = os.path.join(os.path.expanduser("~"), ".evolabs_daq")
+                if not os.path.exists(save_path):
+                    os.makedirs(save_path, exist_ok=True)
+                self.logger.log(f"Saving overlays to global config: {save_path}")
+                
+            overlays_file = os.path.join(save_path, "overlays.json")
+            data = [o.to_dict() if isinstance(o, BaseOverlay) else o for o in self.overlays]
+            
+            import json
+            with open(overlays_file, 'w') as f:
+                json.dump(data, f, indent=4)
+            self.logger.log(f"Overlays saved to {overlays_file}")
+        except Exception as e:
+            self.logger.log(f"Error saving overlays: {str(e)}", "WARN")
+
+    def load_overlays_from_run(self, run_dir=None):
+        """Load overlays from the specified run directory or global config"""
+        try:
+            if not run_dir:
+                run_dir = getattr(self.project_controller, 'current_run_folder', None)
+                
+            # Try specified directory first
+            overlays_file = None
+            if run_dir and os.path.isdir(run_dir):
+                overlays_file = os.path.join(run_dir, "overlays.json")
+            
+            # If not found, try global config
+            if not overlays_file or not os.path.exists(overlays_file):
+                global_path = os.path.join(os.path.expanduser("~"), ".evolabs_daq", "overlays.json")
+                if os.path.exists(global_path):
+                    overlays_file = global_path
+            
+            if not overlays_file or not os.path.exists(overlays_file):
+                return
+                
+            import json
+            with open(overlays_file, 'r') as f:
+                data = json.load(f)
+                
+            self.overlays = []
+            for item in data:
+                obj = BaseOverlay.from_dict(item)
+                if obj:
+                    self.overlays.append(obj)
+            
+            if self.overlays:
+                self.selected_overlay = self.overlays[0]
+            else:
+                self.selected_overlay = None
+                
+            self.update_overlay_selector()
+            
+            if self.camera_thread and hasattr(self.camera_thread, 'set_overlays'):
+                self.camera_thread.set_overlays(self.overlays)
+                
+            self.logger.log(f"Loaded {len(self.overlays)} overlays from {run_dir}")
+        except Exception as e:
+            self.logger.log(f"Error loading overlays: {str(e)}", "WARN")
     
     def remove_overlay(self):
         """Remove the selected overlay"""
@@ -1134,6 +1587,9 @@ class CameraController(QObject):
             # Update camera thread with the updated overlays
             if self.camera_thread and hasattr(self.camera_thread, 'set_overlays'):
                 self.camera_thread.set_overlays(self.overlays)
+            
+            # Save updates to run directory
+            self.save_overlays_to_run()
             
             self.logger.log("Removed overlay")
             
@@ -1212,6 +1668,10 @@ class CameraController(QObject):
             if hasattr(self.main_window, 'record_with_overlays'):
                 record_with_overlays = self.main_window.record_with_overlays.isChecked()
                 self.settings.set_value("record_with_overlays", "true" if record_with_overlays else "false")
+            
+            if hasattr(self.main_window, 'record_audio'):
+                record_audio = self.main_window.record_audio.isChecked()
+                self.settings.set_value("record_audio", "true" if record_audio else "false")
             
             if hasattr(self.main_window, 'recording_output_dir'):
                 recording_output_dir = self.main_window.recording_output_dir.text()
@@ -1344,71 +1804,62 @@ class CameraController(QObject):
             # Check if we clicked on an overlay
             self.selected_overlay = None
             
+            # Use relative coordinates (0.0 - 1.0) of the click within the pixmap
+            rel_click_x = pixmap_click_x / pixmap_width
+            rel_click_y = pixmap_click_y / pixmap_height
+            
             for overlay in self.overlays:
-                # Get overlay properties in original frame coordinates
-                pos_x, pos_y = overlay["position"]
-                overlay_type = overlay.get("type", "text")
-                
-                # Convert overlay position from original frame to displayed pixmap coordinates
-                display_x = pos_x / self.scale_x
-                display_y = pos_y / self.scale_y
+                if not isinstance(overlay, BaseOverlay):
+                    continue
+                    
+                pos_x_rel, pos_y_rel = overlay.position
+                overlay_type = overlay.get_type()
                 
                 # Hit testing based on overlay type
                 hit = False
                 
+                # We need actual pixel sizes for hit testing text
+                # Use current original_width/height to estimate displayed size
                 if overlay_type == "rectangle":
                     # Rectangle hit test
-                    width = overlay.get("width", 100) / self.scale_x
-                    height = overlay.get("height", 50) / self.scale_y
+                    w_rel = overlay.width
+                    h_rel = overlay.height
                     
-                    # Add padding for easier selection (5 pixels in each direction)
-                    padding_x = 5 / self.scale_x
-                    padding_y = 5 / self.scale_y
-                    
-                    # Calculate rectangle bounds with padding
-                    rect_left = display_x - padding_x
-                    rect_right = display_x + width + padding_x
-                    rect_top = display_y - padding_y
-                    rect_bottom = display_y + height + padding_y
-                    
-                    if (rect_left <= pixmap_click_x <= rect_right and 
-                        rect_top <= pixmap_click_y <= rect_bottom):
+                    if (pos_x_rel <= rel_click_x <= pos_x_rel + w_rel and 
+                        pos_y_rel <= rel_click_y <= pos_y_rel + h_rel):
+                        hit = True
+                elif overlay_type == "motion":
+                    # Circular indicator hit test
+                    indicator_size_rel = 30 / self.original_width # slightly larger for easier clicking
+                    dist = ((rel_click_x - pos_x_rel)**2 + (rel_click_y - pos_y_rel)**2)**0.5
+                    if dist < indicator_size_rel:
                         hit = True
                 else:
-                    # Text or timestamp hit test
-                    text = overlay.get("text", "")
-                    if overlay_type == "timestamp":
-                        # For timestamp overlays, use a standard length for hit testing
-                        text = "YYYY-MM-DD HH:MM:SS"
-                        
-                    font_scale = overlay.get("font_scale", 0.7)
-                    thickness = overlay.get("thickness", 2)
+                    # Text-based hit test using cv2.getTextSize
+                    text = ""
+                    if overlay_type == "text":
+                        text = overlay.text
+                    elif overlay_type == "timestamp":
+                        text = datetime.now().strftime(overlay.format)
+                    elif overlay_type == "sensor":
+                        text = f"{overlay.sensor_name}: {overlay.sensor_value} {overlay.sensor_unit}"
                     
-                    # Better text size calculation for different font scales
-                    # The 8.0 multiplier is approximate for the FONT_HERSHEY_SIMPLEX font
-                    # Testing shows this provides better estimation of actual rendered width
-                    text_width = len(text) * 8.0 * font_scale / self.scale_x
-                    text_height = 25 * font_scale / self.scale_y  # Increased height for better hit detection
+                    (text_w_px, text_h_px), baseline = cv2.getTextSize(
+                        text, cv2.FONT_HERSHEY_SIMPLEX, overlay.font_scale, overlay.thickness)
                     
-                    # Add horizontal padding for hit testing
-                    padding_x = 10 / self.scale_x  # 10 pixels in original frame coordinates
-                    padding_y = 10 / self.scale_y  # 10 pixels in original frame coordinates
+                    # Convert pixel size back to relative size
+                    w_rel = (text_w_px + 16) / self.original_width
+                    h_rel = (text_h_px + 16) / self.original_height
                     
-                    # Improved hit testing with padding for the entire text box
-                    text_left = display_x - padding_x
-                    text_right = display_x + text_width + padding_x
-                    text_top = display_y - text_height - padding_y
-                    text_bottom = display_y + padding_y
-                    
-                    if (text_left <= pixmap_click_x <= text_right and 
-                        text_top <= pixmap_click_y <= text_bottom):
+                    if (pos_x_rel - 0.01 <= rel_click_x <= pos_x_rel + w_rel + 0.01 and 
+                        pos_y_rel - h_rel - 0.01 <= rel_click_y <= pos_y_rel + 0.01):
                         hit = True
                         
                 if hit:
                     self.selected_overlay = overlay
-                    # Store offset from overlay position to click position (in pixmap space)
-                    self.drag_offset_x = pixmap_click_x - display_x
-                    self.drag_offset_y = pixmap_click_y - display_y
+                    # Store relative offset from overlay position to click position
+                    self.drag_offset_x = rel_click_x - pos_x_rel
+                    self.drag_offset_y = rel_click_y - pos_y_rel
                     break
                 
             # Update overlay settings UI if an overlay was selected
@@ -1422,6 +1873,12 @@ class CameraController(QObject):
     def camera_mouse_release(self, event):
         """Handle mouse release events on the camera display"""
         try:
+            if self.drag_start_pos and self.selected_overlay:
+                # Final update and save
+                if self.camera_thread and hasattr(self.camera_thread, 'set_overlays'):
+                    self.camera_thread.set_overlays(self.overlays)
+                self.save_overlays_to_run()
+                
             # Reset drag start position
             self.drag_start_pos = None
             
@@ -1458,27 +1915,33 @@ class CameraController(QObject):
                 pixmap_mouse_x = event.position().x() - pixmap_x
                 pixmap_mouse_y = event.position().y() - pixmap_y
                 
-                # Calculate new overlay position in pixmap coordinates
-                # Subtract the drag offset to get the top-left position
-                new_pixmap_x = pixmap_mouse_x - self.drag_offset_x
-                new_pixmap_y = pixmap_mouse_y - self.drag_offset_y
+                # Get mouse position in relative coordinates (0.0 - 1.0)
+                rel_mouse_x = pixmap_mouse_x / pixmap_width
+                rel_mouse_y = pixmap_mouse_y / pixmap_height
                 
-                # Keep overlay within pixmap bounds
-                new_pixmap_x = max(0, min(new_pixmap_x, pixmap_width))
-                new_pixmap_y = max(0, min(new_pixmap_y, pixmap_height))
+                # Calculate new relative overlay position
+                new_rel_x = rel_mouse_x - self.drag_offset_x
+                new_rel_y = rel_mouse_y - self.drag_offset_y
                 
-                # Convert back to original frame coordinates
-                new_frame_x = new_pixmap_x * self.scale_x
-                new_frame_y = new_pixmap_y * self.scale_y
+                # Keep overlay within bounds
+                new_rel_x = max(0, min(new_rel_x, 1.0))
+                new_rel_y = max(0, min(new_rel_y, 1.0))
                 
                 # Update overlay position
-                self.selected_overlay["position"] = (new_frame_x, new_frame_y)
+                if isinstance(self.selected_overlay, BaseOverlay):
+                    self.selected_overlay.position = (new_rel_x, new_rel_y)
+                else:
+                    self.selected_overlay["position"] = (new_rel_x, new_rel_y)
                 
-                # Update camera thread with the updated overlays
+                # Update camera thread with the updated overlays (throttled)
                 if self.camera_thread and hasattr(self.camera_thread, 'set_overlays'):
-                    self.camera_thread.set_overlays(self.overlays)
+                    # Use a small throttle to avoid excessive deepcopy in the thread
+                    now = time.time()
+                    if not hasattr(self, '_last_drag_update') or now - self._last_drag_update > 0.05:
+                        self.camera_thread.set_overlays(self.overlays)
+                        self._last_drag_update = now
                 
-                # Update drag start position
+                # Update drag start position to current for next delta if needed
                 self.drag_start_pos = event.position()
             
         except Exception as e:
@@ -1571,30 +2034,47 @@ class CameraController(QObject):
     def choose_text_color(self):
         """Open color dialog to choose text color"""
         from PyQt6.QtWidgets import QColorDialog
-        
+
         if not self.selected_overlay:
             return
-            
+
         # Get current color - BGR to RGB conversion for display
-        b, g, r = self.selected_overlay["text_color"]
+        if isinstance(self.selected_overlay, BaseOverlay):
+            b, g, r = self.selected_overlay.text_color
+        else:
+            b, g, r = self.selected_overlay["text_color"]
+            
         current_color = QColorDialog.getColor(
             QColor(r, g, b)  # Convert BGR to RGB for QColorDialog
         )
-        
+
         if current_color.isValid():
             # Update overlay text color - RGB to BGR conversion for OpenCV
-            self.selected_overlay["text_color"] = (
+            new_color = (
                 current_color.blue(),    # B
                 current_color.green(),   # G
                 current_color.red()      # R
             )
             
+            if isinstance(self.selected_overlay, BaseOverlay):
+                self.selected_overlay.text_color = new_color
+            else:
+                self.selected_overlay["text_color"] = new_color
+
             # Update UI (using RGB)
             self.main_window.text_color_preview.setStyleSheet(
                 f"background-color: rgb({current_color.red()}, {current_color.green()}, {current_color.blue()}); "
                 f"border: 1px solid #888;"
             )
-            
+
+            # Update hidden spinboxes to match the new color
+            if hasattr(self.main_window, 'overlay_text_color_r'):
+                self.main_window.overlay_text_color_r.setValue(current_color.red())
+            if hasattr(self.main_window, 'overlay_text_color_g'):
+                self.main_window.overlay_text_color_g.setValue(current_color.green())
+            if hasattr(self.main_window, 'overlay_text_color_b'):
+                self.main_window.overlay_text_color_b.setValue(current_color.blue())
+
             # Update the camera thread with the updated overlays
             if self.camera_thread and hasattr(self.camera_thread, 'set_overlays'):
                 self.camera_thread.set_overlays(self.overlays)
@@ -1603,30 +2083,47 @@ class CameraController(QObject):
         """Open color dialog to choose background color"""
         from PyQt6.QtWidgets import QColorDialog
         from PyQt6.QtGui import QColor
-        
+
         if not self.selected_overlay:
             return
-            
+
         # Get current color - BGR to RGB conversion for display
-        b, g, r = self.selected_overlay["bg_color"]
+        if isinstance(self.selected_overlay, BaseOverlay):
+            b, g, r = self.selected_overlay.bg_color
+        else:
+            b, g, r = self.selected_overlay["bg_color"]
+            
         current_color = QColorDialog.getColor(
             QColor(r, g, b)  # Convert BGR to RGB for QColorDialog
         )
-        
+
         if current_color.isValid():
             # Update overlay background color - RGB to BGR conversion for OpenCV
-            self.selected_overlay["bg_color"] = (
+            new_color = (
                 current_color.blue(),    # B
                 current_color.green(),   # G
                 current_color.red()      # R
             )
             
+            if isinstance(self.selected_overlay, BaseOverlay):
+                self.selected_overlay.bg_color = new_color
+            else:
+                self.selected_overlay["bg_color"] = new_color
+
             # Update UI (using RGB)
             self.main_window.bg_color_preview.setStyleSheet(
                 f"background-color: rgb({current_color.red()}, {current_color.green()}, {current_color.blue()}); "
                 f"border: 1px solid #888;"
             )
-            
+
+            # Update hidden spinboxes to match the new color
+            if hasattr(self.main_window, 'overlay_bg_color_r'):
+                self.main_window.overlay_bg_color_r.setValue(current_color.red())
+            if hasattr(self.main_window, 'overlay_bg_color_g'):
+                self.main_window.overlay_bg_color_g.setValue(current_color.green())
+            if hasattr(self.main_window, 'overlay_bg_color_b'):
+                self.main_window.overlay_bg_color_b.setValue(current_color.blue())
+
             # Update the camera thread with the updated overlays
             if self.camera_thread and hasattr(self.camera_thread, 'set_overlays'):
                 self.camera_thread.set_overlays(self.overlays)
@@ -1690,13 +2187,29 @@ class CameraController(QObject):
             if hasattr(self.main_window, 'camera_label'):
                 self.main_window.camera_label.setText("No camera connected")
     
+    def get_audio_devices(self):
+        """Get list of available audio input devices"""
+        return DirectCameraThread.get_audio_input_devices()
+
     def start_recording(self):
         """Start recording video"""
         try:
+            # Check if already recording to prevent duplicate calls
+            if self.is_recording:
+                self.logger.log("Recording already in progress, skipping duplicate start")
+                return
+            
             # Check if camera is connected and thread is running
             if not self.is_connected or not self.camera_thread or not self.camera_thread.isRunning():
-                self.logger.log("Cannot start recording: Camera not connected")
-                return
+                self.logger.log("Camera not connected. Attempting to connect before recording...")
+                self.connect_camera()
+                
+                # Re-check connection status (connect_camera is synchronous for the connection part)
+                if not self.is_connected or not self.camera_thread or not self.camera_thread.isRunning():
+                    self.logger.log("Cannot start recording: Camera connection failed")
+                    return
+                else:
+                    self.logger.log("Camera connected successfully. Proceeding with recording.")
                 
             # Check if we have an active project run directory
             output_dir = "recordings"
@@ -1763,18 +2276,42 @@ class CameraController(QObject):
             
             # Get whether to use direct streaming from SETTINGS (updated by popup)
             use_direct_streaming = self.settings.get_bool("use_direct_streaming", True) # Use get_bool and correct key
+            # Get whether to record audio
+            record_audio = self.settings.get_bool("record_audio", True)
+            
+            # Get specific audio device index
+            audio_device_index = self.settings.get_int("record_audio_device", -1)
+            if audio_device_index == -1:
+                audio_device_index = None
 
             # Update the camera thread with the current overlays
             if hasattr(self.camera_thread, 'set_overlays') and self.overlays:
                 self.camera_thread.set_overlays(self.overlays)
             
             # Start recording in the camera thread
-            self.camera_thread.start_recording(
+            success = self.camera_thread.start_recording(
                 output_dir=output_dir,
                 filename=f"recording_{timestamp}.{video_format}",
                 codec=codec,
-                use_direct_streaming=use_direct_streaming
+                use_direct_streaming=use_direct_streaming,
+                record_audio=record_audio,
+                audio_device_index=audio_device_index
             )
+            if success:
+                video_meta = {
+                    "video_path": getattr(self.camera_thread, "output_file", ""),
+                    "video_start_epoch": getattr(self.camera_thread, "recording_start_time", time.time()),
+                    "video_format": video_format,
+                }
+                self._update_run_metadata(video_meta)
+                # Persist structured segment for replay (supports multiple recordings in one run)
+                self._append_video_segment_metadata(
+                    {
+                        "path": video_meta.get("video_path"),
+                        "start_epoch": video_meta.get("video_start_epoch"),
+                        "format": video_format,
+                    }
+                )
             
             # Update UI state
             self.main_window.record_btn.setText("Stop Recording")
@@ -1784,6 +2321,13 @@ class CameraController(QObject):
             
             self.logger.log(f"Started recording to {output_dir}/recording_{timestamp}.{video_format}")
             
+            # Add event to dashboard and graph
+            if hasattr(self.main_window, 'add_dashboard_event'):
+                self.main_window.add_dashboard_event("Camera recording started", "SUCCESS")
+            
+            # Add recording_started event to automation context
+            self._add_automation_event('recording_started')
+            
         except Exception as e:
             self.logger.log(f"Error starting recording: {str(e)}")
     
@@ -1791,6 +2335,15 @@ class CameraController(QObject):
     @pyqtSlot(bool)
     def _handle_motion_enabled_changed(self, state):
         if not self.camera_thread: return
+        
+        # If enabling motion detection and camera is already connected, show warning
+        if state and self.is_connected:
+            QMessageBox.information(
+                self.main_window,
+                "Motion Detection",
+                "Motion detection has been enabled, but the camera is already connected.\n\n"
+                "Motion detection will only be active the next time the camera is connected."
+            )
         
         if hasattr(self.camera_thread, 'set_motion_detection_enabled'):
             self.camera_thread.set_motion_detection_enabled(state)
@@ -1859,6 +2412,18 @@ class CameraController(QObject):
         if self.motion_indicator is not None:
             style = f"background-color: {color}; border-radius: 5px;"
             self.motion_indicator.setStyleSheet(style)
+        
+        # Add motion detection event to automation context only on transition from False to True
+        # This ensures each motion detection is a discrete event that can trigger automation
+        if detected and not self._last_motion_detected:
+            # Motion just started - add event
+            self._add_automation_event('motion_detected')
+        elif not detected and self._last_motion_detected:
+            # Motion just stopped - clear the event to allow next detection to trigger
+            self._remove_automation_event('motion_detected')
+        
+        # Update the previous state
+        self._last_motion_detected = detected
     # --- Motion Detection Handlers --- END 
 
     def get_status(self):
@@ -1977,6 +2542,7 @@ class CameraController(QObject):
             except Exception:
                 pass
             self.main_window.camera_tab_focus_slider.valueChanged.connect(self.main_window.update_focus_value_label)
+            self.main_window.camera_tab_focus_slider.valueChanged.connect(self.main_window.apply_camera_focus_exposure)
             self.main_window.camera_tab_focus_slider.sliderReleased.connect(self.main_window.apply_camera_focus_exposure)
         
         if hasattr(self.main_window, 'camera_tab_manual_exposure') and hasattr(self.main_window, 'camera_tab_exposure_slider'):
@@ -1992,6 +2558,7 @@ class CameraController(QObject):
             except Exception:
                 pass
             self.main_window.camera_tab_exposure_slider.valueChanged.connect(self.main_window.update_exposure_value_label)
+            self.main_window.camera_tab_exposure_slider.valueChanged.connect(self.main_window.apply_camera_focus_exposure)
             self.main_window.camera_tab_exposure_slider.sliderReleased.connect(self.main_window.apply_camera_focus_exposure)
 
     def update_camera_settings(self, motion_detection=None, motion_sensitivity=None, motion_min_area=None):

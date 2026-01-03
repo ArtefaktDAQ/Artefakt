@@ -1,0 +1,215 @@
+"""
+MQTT Interface
+
+Handles communication with MQTT brokers.
+"""
+
+import time
+import json
+import threading
+from PyQt6.QtCore import QObject, pyqtSignal
+try:
+    import paho.mqtt.client as mqtt
+    MQTT_AVAILABLE = True
+except ImportError:
+    MQTT_AVAILABLE = False
+
+from app.core.interfaces.base_interface import BaseInterface
+
+
+class MQTTInterface(BaseInterface):
+    """Interface for MQTT brokers"""
+    
+    # Connection lost callback
+    on_connection_lost = None
+    
+    def __init__(self, broker="localhost", port=1883, client_id="ArtefaktDAQ", 
+                 username=None, password=None, keepalive=60):
+        """
+        Initialize the MQTT interface
+        
+        Args:
+            broker: MQTT broker address
+            port: MQTT broker port
+            client_id: MQTT client identifier
+            username: Username for authentication
+            password: Password for authentication
+            keepalive: Keepalive interval in seconds
+        """
+        super().__init__(name="MQTT")
+        self.broker = broker
+        self.port = port
+        self.client_id = client_id
+        self.username = username
+        self.password = password
+        self.keepalive = keepalive
+        
+        self.client = None
+        self.data_buffer = {}  # Stores latest {topic: value}
+        self.subscribed_topics = set()
+        self._buffer_lock = threading.Lock()
+        
+        if not MQTT_AVAILABLE:
+            self.error_message = "paho-mqtt library not installed"
+            
+    def connect(self):
+        """
+        Connect to the MQTT broker
+        
+        Returns:
+            True if connected successfully, False otherwise
+        """
+        if not MQTT_AVAILABLE:
+            self.error_message = "paho-mqtt library not installed"
+            return False
+            
+        try:
+            # Create MQTT client
+            # Using CallbackAPIVersion.VERSION2 for paho-mqtt 2.x compatibility
+            try:
+                self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, self.client_id)
+            except AttributeError:
+                # Fallback for older paho-mqtt versions
+                self.client = mqtt.Client(self.client_id)
+            
+            if self.username:
+                self.client.username_pw_set(self.username, self.password)
+            
+            # Set callbacks
+            self.client.on_connect = self._on_connect
+            self.client.on_disconnect = self._on_disconnect
+            self.client.on_message = self._on_message
+            
+            # Connect to broker
+            self.client.connect(self.broker, self.port, self.keepalive)
+            
+            # Start background loop
+            self.client.loop_start()
+            
+            # We don't set self.connected = True here; we wait for _on_connect
+            # but for the interface pattern, we might want to wait a bit
+            timeout = 5.0
+            start_time = time.time()
+            while not self.connected and time.time() - start_time < timeout:
+                time.sleep(0.1)
+                
+            if not self.connected:
+                self.error_message = "Timed out waiting for MQTT connection"
+                self.client.loop_stop()
+                return False
+                
+            return True
+            
+        except Exception as e:
+            self.error_message = f"Failed to connect to MQTT broker: {e}"
+            self.connected = False
+            return False
+            
+    def disconnect(self):
+        """Disconnect from the MQTT broker"""
+        if self.client:
+            self.client.loop_stop()
+            self.client.disconnect()
+        self.connected = False
+        self.client = None
+        
+    def is_connected(self):
+        """Check if the interface is connected"""
+        return self.connected
+        
+    def subscribe(self, topic):
+        """Subscribe to a topic"""
+        if self.client and self.connected:
+            self.client.subscribe(topic)
+            self.subscribed_topics.add(topic)
+            return True
+        return False
+        
+    def unsubscribe(self, topic):
+        """Unsubscribe from a topic"""
+        if self.client and self.connected:
+            self.client.unsubscribe(topic)
+            if topic in self.subscribed_topics:
+                self.subscribed_topics.remove(topic)
+            return True
+        return False
+        
+    def _on_connect(self, client, userdata, flags, rc, properties=None):
+        """Callback for when the client connects to the broker"""
+        if rc == 0:
+            self.connected = True
+            self.error_message = ""
+            # Resubscribe to topics if reconnecting
+            for topic in self.subscribed_topics:
+                self.client.subscribe(topic)
+        else:
+            self.connected = False
+            self.error_message = f"MQTT connection failed with result code {rc}"
+            
+    def _on_disconnect(self, client, userdata, disconnect_flags, rc, properties=None):
+        """Callback for when the client disconnects from the broker"""
+        self.connected = False
+        if rc != 0:
+            self.error_message = f"Unexpected MQTT disconnection (rc={rc})"
+            if self.on_connection_lost:
+                self.on_connection_lost(self.error_message)
+                
+    def _on_message(self, client, userdata, msg):
+        """Callback for when a message is received"""
+        topic = msg.topic
+        payload = msg.payload.decode('utf-8', errors='replace')
+        
+        # Try to parse as JSON if it looks like it
+        try:
+            if payload.startswith('{') or payload.startswith('['):
+                value = json.loads(payload)
+            else:
+                # Try to convert to float/int
+                try:
+                    value = float(payload)
+                    if value == int(value):
+                        value = int(value)
+                except ValueError:
+                    value = payload
+        except Exception:
+            value = payload
+            
+        with self._buffer_lock:
+            self.data_buffer[topic] = value
+            
+    def read_data(self):
+        """
+        Read data from the buffer
+        
+        Returns:
+            Dictionary with {topic: value} pairs or None if no data
+        """
+        with self._buffer_lock:
+            if not self.data_buffer:
+                return None
+            data = self.data_buffer.copy()
+            self.data_buffer.clear()
+            return data
+            
+    def write_data(self, data):
+        """
+        Publish data to the broker
+        
+        Args:
+            data: Tuple or list of (topic, payload)
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.is_connected() or not self.client:
+            return False
+            
+        try:
+            if isinstance(data, (tuple, list)) and len(data) == 2:
+                topic, payload = data
+                self.client.publish(topic, payload)
+                return True
+            return False
+        except Exception as e:
+            self.error_message = f"Failed to publish MQTT message: {e}"
+            return False

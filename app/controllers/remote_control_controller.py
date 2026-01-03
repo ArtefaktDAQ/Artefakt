@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
 from PyQt6.QtGui import QColor, QFont
 
 from app.core.logger import Logger
+from app.ui.theme import GroupBoxStyles, ButtonStyles
 
 class RemoteControlController(QObject):
     """Manages remote control permissions and commands with security features"""
@@ -58,20 +59,7 @@ class RemoteControlController(QObject):
         # Add remote control button to main window
         if hasattr(self.main_window, 'automation_tab'):
             self.remote_control_btn = QPushButton("🔐 Remote Control Manager")
-            self.remote_control_btn.setStyleSheet("""
-                QPushButton {
-                    background-color: #FF9800;
-                    color: white;
-                    border: none;
-                    padding: 10px;
-                    font-size: 14px;
-                    border-radius: 6px;
-                    font-weight: bold;
-                }
-                QPushButton:hover {
-                    background-color: #F57C00;
-                }
-            """)
+            self.remote_control_btn.setStyleSheet(ButtonStyles.warning("medium"))
             self.remote_control_btn.clicked.connect(self.show_remote_control_dialog)
             
             # Add to automation tab if available
@@ -285,6 +273,7 @@ class RemoteControlRequestDialog(QDialog):
         
         # Client information
         info_group = QGroupBox("Request Information")
+        info_group.setStyleSheet(GroupBoxStyles.default())
         info_layout = QFormLayout()
         
         info_layout.addRow("Client ID:", QLabel(self.client_id))
@@ -296,6 +285,7 @@ class RemoteControlRequestDialog(QDialog):
         
         # Permission settings
         permission_group = QGroupBox("Grant Permission")
+        permission_group.setStyleSheet(GroupBoxStyles.default())
         permission_layout = QFormLayout()
         
         self.permission_combo = QComboBox()
@@ -326,37 +316,11 @@ class RemoteControlRequestDialog(QDialog):
         button_layout = QHBoxLayout()
         
         accept_btn = QPushButton("✅ Accept")
-        accept_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                border: none;
-                padding: 10px 20px;
-                font-size: 14px;
-                border-radius: 6px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-        """)
+        accept_btn.setStyleSheet(ButtonStyles.success("medium"))
         accept_btn.clicked.connect(self.accept)
         
         reject_btn = QPushButton("❌ Reject")
-        reject_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #f44336;
-                color: white;
-                border: none;
-                padding: 10px 20px;
-                font-size: 14px;
-                border-radius: 6px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #da190b;
-            }
-        """)
+        reject_btn.setStyleSheet(ButtonStyles.danger("medium"))
         reject_btn.clicked.connect(self.reject)
         
         button_layout.addWidget(accept_btn)
@@ -479,6 +443,7 @@ class RemoteControlDialog(QDialog):
         
         # Security options
         security_group = QGroupBox("Security Options")
+        security_group.setStyleSheet(GroupBoxStyles.default())
         security_layout = QFormLayout()
         
         self.enable_security_check = QCheckBox("Enable Remote Control Security")
@@ -495,6 +460,7 @@ class RemoteControlDialog(QDialog):
         
         # Statistics
         stats_group = QGroupBox("Statistics")
+        stats_group.setStyleSheet(GroupBoxStyles.default())
         stats_layout = QFormLayout()
         
         self.total_requests_label = QLabel("0")

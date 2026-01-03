@@ -24,10 +24,16 @@ class Logger:
         self.log_file = log_file
         self.console = console
         self.log_level = log_level
+        self._file_handle = None
         
         # Create log directory if needed
         if log_file:
             os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            try:
+                # Open file in append mode and keep it open
+                self._file_handle = open(log_file, "a", buffering=1) # line buffering
+            except Exception as e:
+                print(f"Error opening log file {log_file}: {str(e)}")
     
     def _should_log(self, level):
         """Check if the message should be logged based on level
@@ -63,10 +69,10 @@ class Logger:
             print(log_message)
         
         # Write to file if enabled
-        if self.log_file:
+        if self._file_handle:
             try:
-                with open(self.log_file, "a") as f:
-                    f.write(log_message + "\n")
+                self._file_handle.write(log_message + "\n")
+                # No need to flush manually with buffering=1 (line buffering)
             except Exception as e:
                 print(f"Error writing to log file: {str(e)}")
     

@@ -123,11 +123,13 @@ def setup_ui(main_window):
     if hasattr(main_window, 'camera_tab_manual_focus') and hasattr(main_window, 'camera_tab_focus_slider'):
         main_window.camera_tab_manual_focus.stateChanged.connect(main_window.apply_camera_focus_exposure)
         main_window.camera_tab_focus_slider.valueChanged.connect(main_window.update_focus_value_label)
+        main_window.camera_tab_focus_slider.valueChanged.connect(main_window.apply_camera_focus_exposure)
         main_window.camera_tab_focus_slider.sliderReleased.connect(main_window.apply_camera_focus_exposure)
     
     if hasattr(main_window, 'camera_tab_manual_exposure') and hasattr(main_window, 'camera_tab_exposure_slider'):
         main_window.camera_tab_manual_exposure.stateChanged.connect(main_window.apply_camera_focus_exposure)
         main_window.camera_tab_exposure_slider.valueChanged.connect(main_window.update_exposure_value_label)
+        main_window.camera_tab_exposure_slider.valueChanged.connect(main_window.apply_camera_focus_exposure)
         main_window.camera_tab_exposure_slider.sliderReleased.connect(main_window.apply_camera_focus_exposure)
     
     # Connect the camera connect button

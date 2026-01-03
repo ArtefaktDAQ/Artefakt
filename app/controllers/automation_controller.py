@@ -46,11 +46,18 @@ class AutomationController(QObject):
             'data_logger': getattr(self.main_window, 'data_logger', None),
             'sound_player': getattr(self.main_window, 'sound_player', None),
             'sensor_controller': getattr(self.main_window, 'sensor_controller', None),
+            'events': set(),  # Initialize events dictionary for system events (motion, recording, etc.)
             # Add other necessary components here
         }
         
         # Define where sequences are saved, prioritizing the current run folder
-        sequences_file_path = "data/automation_sequences.json" # Default fallback
+        # Use the path from config if available, otherwise use default
+        if isinstance(self.config, dict) and 'automation_sequences_path' in self.config:
+            self.default_sequences_path = self.config['automation_sequences_path']
+        else:
+            self.default_sequences_path = "data/automation_sequences.json"
+            
+        sequences_file_path = self.default_sequences_path
         try:
             if hasattr(self.config, 'current_run_folder'):
                 current_run_folder = self.config.current_run_folder
@@ -80,7 +87,12 @@ class AutomationController(QObject):
             except Exception as e:
                 print(f"Error creating automation sequences directory: {e}")
         
-        self.manager = AutomationManager(sequences_file=sequences_file_path, app_context=initial_context)
+        # Initialize the manager with both current and master paths
+        self.manager = AutomationManager(
+            sequences_file=sequences_file_path, 
+            app_context=initial_context,
+            master_file=self.default_sequences_path
+        )
 
         # --- ADDED --- Timer for updating the dashboard table (for live countdowns)
         self.dashboard_update_timer = QTimer(self)
@@ -116,6 +128,11 @@ class AutomationController(QObject):
         self.update_button_states() # Set initial button enabled/disabled state
         self.update_automation_status_display() # Set initial status display
         self.connect_signals() # Connect UI signals
+        
+        # Enable context menu for dashboard table
+        if hasattr(self.main_window, 'dashboard_automation_table'):
+            self.main_window.dashboard_automation_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.main_window.dashboard_automation_table.customContextMenuRequested.connect(self.show_dashboard_context_menu)
 
     def setup_sequences_table(self):
         """Configure the appearance of the sequences table in the main UI."""
@@ -139,6 +156,8 @@ class AutomationController(QObject):
             # Connect item changed (for checkbox toggles) to update button states (for start/stop)
             # Connect to a dedicated handler to manage the checked state set
             table.itemChanged.connect(self._handle_item_changed)
+            # Connect double-click to edit sequence
+            table.cellDoubleClicked.connect(self._on_sequence_double_clicked)
         else:
             print("Warning: Main window does not have 'sequences_table' attribute.")
 
@@ -155,10 +174,10 @@ class AutomationController(QObject):
             self.main_window.remove_sequence_btn.clicked.connect(self.remove_sequence)
             
         if hasattr(self.main_window, 'start_sequence_btn'):
-             self.main_window.start_sequence_btn.clicked.connect(self.start_checked_sequences)
+             self.main_window.start_sequence_btn.clicked.connect(self.handle_start_button)
 
         if hasattr(self.main_window, 'stop_sequence_btn'):
-             self.main_window.stop_sequence_btn.clicked.connect(self.stop_checked_sequences)
+             self.main_window.stop_sequence_btn.clicked.connect(self.handle_stop_button)
 
         # Optional: Connect an enable/disable checkbox if needed
         # if hasattr(self.main_window, 'automation_enable_cb'):
@@ -253,7 +272,14 @@ class AutomationController(QObject):
         self.update_button_states() # Update buttons after table change
 
     def get_selected_sequence(self):
-        """Get the AutomationSequence object for the currently selected row."""
+        """Get the AutomationSequence object for the currently selected row in any active table."""
+        # 1. Try dashboard table first (if it has focus or selection)
+        if hasattr(self.main_window, 'dashboard_automation_table'):
+            seq = self.get_selected_dashboard_sequence()
+            if seq:
+                return seq
+                
+        # 2. Try main sequences table
         if not hasattr(self.main_window, 'sequences_table'):
             return None
             
@@ -269,7 +295,7 @@ class AutomationController(QObject):
         return None
         
     def get_selected_row_index(self):
-         """Get the index of the currently selected row."""
+         """Get the index of the currently selected row in the main sequences table."""
          if not hasattr(self.main_window, 'sequences_table'):
             return None
          table = self.main_window.sequences_table
@@ -278,11 +304,56 @@ class AutomationController(QObject):
               return selected_ranges[0].topRow()
          return None
 
+    def get_selected_dashboard_sequence(self):
+        """Get the AutomationSequence object for the currently selected row in the dashboard table."""
+        if not hasattr(self.main_window, 'dashboard_automation_table'):
+            return None
+            
+        table = self.main_window.dashboard_automation_table
+        selected_ranges = table.selectedRanges()
+        if not selected_ranges:
+            return None
+            
+        row = selected_ranges[0].topRow()
+        # Find the sequence in the manager based on the name in the first column
+        name_item = table.item(row, 0)
+        if name_item:
+            name = name_item.text()
+            for seq in self.manager.sequences:
+                if seq.name == name:
+                    return seq
+        return None
+
+    def show_dashboard_context_menu(self, pos):
+        """Show context menu for the dashboard automation table."""
+        sequence = self.get_selected_dashboard_sequence()
+        if not sequence:
+            return
+            
+        from PyQt6.QtWidgets import QMenu
+        from PyQt6.QtGui import QAction
+        
+        menu = QMenu(self.main_window)
+        
+        is_running = sequence in self.manager.active_sequences
+        
+        start_action = QAction("Start Sequence", self.main_window)
+        start_action.setEnabled(not is_running)
+        start_action.triggered.connect(lambda: self.manager.start_sequence(sequence))
+        menu.addAction(start_action)
+        
+        stop_action = QAction("Stop Sequence", self.main_window)
+        stop_action.setEnabled(is_running)
+        stop_action.triggered.connect(lambda: self.manager.stop_sequence(sequence))
+        menu.addAction(stop_action)
+        
+        menu.exec(self.main_window.dashboard_automation_table.viewport().mapToGlobal(pos))
+
     def add_sequence(self):
         """Open dialog to add a new automation sequence."""
         try:
             # Gather context needed for the dialog
-            sensors = self.manager.get_available_sensors()
+            sensors = self.manager.get_available_sensor_objects()
             ports = self.manager.get_available_serial_ports()
             # Pass the manager's context which includes interfaces etc.
             context = self.manager.app_context 
@@ -325,7 +396,7 @@ class AutomationController(QObject):
 
         try:
             # Gather context for the dialog
-            sensors = self.manager.get_available_sensors()
+            sensors = self.manager.get_available_sensor_objects()
             ports = self.manager.get_available_serial_ports()
             context = self.manager.app_context
 
@@ -439,6 +510,9 @@ class AutomationController(QObject):
     def on_sequence_started(self, sequence):
         """Handler for sequence started signal (from manager)"""
         print(f"Sequence '{sequence.name}' started.")
+        # Hide any previous error message when a sequence starts
+        if hasattr(self.main_window, 'automation_error_label'):
+            self.main_window.automation_error_label.setVisible(False)
         # Ensure timer is running when a sequence starts
         self._ensure_dashboard_timer_active()
         
@@ -465,11 +539,14 @@ class AutomationController(QObject):
     def on_sequence_error(self, sequence, error_message):
         """Handle sequence errors, updating the table and potentially the dashboard."""
         print(f"Error in sequence '{sequence.name}': {error_message}")
+        
+        # Display error in the automation error label
+        if hasattr(self.main_window, 'automation_error_label'):
+            error_text = f"⚠ Sequence '{sequence.name}' failed: {error_message}"
+            self.main_window.automation_error_label.setText(error_text)
+            self.main_window.automation_error_label.setVisible(True)
+        
         # No direct call to update dashboard needed, status_changed signal handles it
-        # Optionally show a message box or log the error
-        # QMessageBox.warning(self.main_window, "Sequence Error", f"Error in sequence '{sequence.name}':\n{error_message}")
-        # self.update_sequences_table() # Handled by status_changed
-        # self._update_dashboard_automation_table() # Handled by status_changed
 
     def update_button_states(self):
         """Enable/disable UI buttons based on selection, checks, and sequence state."""
@@ -504,11 +581,20 @@ class AutomationController(QObject):
         if hasattr(self.main_window, 'action_stop_sequence'):
              self.main_window.action_stop_sequence.setEnabled(has_selection and is_selected_running)
 
-        # Main Start/Stop buttons based on *checked*
+        # Main Start/Stop buttons based on selection OR checked
+        can_start = can_start_checked
+        can_stop = can_stop_checked
+        
+        if has_selection:
+            if not is_selected_running:
+                can_start = True
+            else:
+                can_stop = True
+
         if hasattr(self.main_window, 'start_sequence_btn'):
-             self.main_window.start_sequence_btn.setEnabled(can_start_checked)
+             self.main_window.start_sequence_btn.setEnabled(can_start)
         if hasattr(self.main_window, 'stop_sequence_btn'):
-             self.main_window.stop_sequence_btn.setEnabled(can_stop_checked)
+             self.main_window.stop_sequence_btn.setEnabled(can_stop)
 
     def update_automation_status_display(self):
         """General update method called when automation status changes.
@@ -518,6 +604,10 @@ class AutomationController(QObject):
         # This method might be used for other general status updates in the future.
         # print("AutomationController: update_automation_status_display called")
         pass # Keep this simple, specific updates handled by dedicated slots/signals
+
+    def is_running(self):
+        """Check if any automation sequence is currently running."""
+        return len(self.manager.active_sequences) > 0
 
     def get_status(self):
         """
@@ -579,6 +669,24 @@ class AutomationController(QObject):
                 checked_sequences.append(seq)
         return checked_sequences
 
+    def handle_start_button(self):
+        """Start the selected sequence, or all checked ones if none selected."""
+        selected = self.get_selected_sequence()
+        if selected and selected not in self.manager.active_sequences:
+            self.manager.start_sequence(selected)
+        else:
+            # Fallback to starting all checked sequences
+            self.start_checked_sequences()
+
+    def handle_stop_button(self):
+        """Stop the selected sequence, or all checked ones if none selected."""
+        selected = self.get_selected_sequence()
+        if selected and selected in self.manager.active_sequences:
+            self.manager.stop_sequence(selected)
+        else:
+            # Fallback to stopping all checked sequences
+            self.stop_checked_sequences()
+
     def start_checked_sequences(self):
         """Start all automation sequences that are currently checked."""
         checked_sequences = self.get_checked_sequences()
@@ -587,6 +695,11 @@ class AutomationController(QObject):
             # This allows users to run without any automation sequences
             print("No automation sequences checked - continuing without automation")
             return
+
+        # Clear stale sensor data and events before starting sequences
+        # This prevents immediate triggering from values left over from a previous run
+        self.manager.update_context({'sensors': {}, 'events': set()})
+        self.manager.variables = {} # Reset shared variables for a fresh start
 
         started_count = 0
         error_messages = []
@@ -650,6 +763,12 @@ class AutomationController(QObject):
                 if sequence.checked != is_checked:
                     sequence.checked = is_checked # Update the model attribute
                     print(f"Sequence '{sequence.name}' checked state set to: {sequence.checked}")
+                    
+                    # If unchecked, stop it if it's running
+                    if not is_checked and sequence in self.manager.active_sequences:
+                        print(f"Sequence '{sequence.name}' was unchecked while running - stopping it.")
+                        self.manager.stop_sequence(sequence)
+                        
                     # Trigger a save to persist the change
                     self.manager.save_sequences()
                     # Now update button states based on the new check state
@@ -661,6 +780,42 @@ class AutomationController(QObject):
         # ... (rest of the method remains unchanged)
 
         # ... (rest of the method remains unchanged) 
+
+    def _on_sequence_double_clicked(self, row, column):
+        """Handle double-click on a sequence row to open it in edit mode."""
+        # Get the sequence from the checkbox column (column 0)
+        if not hasattr(self.main_window, 'sequences_table'):
+            return
+            
+        table = self.main_window.sequences_table
+        checkbox_item = table.item(row, 0)
+        if checkbox_item:
+            sequence = checkbox_item.data(Qt.ItemDataRole.UserRole)
+            if sequence:
+                # Only edit if sequence is not running
+                if sequence not in self.manager.active_sequences:
+                    # Select the row first to ensure get_selected_sequence() works
+                    table.selectRow(row)
+                    self.edit_sequence()
+                else:
+                    QMessageBox.information(
+                        self.main_window, 
+                        "Cannot Edit", 
+                        f"Cannot edit sequence '{sequence.name}' while it is running."
+                    )
+
+    def load_sequences(self, is_startup_load=False):
+        """Reload sequences from file. If is_startup_load is True, load from global master file."""
+        if is_startup_load:
+            # Revert to global master sequences on startup load
+            # This ensures that any sequences created/modified globally between runs are loaded
+            self.manager.set_sequences_file(self.default_sequences_path)
+        
+        try:
+            self.manager.load_sequences()
+            self.main_window.logger.log(f"Automation sequences loaded (startup={is_startup_load})", "INFO")
+        except Exception as e:
+            self.main_window.logger.log(f"Error loading automation sequences: {e}", "ERROR")
 
     def update_sequence_path(self, new_run_folder):
         """Updates the path for saving/loading sequences based on the run folder."""
@@ -727,89 +882,195 @@ class AutomationController(QObject):
 
     def _update_dashboard_automation_table(self):
         """Updates the automation table in the dashboard view."""
-        table = self.main_window.dashboard_automation_table
-        table.setRowCount(0) # Clear existing rows
+        # Skip live updates when a replay automation overlay is active (unless collecting live data)
+        if getattr(self.main_window, "automation_replay_active", False):
+            collecting = False
+            try:
+                collecting = bool(getattr(getattr(self.main_window, "data_collection_controller", None), "collecting_data", False))
+            except Exception:
+                collecting = False
+            if not collecting:
+                return
+        # Prevent recursive calls during update
+        if hasattr(self, '_updating_dashboard_table') and self._updating_dashboard_table:
+            return
+        self._updating_dashboard_table = True
+        
+        try:
+            # Check if table exists
+            if not hasattr(self.main_window, 'dashboard_automation_table'):
+                print("Warning: dashboard_automation_table not found in main_window")
+                return
+            
+            table = self.main_window.dashboard_automation_table
+            if table is None:
+                print("Warning: dashboard_automation_table is None")
+                return
+            
+            # --- Preserve Selection ---
+            selected_sequence = None
+            selected_name = None
+            try:
+                selected_sequence = self.get_selected_dashboard_sequence()
+                if selected_sequence:
+                    selected_name = getattr(selected_sequence, 'name', None)
+            except Exception as e:
+                print(f"Error getting selected sequence: {e}")
+                selected_name = None
+            
+            table.setRowCount(0) # Clear existing rows
 
-        # Get sequences (both running and stopped)
-        all_sequences = self.manager.sequences # CORRECTED: Use public attribute
-        active_sequences = self.manager.active_sequences # CORRECTED: Use public attribute
+            # Get sequences (both running and stopped)
+            all_sequences = self.manager.sequences # CORRECTED: Use public attribute
+            active_sequences = self.manager.active_sequences # CORRECTED: Use public attribute
 
-        # Log current update for debugging
-        # print(f"Updating dashboard table - {len(active_sequences)}/{len(all_sequences)} sequences active")
+            # Log current update for debugging
+            print(f"Updating dashboard table - {len(active_sequences)}/{len(all_sequences)} sequences active")
 
-        # Combine and sort: running first, then by name
-        def sort_key(seq):
-            is_active = seq in active_sequences
-            return (not is_active, seq.name.lower()) # Sort active first (False comes before True)
+            # Combine and sort: running first, then by name
+            # Use safe name access to avoid recursion errors
+            def sort_key(seq):
+                try:
+                    is_active = seq in active_sequences
+                    # Safely get name as string
+                    name = getattr(seq, 'name', 'Unnamed')
+                    if not isinstance(name, str):
+                        name = str(name) if name is not None else 'Unnamed'
+                    name_lower = name.lower() if name else ''
+                    return (not is_active, name_lower) # Sort active first (False comes before True)
+                except (RecursionError, AttributeError, TypeError) as e:
+                    # Fallback if there's any error accessing the name
+                    print(f"Error in sort_key for sequence: {e}")
+                    return (True, '') # Put problematic sequences at the end
 
-        sorted_sequences = sorted(all_sequences, key=sort_key)
+            try:
+                sorted_sequences = sorted(all_sequences, key=sort_key)
+            except Exception as e:
+                print(f"Error sorting sequences: {e}")
+                traceback.print_exc()
+                # Fallback: use sequences as-is without sorting
+                sorted_sequences = list(all_sequences)
 
-        for row, sequence in enumerate(sorted_sequences):
-            table.insertRow(row)
+            # If no sequences, show a message
+            if not sorted_sequences:
+                table.setRowCount(1)
+                table.setItem(0, 0, QTableWidgetItem("No automation sequences defined"))
+                for col in range(1, 5):
+                    table.setItem(0, col, QTableWidgetItem("-"))
+                table.viewport().update()
+                return
 
-            # Sequence Name
-            name_item = QTableWidgetItem(sequence.name)
-            table.setItem(row, 0, name_item)
+            for row, sequence in enumerate(sorted_sequences):
+                table.insertRow(row)
 
-            # Status
-            status = "Running" if sequence in active_sequences else "Stopped"
-            status_item = QTableWidgetItem(status)
-            table.setItem(row, 1, status_item)
+                # Sequence Name - safe access to avoid recursion errors
+                try:
+                    seq_name = getattr(sequence, 'name', 'Unnamed')
+                    if not isinstance(seq_name, str):
+                        seq_name = str(seq_name) if seq_name is not None else 'Unnamed'
+                except (RecursionError, AttributeError, TypeError) as e:
+                    print(f"Error accessing sequence name: {e}")
+                    seq_name = 'Unnamed'
+                
+                name_item = QTableWidgetItem(seq_name)
+                table.setItem(row, 0, name_item)
 
-            # Current Step (if running)
-            step_text = ""
-            next_step_text = ""
-            time_trigger_text = ""
-            if sequence in active_sequences and hasattr(sequence, 'current_step_index') and 0 <= sequence.current_step_index < len(sequence.steps):
-                step_idx = sequence.current_step_index
-                step = sequence.steps[step_idx]
-                trigger_desc = getattr(step.trigger, 'description', 'Unnamed Trigger')
-                action_desc = getattr(step.action, 'description', 'Unnamed Action')
-                step_text = f"Step {step_idx + 1}: {trigger_desc} -> {action_desc}"
-
-                # Next Step
-                if step_idx + 1 < len(sequence.steps):
-                    next_step = sequence.steps[step_idx + 1]
-                    next_trigger_desc = getattr(next_step.trigger, 'description', 'Unnamed Trigger')
-                    next_action_desc = getattr(next_step.action, 'description', 'Unnamed Action')
-                    next_step_text = f"Step {step_idx + 2}: {next_trigger_desc} -> {next_action_desc}"
+                # Status
+                if sequence in active_sequences:
+                    status = "Running"
+                    status_item = QTableWidgetItem(status)
+                elif getattr(sequence, '_current_step_failed', False):
+                    status = "Failed"
+                    status_item = QTableWidgetItem(status)
+                    status_item.setForeground(Qt.GlobalColor.red)
                 else:
+                    status = "Stopped"
+                    status_item = QTableWidgetItem(status)
+                table.setItem(row, 1, status_item)
+
+                # Current Step (if running)
+                step_text = ""
+                next_step_text = ""
+                time_trigger_text = ""
+                if sequence in active_sequences and hasattr(sequence, 'current_step_index') and 0 <= sequence.current_step_index < len(sequence.steps):
+                    step_idx = sequence.current_step_index
+                    step = sequence.steps[step_idx]
+                    trigger_desc = getattr(step.trigger, 'description', 'Unnamed Trigger')
+                    action_desc = getattr(step.action, 'description', 'Unnamed Action')
+                    step_text = f"Step {step_idx + 1}: {trigger_desc} -> {action_desc}"
+
+                    # Next Step
+                    if step_idx + 1 < len(sequence.steps):
+                        next_step = sequence.steps[step_idx + 1]
+                        next_trigger_desc = getattr(next_step.trigger, 'description', 'Unnamed Trigger')
+                        next_action_desc = getattr(next_step.action, 'description', 'Unnamed Action')
+                        next_step_text = f"Step {step_idx + 2}: {next_trigger_desc} -> {next_action_desc}"
+                    else:
+                        next_step_text = "-"
+
+                    # Time/Trigger: countdown for time-based triggers
+                    if (hasattr(step, 'trigger') and 
+                        isinstance(step.trigger, TimeDurationTrigger) and 
+                        hasattr(step.trigger, 'start_time') and 
+                        step.trigger.start_time is not None):
+                        
+                        # Calculate remaining time
+                        elapsed = time.monotonic() - step.trigger.start_time
+                        remaining = max(0, step.trigger.duration - elapsed)
+                        mins = int(remaining // 60)
+                        secs = int(remaining % 60)
+                        time_trigger_text = f"{mins:02d}:{secs:02d} left"
+                        
+                        # Debug info for the timer countdown - use safe name access
+                        if active_sequences and sequence == next(iter(active_sequences)):
+                            try:
+                                safe_name = getattr(sequence, 'name', 'Unknown')
+                                if not isinstance(safe_name, str):
+                                    safe_name = str(safe_name) if safe_name is not None else 'Unknown'
+                                print(f"Timer update for {safe_name}: {mins:02d}:{secs:02d} left (elapsed={elapsed:.1f}s, duration={step.trigger.duration}s)")
+                            except:
+                                pass  # Skip debug print if name access fails
+                    else:
+                        # Fallback to trigger description
+                        time_trigger_text = trigger_desc
+                else:
+                    step_text = "-"
                     next_step_text = "-"
+                    time_trigger_text = "-"
 
-                # Time/Trigger: countdown for time-based triggers
-                if (hasattr(step, 'trigger') and 
-                    isinstance(step.trigger, TimeDurationTrigger) and 
-                    hasattr(step.trigger, 'start_time') and 
-                    step.trigger.start_time is not None):
-                    
-                    # Calculate remaining time
-                    elapsed = time.monotonic() - step.trigger.start_time
-                    remaining = max(0, step.trigger.duration - elapsed)
-                    mins = int(remaining // 60)
-                    secs = int(remaining % 60)
-                    time_trigger_text = f"{mins:02d}:{secs:02d} left"
-                    
-                    # Debug info for the timer countdown
-                    if active_sequences and sequence == next(iter(active_sequences)):
-                        print(f"Timer update for {sequence.name}: {mins:02d}:{secs:02d} left (elapsed={elapsed:.1f}s, duration={step.trigger.duration}s)")
-                else:
-                    # Fallback to trigger description
-                    time_trigger_text = trigger_desc
-            else:
-                step_text = "-"
-                next_step_text = "-"
-                time_trigger_text = "-"
+                step_item = QTableWidgetItem(step_text)
+                table.setItem(row, 2, step_item)
 
-            step_item = QTableWidgetItem(step_text)
-            table.setItem(row, 2, step_item)
+                next_step_item = QTableWidgetItem(next_step_text)
+                table.setItem(row, 3, next_step_item)
 
-            next_step_item = QTableWidgetItem(next_step_text)
-            table.setItem(row, 3, next_step_item)
+                time_trigger_item = QTableWidgetItem(time_trigger_text)
+                table.setItem(row, 4, time_trigger_item)
+                
+                # Restore selection if this is the sequence that was selected
+                if selected_name and seq_name == selected_name:
+                    table.selectRow(row)
 
-            time_trigger_item = QTableWidgetItem(time_trigger_text)
-            table.setItem(row, 4, time_trigger_item)
-
-        # Make sure table refreshes
-        table.resizeColumnsToContents()
-        table.viewport().update() # Force viewport update
-        self.main_window.update() # Force main window update 
+            # Make sure table refreshes
+            # REMOVED: table.resizeColumnsToContents() - prevents manual resizing
+            table.viewport().update() # Force viewport update
+            self.main_window.update() # Force main window update
+            
+        except Exception as e:
+            # Log any errors that occur during update
+            print(f"Error updating dashboard automation table: {e}")
+            traceback.print_exc()
+            # Try to show a message in the table if possible
+            try:
+                if hasattr(self.main_window, 'dashboard_automation_table'):
+                    table = self.main_window.dashboard_automation_table
+                    if table is not None:
+                        table.setRowCount(1)
+                        table.setItem(0, 0, QTableWidgetItem(f"Error: {str(e)}"))
+                        for col in range(1, 5):
+                            table.setItem(0, col, QTableWidgetItem("-"))
+            except:
+                pass  # If we can't even show the error, just skip it
+        finally:
+            # Always clear the flag, even if an error occurred
+            self._updating_dashboard_table = False 

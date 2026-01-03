@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from . import daq_service_pb2 as daq__service__pb2
+import daq_service_pb2 as daq__service__pb2
 
 GRPC_GENERATED_VERSION = '1.73.1'
 GRPC_VERSION = grpc.__version__
@@ -78,6 +78,11 @@ class DAQServiceStub(object):
                 '/daq.DAQService/StreamVideo',
                 request_serializer=daq__service__pb2.VideoRequest.SerializeToString,
                 response_deserializer=daq__service__pb2.VideoFrame.FromString,
+                _registered_method=True)
+        self.StreamAudio = channel.unary_stream(
+                '/daq.DAQService/StreamAudio',
+                request_serializer=daq__service__pb2.AudioRequest.SerializeToString,
+                response_deserializer=daq__service__pb2.AudioFrame.FromString,
                 _registered_method=True)
         self.StreamCombinedData = channel.unary_stream(
                 '/daq.DAQService/StreamCombinedData',
@@ -166,6 +171,12 @@ class DAQServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def StreamAudio(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def StreamCombinedData(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -245,6 +256,11 @@ def add_DAQServiceServicer_to_server(servicer, server):
                     servicer.StreamVideo,
                     request_deserializer=daq__service__pb2.VideoRequest.FromString,
                     response_serializer=daq__service__pb2.VideoFrame.SerializeToString,
+            ),
+            'StreamAudio': grpc.unary_stream_rpc_method_handler(
+                    servicer.StreamAudio,
+                    request_deserializer=daq__service__pb2.AudioRequest.FromString,
+                    response_serializer=daq__service__pb2.AudioFrame.SerializeToString,
             ),
             'StreamCombinedData': grpc.unary_stream_rpc_method_handler(
                     servicer.StreamCombinedData,
@@ -515,6 +531,33 @@ class DAQService(object):
             '/daq.DAQService/StreamVideo',
             daq__service__pb2.VideoRequest.SerializeToString,
             daq__service__pb2.VideoFrame.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StreamAudio(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/daq.DAQService/StreamAudio',
+            daq__service__pb2.AudioRequest.SerializeToString,
+            daq__service__pb2.AudioFrame.FromString,
             options,
             channel_credentials,
             insecure,

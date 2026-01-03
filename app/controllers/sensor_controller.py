@@ -16,6 +16,7 @@ import sys
 import os
 import queue  # Add this import for queue.Empty exceptions
 import time
+import collections  # For deque in buffer clearing
 
 # Import from the app.core.interfaces package
 try:
@@ -91,15 +92,31 @@ class SensorController(QObject):
     
     def update_sensor_table(self, update_dropdowns=True):
         """Update the sensor table"""
-        from PyQt6.QtWidgets import QTableWidgetItem, QCheckBox
+        from PyQt6.QtWidgets import QTableWidgetItem, QCheckBox, QWidget, QVBoxLayout
         from PyQt6.QtCore import Qt
         from PyQt6.QtGui import QColor
         
         if not hasattr(self.main_window, 'data_table'):
             return
             
-        # Clear the table
+        # Get the table and ensure it has 7 columns
         table = self.main_window.data_table
+        
+        # Ensure table has 9 columns (added Smooth/Average)
+        if table.columnCount() < 9:
+            table.setColumnCount(9)
+            table.setHorizontalHeaderLabels(["Use", "Sensor", "Value", "Interface", "Offset/Unit", "Stale xInt", "Smooth", "Color", "Cal."])
+            table.setColumnWidth(0, 50)  # Use checkbox
+            table.setColumnWidth(1, 120)  # Sensor name
+            table.setColumnWidth(2, 90)   # Value
+            table.setColumnWidth(3, 80)   # Interface
+            table.setColumnWidth(4, 95)   # Offset/Unit
+            table.setColumnWidth(5, 85)  # Stale xInt
+            table.setColumnWidth(6, 55)  # Smooth checkbox
+            table.setColumnWidth(7, 70)   # Color
+            table.setColumnWidth(8, 50)   # Cal.
+        
+        # Clear the table rows
         table.setRowCount(0)
         
         # Add rows for each sensor
@@ -136,6 +153,36 @@ class SensorController(QObject):
             offset_item = QTableWidgetItem(offset_unit)
             table.setItem(i, 4, offset_item)
             
+            # Stale factor (multiplier of sampling interval)
+            from PyQt6.QtWidgets import QDoubleSpinBox
+            stale_spin = QDoubleSpinBox()
+            stale_spin.setRange(0.1, 50.0)
+            stale_spin.setSingleStep(0.5)
+            stale_spin.setDecimals(2)
+            default_factor = getattr(sensor, "stale_timeout_factor", None)
+            stale_spin.setValue(default_factor if default_factor is not None else 5.0)
+            stale_spin.setToolTip("Gap threshold = factor / sampling rate")
+            stale_spin.valueChanged.connect(lambda val, s=sensor: self._update_sensor_stale_factor(s, val))
+            table.setCellWidget(i, 5, stale_spin)
+
+            # Create a checkbox for "Averaging"
+            smooth_checkbox = QCheckBox()
+            # Handle potentially missing averaging_enabled on older models
+            is_smooth = getattr(sensor, 'averaging_enabled', False)
+            smooth_checkbox.setChecked(is_smooth)
+            smooth_checkbox.setToolTip("Enable moving average (last 10 values) for this sensor to reduce noise")
+            smooth_checkbox.stateChanged.connect(lambda state, s=sensor: self.toggle_sensor_averaging(s, state))
+            
+            # Center the checkbox in the cell
+            smooth_container = QWidget()
+            smooth_layout = QVBoxLayout(smooth_container)
+            smooth_layout.setContentsMargins(0, 0, 0, 0)
+            smooth_layout.setSpacing(0)
+            smooth_layout.addStretch()
+            smooth_layout.addWidget(smooth_checkbox, alignment=Qt.AlignmentFlag.AlignCenter)
+            smooth_layout.addStretch()
+            table.setCellWidget(i, 6, smooth_container)
+
             # Color
             # Replace the colored cell with a button
             color_button = QPushButton(sensor.color)
@@ -147,10 +194,29 @@ class SensorController(QObject):
                 
                 # Determine text color based on background brightness for better contrast
                 text_color = "black" if color_obj.lightness() > 128 else "white"
-                color_style = f"background-color: {color_obj.name()}; color: {text_color}; min-height: 25px;"
+                color_style = f"""
+                    QPushButton {{
+                        background-color: {color_obj.name()};
+                        color: {text_color};
+                        min-height: 20px;
+                        max-height: 20px;
+                        padding: 1px 6px;
+                        margin: 0px;
+                        border: none;
+                    }}
+                """
             except Exception as e:
                 print(f"Error setting button style: {e}")
-                color_style = f"background-color: {sensor.color}; min-height: 25px;"
+                color_style = f"""
+                    QPushButton {{
+                        background-color: {sensor.color};
+                        min-height: 20px;
+                        max-height: 20px;
+                        padding: 1px 6px;
+                        margin: 0px;
+                        border: none;
+                    }}
+                """
                 
             color_button.setStyleSheet(color_style)
             color_button.setToolTip("Click to change the sensor color")
@@ -158,13 +224,171 @@ class SensorController(QObject):
             # Connect button click to color change function
             color_button.clicked.connect(lambda _, s=sensor, r=i: self.change_sensor_color(s, r))
             
-            # Add the button to the table
-            table.setCellWidget(i, 5, color_button)
+            # Wrap button in a container widget with center alignment
+            color_container = QWidget()
+            color_layout = QVBoxLayout(color_container)
+            color_layout.setContentsMargins(0, 0, 0, 0)
+            color_layout.setSpacing(0)
+            color_layout.addStretch()
+            color_layout.addWidget(color_button, alignment=Qt.AlignmentFlag.AlignCenter)
+            color_layout.addStretch()
+            
+            # Add the button container to the table
+            table.setCellWidget(i, 7, color_container)
+            
+            # Calibration button - check if sensor is calibrated
+            is_calibrated = self._is_sensor_calibrated(sensor)
+            if is_calibrated:
+                cal_button = QPushButton("✓")
+                cal_button.setStyleSheet("""
+                    QPushButton {
+                        background-color: #4CAF50;
+                        color: white;
+                        border: none;
+                        border-radius: 4px;
+                        font-weight: bold;
+                        min-height: 20px;
+                        max-height: 20px;
+                        padding: 1px 6px;
+                        margin: 0px;
+                    }
+                    QPushButton:hover {
+                        background-color: #66BB6A;
+                    }
+                """)
+                cal_button.setToolTip("Calibrated - Click to view/edit calibration")
+            else:
+                cal_button = QPushButton("🔧")
+                cal_button.setStyleSheet("""
+                    QPushButton {
+                        background-color: transparent;
+                        color: #FF9800;
+                        border: 1px solid #FF9800;
+                        border-radius: 4px;
+                        font-weight: bold;
+                        min-height: 20px;
+                        max-height: 20px;
+                        padding: 1px 6px;
+                        margin: 0px;
+                    }
+                    QPushButton:hover {
+                        background-color: rgba(255, 152, 0, 0.1);
+                        border: 1px solid #FFB74D;
+                    }
+                """)
+                cal_button.setToolTip("Not calibrated - Click to calibrate sensor")
+            
+            cal_button.clicked.connect(lambda _, s=sensor: self.open_calibration_for_sensor(s))
+            
+            # Wrap button in a container widget with center alignment
+            cal_container = QWidget()
+            cal_layout = QVBoxLayout(cal_container)
+            cal_layout.setContentsMargins(0, 0, 0, 0)
+            cal_layout.setSpacing(0)
+            cal_layout.addStretch()
+            cal_layout.addWidget(cal_button, alignment=Qt.AlignmentFlag.AlignCenter)
+            cal_layout.addStretch()
+            
+            table.setCellWidget(i, 8, cal_container)
+            
+            # Set row height to fit buttons properly
+            table.setRowHeight(i, 34)
             
         # Update graph dropdowns if requested
         if update_dropdowns:
             self.update_graph_sensor_dropdowns()
             
+    def _update_sensor_stale_factor(self, sensor, factor):
+        """Update per-sensor stale timeout factor (multiplier of sampling interval)."""
+        try:
+            sensor.stale_timeout_factor = float(factor)
+        except Exception:
+            sensor.stale_timeout_factor = None
+        self.save_sensors()
+        if hasattr(self.main_window, "logger"):
+            self.main_window.logger.log(
+                f"Set stale timeout factor for {sensor.name} to {sensor.stale_timeout_factor}",
+                "INFO"
+            )
+        # No need to restart; the data collection controller reads factors dynamically
+        
+    def toggle_sensor_averaging(self, sensor, state):
+        """Toggle sensor averaging (smoothing)"""
+        # PyQt6 sends the integer value of CheckState, not the enum itself
+        # Checked = 2, Unchecked = 0
+        sensor.averaging_enabled = int(state) == Qt.CheckState.Checked.value
+        
+        # Save the updated sensor configuration
+        self.save_sensors()
+        
+        if hasattr(self.main_window, "logger"):
+            status = "enabled" if sensor.averaging_enabled else "disabled"
+            self.main_window.logger.log(f"Averaging {status} for sensor: {sensor.name}", "INFO")
+        
+        # Invalidate the ENTIRE sensor cache in data collection controller so the change takes effect immediately
+        # We clear the entire cache to ensure no stale sensor references remain
+        if hasattr(self.main_window, 'data_collection_controller'):
+            dc = self.main_window.data_collection_controller
+            dc.invalidate_sensor_cache(None)
+        
+        # Clear the averaging buffer for this sensor to start fresh
+        # This is important both when enabling (to start with clean buffer) and disabling (to clear accumulated data)
+        if hasattr(self.main_window, 'data_collection_controller'):
+            dc = self.main_window.data_collection_controller
+            # Find ALL prefixed keys that match this sensor and clear their buffers
+            interface_type = getattr(sensor, 'interface_type', '')
+            sensor_name = getattr(sensor, 'name', None)
+            sensor_port = getattr(sensor, 'port', None)
+            
+            # Construct the base prefixed key to match against
+            prefixed_key_base = None
+            if interface_type.lower() == 'labjack' and sensor_port:
+                prefixed_key_base = f"labjack_{sensor_port}"
+            elif interface_type.lower() == 'arduino' and sensor_name:
+                prefixed_key_base = f"arduino_{sensor_name}"
+            elif interface_type.lower() == 'otherserial' and sensor_name:
+                prefixed_key_base = f"other_serial_{sensor_name}"
+            elif interface_type.lower() == 'audiosensor' and sensor_name:
+                prefixed_key_base = f"audio_{sensor_name}"
+            elif interface_type.lower() == 'opticalsensor' and sensor_name:
+                prefixed_key_base = f"optical_{sensor_name}"
+            
+            # Clear all buffers that match this sensor (including variants like AIN0_EF_READ_A)
+            if prefixed_key_base:
+                dc.combined_data_mutex.lock()
+                try:
+                    cleared_count = 0
+                    for buffer_key in list(dc.averaging_buffers.keys()):
+                        # For LabJack, check if the buffer key starts with our base or matches exactly
+                        if interface_type.lower() == 'labjack':
+                            # Match labjack_AIN0 with labjack_AIN0_EF_READ_A or labjack_AIN0
+                            if buffer_key == prefixed_key_base or buffer_key.startswith(f"{prefixed_key_base}_"):
+                                # Clear buffer - create new empty deque with same maxlen if it's a deque
+                                old_buf = dc.averaging_buffers[buffer_key]
+                                if isinstance(old_buf, collections.deque):
+                                    window_size = old_buf.maxlen if old_buf.maxlen is not None else 100
+                                    dc.averaging_buffers[buffer_key] = collections.deque(maxlen=window_size)
+                                else:
+                                    # Old format or unknown - initialize as deque
+                                    window_size = dc._averaging_window_size if dc._averaging_window_size is not None else 10
+                                    dc.averaging_buffers[buffer_key] = collections.deque(maxlen=window_size)
+                                cleared_count += 1
+                        else:
+                            # For other interfaces, exact match
+                            if buffer_key == prefixed_key_base:
+                                # Clear buffer - create new empty deque with same maxlen if it's a deque
+                                old_buf = dc.averaging_buffers[buffer_key]
+                                if isinstance(old_buf, collections.deque):
+                                    window_size = old_buf.maxlen if old_buf.maxlen is not None else 100
+                                    dc.averaging_buffers[buffer_key] = collections.deque(maxlen=window_size)
+                                else:
+                                    # Old format or unknown - initialize as deque
+                                    window_size = dc._averaging_window_size if dc._averaging_window_size is not None else 10
+                                    dc.averaging_buffers[buffer_key] = collections.deque(maxlen=window_size)
+                                cleared_count += 1
+                finally:
+                    dc.combined_data_mutex.unlock()
+        
     def toggle_sensor_in_graph(self, sensor, state):
         """Toggle sensor visibility in graphs"""
         # PyQt6 sends the integer value of CheckState, not the enum itself
@@ -174,9 +398,21 @@ class SensorController(QObject):
         # Save the updated sensor configuration
         self.save_sensors()
         
+        # Emit status changed signal so the nav button icon updates
+        self.status_changed.emit()
+        
+        # Update the graph sensor dropdowns/lists
+        self.update_graph_sensor_dropdowns()
+        
         # Update the main analysis graph
         if hasattr(self.main_window, 'update_graph'):
             self.main_window.update_graph()
+            
+        # Refresh tools window if it exists
+        if hasattr(self.main_window, '_tools_window') and self.main_window._tools_window:
+            self.main_window._tools_window.refresh_sensors()
+        elif hasattr(self.main_window, 'tools_window') and self.main_window.tools_window:
+            self.main_window.tools_window.refresh_sensors()
         
         # Reinitialize the dashboard graph if data collection is active
         if (hasattr(self.main_window, 'data_collection_controller') and 
@@ -204,7 +440,7 @@ class SensorController(QObject):
             
             # Add currently configured sensors
             for i, sensor in enumerate(self.sensors):
-                if sensor.enabled:  # Only add enabled sensors
+                if sensor.enabled and sensor.show_in_graph:  # Only add enabled sensors configured to show in graph
                     historical_key = self.get_historical_buffer_key(sensor)
                     self.main_window.graph_primary_sensor.addItem(sensor.name, userData=historical_key)
                     if sensor.name == current_text:
@@ -239,7 +475,7 @@ class SensorController(QObject):
             
             # Add currently configured sensors
             for i, sensor in enumerate(self.sensors):
-                if sensor.enabled:  # Only add enabled sensors
+                if sensor.enabled and sensor.show_in_graph:  # Only add enabled sensors configured to show in graph
                     historical_key = self.get_historical_buffer_key(sensor)
                     self.main_window.graph_secondary_sensor.addItem(sensor.name, userData=historical_key)
                     if sensor.name == current_text:
@@ -283,7 +519,7 @@ class SensorController(QObject):
             
             # Add currently configured sensors
             for sensor in self.sensors:
-                if sensor.enabled:  # Only add enabled sensors
+                if sensor.enabled and sensor.show_in_graph:  # Only add enabled sensors configured to show in graph
                     historical_key = self.get_historical_buffer_key(sensor)
                     item = QListWidgetItem(sensor.name)
                     item.setData(Qt.ItemDataRole.UserRole, historical_key)
@@ -310,6 +546,14 @@ class SensorController(QObject):
             # Reselect items that were selected before
             for item in items_to_reselect:
                 item.setSelected(True)
+            
+            # If Standard Time Series is selected and no items were previously selected, select all by default
+            if hasattr(self.main_window, 'graph_type_combo'):
+                graph_type = self.main_window.graph_type_combo.currentText()
+                if graph_type == "Standard Time Series" and len(items_to_reselect) == 0:
+                    # Select all items in the multi-sensor list
+                    for i in range(self.main_window.multi_sensor_list.count()):
+                        self.main_window.multi_sensor_list.item(i).setSelected(True)
     
     def add_sensor(self):
         """Add a new sensor"""
@@ -333,7 +577,9 @@ class SensorController(QObject):
             device_type_combo = QComboBox()
             device_type_combo.addItem("Arduino")
             device_type_combo.addItem("LabJack")
+            device_type_combo.addItem("MQTT")
             device_type_combo.addItem("Other/Virtual Sensor")
+            device_type_combo.addItem("Optical Sensor")
             device_type_combo.setCurrentIndex(0)  # Default to Arduino
             
             print("Created device type combo")
@@ -455,7 +701,17 @@ class SensorController(QObject):
                     arduino_port_combo.setVisible(False)
                     refresh_btn.setVisible(False)
                     labjack_channel_combo.setVisible(True)
+                    if hasattr(self, 'mqtt_topic_input'): self.mqtt_topic_input.setVisible(False)
                     populate_labjack_channels()  # Populate channels when switching to LabJack
+                elif device_type == "MQTT":
+                    arduino_port_combo.setVisible(False)
+                    refresh_btn.setVisible(False)
+                    labjack_channel_combo.setVisible(False)
+                    if not hasattr(self, 'mqtt_topic_input'):
+                        self.mqtt_topic_input = QLineEdit()
+                        self.mqtt_topic_input.setPlaceholderText("e.g. sensors/temperature")
+                        port_layout.addWidget(self.mqtt_topic_input)
+                    self.mqtt_topic_input.setVisible(True)
                 elif device_type == "Other/Virtual Sensor":
                     # First check if we have any sequences with published variables
                     other_sequences = getattr(self.main_window, 'other_sequences', [])
@@ -555,7 +811,14 @@ class SensorController(QObject):
                                                 sequence=self.main_window.data_collection_controller.create_serial_sequence(seq_name, steps)
                                             )
                                             break
-                return
+                    return
+                elif device_type == "Optical Sensor":
+                    # Close the current dialog and open the Optical Sensor dialog
+                    dialog.reject()
+                    
+                    # Open the Optical Sensor add dialog
+                    self._show_add_optical_sensor_dialog()
+                    return
             
             # Connect the device type combo box change event
             device_type_combo.currentIndexChanged.connect(on_device_type_changed)
@@ -731,6 +994,28 @@ class SensorController(QObject):
                         enabled=True,
                         show_in_graph=show_in_graph.isChecked()
                     )
+                elif device_type == "MQTT":
+                    # For MQTT, use the topic input
+                    port = self.mqtt_topic_input.text().strip() if hasattr(self, 'mqtt_topic_input') else ""
+                    new_sensor = SensorModel(
+                        name=name,
+                        interface_type="MQTT",
+                        port=port,
+                        unit=unit_edit.text(),
+                        offset=offset_spinbox.value(),
+                        conversion_factor=1.0,
+                        color=selected_color.name(),
+                        enabled=True,
+                        show_in_graph=show_in_graph.isChecked(),
+                        stale_timeout_factor=None, # Default for new sensor
+                        averaging_enabled=False    # Default for new sensor
+                    )
+                    
+                    # Automatically subscribe if connected
+                    if hasattr(self.main_window, 'data_collection_controller'):
+                        dcc = self.main_window.data_collection_controller
+                        if hasattr(dcc, 'mqtt_thread') and dcc.mqtt_thread.is_connected() and port:
+                            dcc.mqtt_thread.subscribe(port)
                 else:
                     # For other device types, use the standard creation method
                     new_sensor = SensorModel(
@@ -742,7 +1027,9 @@ class SensorController(QObject):
                         conversion_factor=1.0,  # Default to 1.0 for now (removed from UI)
                         color=selected_color.name(),
                         enabled=True,
-                        show_in_graph=show_in_graph.isChecked()
+                        show_in_graph=show_in_graph.isChecked(),
+                        stale_timeout_factor=None,
+                        averaging_enabled=False
                     )
                     
                     # If Arduino sensor was created with a name that matches available_sensors, set empty port to support direct name matching
@@ -997,7 +1284,9 @@ class SensorController(QObject):
                     unit=unit_edit.text(),
                     offset=offset_spinbox.value(),
                     color=current_color.name(),
-                    show_in_graph=show_in_graph.isChecked()
+                    show_in_graph=show_in_graph.isChecked(),
+                    stale_timeout_factor=getattr(sensor, 'stale_timeout_factor', None),
+                    averaging_enabled=getattr(sensor, 'averaging_enabled', False)
                 )
                 
                 # Replace the old sensor with the updated one
@@ -1180,7 +1469,9 @@ class SensorController(QObject):
                         conversion_factor=conversion_spinbox.value(),
                         color=current_color.name(),
                         enabled=True,
-                        show_in_graph=show_in_graph.isChecked()
+                        show_in_graph=show_in_graph.isChecked(),
+                        stale_timeout_factor=getattr(sensor, 'stale_timeout_factor', None),
+                        averaging_enabled=getattr(sensor, 'averaging_enabled', False)
                     )
                     
                     # Replace the old sensor with the updated one
@@ -1222,6 +1513,12 @@ class SensorController(QObject):
                     self.update_sensor_table()
                     self.status_changed.emit()
                     self.main_window.logger.log(f"Updated OtherSerial sensor: {updated_sensor_dict['name']}")
+            return
+        
+        elif sensor.interface_type == "OpticalSensor":
+            # Open the specialized Optical Sensor configuration dialog
+            self.main_window.logger.log(f"Editing Optical Sensor {sensor.name}")
+            self.show_optical_sensor_config(sensor)
             return
         
         else:
@@ -1353,8 +1650,18 @@ class SensorController(QObject):
             # Remove the sensor
             removed_sensor = self.sensors.pop(row)
             
+            # Clean up sensor interface if needed
+            interface_type = getattr(removed_sensor, 'interface_type', None)
+            if interface_type == 'OpticalSensor':
+                self.disconnect_optical_sensor(removed_sensor)
+            elif interface_type == 'AudioSensor':
+                self.disconnect_audio_sensor(removed_sensor)
+            
             # Update the UI
             self.update_sensor_table()
+            
+            # Save the updated sensor list
+            self.save_sensors()
             
             # Log the sensor removal
             self.main_window.logger.log(f"Removed sensor: {removed_sensor.name}")
@@ -1387,7 +1694,7 @@ class SensorController(QObject):
         # After removing, emit the status changed signal
         self.status_changed.emit()
     
-    def load_sensors(self):
+    def load_sensors(self, is_startup_load=False):
         """Load saved sensors"""
         import json
         import os
@@ -1396,7 +1703,7 @@ class SensorController(QObject):
         try:
             # First try to load from the current run directory if available
             run_dir = None
-            if hasattr(self.main_window, 'project_controller') and self.main_window.project_controller:
+            if not is_startup_load and hasattr(self.main_window, 'project_controller') and self.main_window.project_controller:
                 if (hasattr(self.main_window.project_controller, 'current_project') and 
                     hasattr(self.main_window.project_controller, 'current_test_series') and
                     hasattr(self.main_window.project_controller, 'current_run') and
@@ -1454,6 +1761,28 @@ class SensorController(QObject):
         with open(sensors_file, "r") as f:
             sensors_data = json.load(f)
             
+        # Disconnect any active optical/audio sensors before clearing
+        if hasattr(self, 'optical_sensor_interfaces'):
+            for name in list(self.optical_sensor_interfaces.keys()):
+                sensor = next((s for s in self.sensors if s.name == name), None)
+                if sensor:
+                    self.disconnect_optical_sensor(sensor)
+                else:
+                    # If sensor not in list, disconnect anyway using a mock sensor object
+                    from types import SimpleNamespace
+                    mock_sensor = SimpleNamespace(name=name)
+                    self.disconnect_optical_sensor(mock_sensor)
+        
+        if hasattr(self, 'audio_sensor_interfaces'):
+            for name in list(self.audio_sensor_interfaces.keys()):
+                sensor = next((s for s in self.sensors if s.name == name), None)
+                if sensor:
+                    self.disconnect_audio_sensor(sensor)
+                else:
+                    from types import SimpleNamespace
+                    mock_sensor = SimpleNamespace(name=name)
+                    self.disconnect_audio_sensor(mock_sensor)
+
         # Clear existing sensors
         self.sensors.clear()
         
@@ -1475,7 +1804,9 @@ class SensorController(QObject):
                     conversion_factor=sensor_data.get("conversion_factor", 1.0),
                     color=sensor_data.get("color", "#4287f5"),
                     enabled=sensor_data.get("enabled", True),
-                    show_in_graph=sensor_data.get("show_in_graph", True)
+                    show_in_graph=sensor_data.get("show_in_graph", True),
+                    stale_timeout_factor=sensor_data.get("stale_timeout_factor", None),
+                    averaging_enabled=sensor_data.get("averaging_enabled", False)
                 )
                 
                 # Add the sensor to the collection
@@ -1524,6 +1855,12 @@ class SensorController(QObject):
         # Update the UI
         self.update_sensor_table()
         
+        # Rebuild the averaging cache in data collection controller after loading sensors
+        # This ensures the cache reflects the loaded sensor settings
+        if hasattr(self.main_window, 'data_collection_controller'):
+            self.main_window.data_collection_controller._rebuild_averaging_cache()
+            self.main_window.logger.log("Rebuilt averaging cache after loading sensors", "INFO")
+        
         # Log successful load
         self.main_window.logger.log(f"Loaded {len(self.sensors)} sensors")
         
@@ -1552,7 +1889,11 @@ class SensorController(QObject):
         try:
             # First try to save to the current run directory if available
             run_dir = None
-            if hasattr(self.main_window, 'project_controller') and self.main_window.project_controller:
+            
+            # CHECK FOR REPLAY MODE: If we are just viewing an old run, don't save to its directory
+            is_replay = getattr(self.main_window, 'is_replay_mode', False)
+            
+            if not is_replay and hasattr(self.main_window, 'project_controller') and self.main_window.project_controller:
                 if (hasattr(self.main_window.project_controller, 'current_project') and 
                     hasattr(self.main_window.project_controller, 'current_test_series') and
                     hasattr(self.main_window.project_controller, 'current_run') and
@@ -1709,7 +2050,7 @@ class SensorController(QObject):
                 
                 # Try direct name match first (exact case)
                 if sensor.name in data:
-                    print(f"DEBUG - Direct name match for Arduino sensor {sensor.name}, value: {data[sensor.name]}")
+                    # print(f"DEBUG - Direct name match for Arduino sensor {sensor.name}, value: {data[sensor.name]}")
                     # sensor.process_reading(data[sensor.name]) # REMOVED
                     # Directly assign the corrected value
                     try:
@@ -1724,7 +2065,7 @@ class SensorController(QObject):
                     sensor_name_lower = sensor.name.lower()
                     for key in data:
                         if key.lower() == sensor_name_lower:
-                            print(f"DEBUG - Case-insensitive match for Arduino sensor {sensor.name} with key {key}, value: {data[key]}")
+                            # print(f"DEBUG - Case-insensitive match for Arduino sensor {sensor.name} with key {key}, value: {data[key]}")
                             # sensor.process_reading(data[key]) # REMOVED
                             # Directly assign the corrected value
                             try:
@@ -1736,18 +2077,23 @@ class SensorController(QObject):
                             break
                         
                 if not matched:
-                    print(f"DEBUG - No match found for Arduino sensor {sensor.name}")
+                    # print(f"DEBUG - No match found for Arduino sensor {sensor.name}")
+                    pass
         
         # Handle non-Arduino sensors with the existing logic
         for sensor in self.sensors:
             if sensor.interface_type != "Arduino":
                 if sensor.name in data:
                     # Direct match by sensor name
-                    print(f"DEBUG - Direct match found for {sensor.name}, value: {data[sensor.name]}")
+                    # print(f"DEBUG - Direct match found for {sensor.name}, value: {data[sensor.name]}")
                     sensor.process_reading(data[sensor.name])
                 elif sensor.interface_type == "LabJack" and sensor.port in data:
                     # Match by port for LabJack
-                    print(f"DEBUG - Port match found for {sensor.name} via port {sensor.port}, value: {data[sensor.port]}")
+                    # print(f"DEBUG - Port match found for {sensor.name} via port {sensor.port}, value: {data[sensor.port]}")
+                    sensor.process_reading(data[sensor.port])
+                elif sensor.interface_type == "MQTT" and sensor.port in data:
+                    # Match by topic (stored in 'port' field) for MQTT
+                    # print(f"DEBUG - Topic match found for MQTT sensor {sensor.name} via topic {sensor.port}, value: {data[sensor.port]}")
                     sensor.process_reading(data[sensor.port])
             
         # Update UI with the new values
@@ -1770,6 +2116,13 @@ class SensorController(QObject):
         for sensor in self.sensors:
             if hasattr(sensor, 'name') and hasattr(sensor, 'current_value') and sensor.current_value is not None:
                 sensor_values[sensor.name] = sensor.current_value
+                
+                # --- ADDED: Support unprefixed port/channel names for LabJack ---
+                # This allows triggers like 'AIN0' to work even if the sensor name is 'labjack_AIN0'
+                if getattr(sensor, 'interface_type', '') == 'LabJack' and hasattr(sensor, 'port') and sensor.port:
+                    # Use port as an alternative key if it's different from the name
+                    if sensor.port != sensor.name:
+                        sensor_values[sensor.port] = sensor.current_value
         
         # Skip if no sensor values
         if not sensor_values:
@@ -1782,24 +2135,37 @@ class SensorController(QObject):
                 'sensors': sensor_values
             }
             
+            # Add optical sensor data for advanced triggers
+            if hasattr(self, '_optical_sensor_data') and self._optical_sensor_data:
+                context_update['optical_sensors'] = self._optical_sensor_data.copy()
+            
+            # Add audio sensor data for advanced triggers
+            if hasattr(self, '_audio_sensor_data') and self._audio_sensor_data:
+                context_update['audio_sensors'] = self._audio_sensor_data.copy()
+            
             # Update the automation context
             self.main_window.automation_controller.update_context(context_update)
-            print(f"DEBUG SensorController: Updated automation context with {len(sensor_values)} sensor values")
+            if hasattr(self.main_window, "logger"):
+                self.main_window.logger.debug(f"SensorController: Updated automation context with {len(sensor_values)} sensor values")
         except Exception as e:
-            print(f"ERROR SensorController: Failed to update automation context: {e}")
+            if hasattr(self.main_window, "logger"):
+                self.main_window.logger.error(f"SensorController: Failed to update automation context: {e}")
             import traceback
             traceback.print_exc()
     
     def update_sensor_values(self):
         """Update sensor values in the UI table"""
         if not hasattr(self, 'sensors') or not self.sensors:
-            print("DEBUG SensorController: No sensors found in update_sensor_values")
+            if hasattr(self.main_window, "logger"):
+                self.main_window.logger.debug("SensorController: No sensors found in update_sensor_values")
             return
         if not hasattr(self.main_window, 'data_table') or not self.main_window.data_table:
-            print("DEBUG SensorController: No data_table found in main_window")
+            if hasattr(self.main_window, "logger"):
+                self.main_window.logger.debug("SensorController: No data_table found in main_window")
             return
         arduino_connected = False
         other_serial_connected = False
+        labjack_connected = False
         if hasattr(self.main_window, 'data_collection_controller'):
             dcc = self.main_window.data_collection_controller
             if hasattr(dcc, 'interfaces'):
@@ -1810,19 +2176,26 @@ class SensorController(QObject):
                         other_serial_connected = dcc.interfaces['other_serial'].get('connected', False)
                     else:
                         other_serial_connected = bool(dcc.interfaces['other_serial'])
+                if 'labjack' in dcc.interfaces:
+                    labjack_connected = dcc.interfaces['labjack'].get('connected', False)
+                    
         table = self.main_window.data_table
         if table.rowCount() != len(self.sensors):
             table.setRowCount(len(self.sensors))
         for i, sensor in enumerate(self.sensors):
-            # Explizit alle Arduino-Sensorwerte auf None setzen, wenn Arduino nicht verbunden ist
-            if getattr(sensor, 'interface_type', '') == 'Arduino' and not arduino_connected:
-                sensor.current_value = None
-            # Explizit alle OtherSerial-Sensorwerte auf None setzen, wenn OtherSerial nicht verbunden ist
-            if getattr(sensor, 'interface_type', '') == 'OtherSerial' and not other_serial_connected:
-                sensor.current_value = None
+            # Check for staleness
+            is_stale = False
+            if hasattr(self.main_window, 'data_collection_controller'):
+                dcc = self.main_window.data_collection_controller
+                hist_key = self.get_historical_buffer_key(sensor)
+                if hist_key and hist_key in dcc._last_sensor_update:
+                    last_ts = dcc._last_sensor_update[hist_key]
+                    timeout = dcc._get_stale_timeout_for_key(hist_key)
+                    if time.time() - last_ts > timeout:
+                        is_stale = True
                 
             value_display = ""
-            if hasattr(sensor, 'current_value') and sensor.current_value is not None:
+            if not is_stale and hasattr(sensor, 'current_value') and sensor.current_value is not None:
                 try:
                     value = sensor.current_value
                     if isinstance(value, (int, float)):
@@ -1857,7 +2230,10 @@ class SensorController(QObject):
             value_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             table.setItem(i, 2, value_item)
         table.repaint()
-        print(f"DEBUG SensorController: Completed update_sensor_values for {len(self.sensors)} sensors")
+        
+        # --- ADDED: Update automation context whenever values are updated ---
+        # This ensures triggers based on ANY sensor (Arduino, LabJack, etc.) are checked
+        self.update_automation_context()
     
     def start_acquisition(self):
         """Start data acquisition"""
@@ -1880,36 +2256,47 @@ class SensorController(QObject):
     def disconnect_labjack(self):
         """Properly disconnect from LabJack and clean up resources"""
         try:
-            # Stop the status monitoring timer if it exists
+            print("DEBUG SENSOR_CONTROLLER: disconnect_labjack called")
+            
+            # 1. Stop the status monitoring timer if it exists
             if hasattr(self, '_labjack_status_timer') and self._labjack_status_timer:
                 self._labjack_status_timer.stop()
                 print("Stopped LabJack status monitoring timer")
-                
-            # Disconnect the interface if it exists
+            
+            # 2. Call DataCollectionController to stop the monitoring thread and disconnect
+            if hasattr(self.main_window, 'data_collection_controller'):
+                print("DEBUG SENSOR_CONTROLLER: Calling data_collection_controller.disconnect_labjack()")
+                self.main_window.data_collection_controller.disconnect_labjack()
+            
+            # 3. Disconnect the interface if it still exists (DataCollectionController should have handled it)
             if hasattr(self, 'labjack_interface') and self.labjack_interface:
-                # The disconnect method now handles stopping the background thread
                 self.labjack_interface.disconnect()
                 self.labjack_interface = None
-                print("LabJack interface disconnected and reference cleared")
-                
-            # Clear cached data
+                print("LabJack interface reference cleared in SensorController")
+            
+            # 4. Clear cached data and internal state
+            self.labjack = None
+            self.labjack_connected = False
             if hasattr(self, '_labjack_device_info'):
                 self._labjack_device_info = None
             if hasattr(self, '_labjack_ef_channels'):
                 self._labjack_ef_channels = None
                 
-            # Update UI if needed
-            if hasattr(self, 'main_window') and hasattr(self.main_window, 'update_labjack_connected_status'):
+            # 5. Update UI if needed
+            if hasattr(self.main_window, 'update_labjack_connected_status'):
                 self.main_window.update_labjack_connected_status(False)
-            elif hasattr(self, 'main_window') and hasattr(self.main_window, 'update_device_connection_status_ui'):
+            elif hasattr(self.main_window, 'update_device_connection_status_ui'):
                 self.main_window.update_device_connection_status_ui('labjack', False)
                 
-            # Log the disconnection
-            if hasattr(self, 'main_window') and hasattr(self.main_window, 'logger'):
+            # 6. Log the disconnection
+            if hasattr(self.main_window, 'logger'):
                 self.main_window.logger.log("LabJack properly disconnected")
                 
-            # Emit status changed signal
+            # 7. Emit status changed signal
             self.status_changed.emit()
+            
+            # 8. Force update sensor table to clear values
+            self.update_sensor_values()
             
             return True
         except Exception as e:
@@ -2070,11 +2457,14 @@ class SensorController(QObject):
         if success:
             # We can assume the interface is now available in DataCollectionController
             if 'labjack' in self.main_window.data_collection_controller.interfaces:
-                self.labjack = self.main_window.data_collection_controller.interfaces['labjack']['interface']
+                self.labjack_interface = self.main_window.data_collection_controller.interfaces['labjack']['interface']
+                # For backwards compatibility during transition
+                self.labjack = self.labjack_interface
                 print("DEBUG SENSOR_CONTROLLER: Stored LabJack interface reference")
             else:
                 print("ERROR SENSOR_CONTROLLER: LabJack key not found in interfaces after successful connect")
-                self.labjack = None # Ensure it's None if something went wrong
+                self.labjack_interface = None
+                self.labjack = None
             self.labjack_connected = True
             if hasattr(self.main_window, 'logger'): # Check if logger exists
                 self.main_window.logger.log(f"LabJack connection successful (Identifier: {device_identifier})", "INFO")
@@ -2218,9 +2608,10 @@ class SensorController(QObject):
             # Handle connection status update
             connected = status.get('connected', False)
             
-            # Update device info if provided
+            # Update device info if provided - store in a separate attribute
+            # Do NOT overwrite the interface object in self.labjack/self.labjack_interface
             if 'device_info' in status:
-                self.labjack = status['device_info']
+                self.last_device_info = status['device_info']
                 
             # Update UI status display - with error handling
             try:
@@ -2346,8 +2737,8 @@ class SensorController(QObject):
                     "Connected" if is_connected else "Not Connected"
                 )
                 self.main_window.labjack_status_label.setStyleSheet(
-                    "color: green; font-weight: bold; font-size: 13px;" if is_connected else
-                    "color: grey; font-weight: bold; font-size: 13px;"
+                    "color: green; font-size: 9px; background-color: transparent; border: none;" if is_connected else
+                    "color: grey; font-size: 9px; background-color: transparent; border: none;"
                 )
         except AttributeError:
             # Silently ignore if the element doesn't exist or is None
@@ -2362,8 +2753,8 @@ class SensorController(QObject):
                     "Connected" if is_connected else "Not Connected"
                 )
                 self.main_window.labjack_status.setStyleSheet(
-                    "color: green; font-weight: bold; font-size: 13px;" if is_connected else
-                    "color: grey; font-weight: bold; font-size: 13px;"
+                    "color: green; font-size: 9px; background-color: transparent; border: none;" if is_connected else
+                    "color: grey; font-size: 9px; background-color: transparent; border: none;"
                 )
         except AttributeError:
             # Silently ignore if the element doesn't exist or is None
@@ -2461,8 +2852,11 @@ class SensorController(QObject):
             list: List of dictionaries with channel information, or empty list.
         """
         # Check connection status first using the correct interface reference
-        # The actual interface object is now stored in self.labjack
-        active_interface = getattr(self, 'labjack', None) 
+        # Use labjack_interface as the primary source
+        active_interface = getattr(self, 'labjack_interface', None)
+        if not active_interface:
+            active_interface = getattr(self, 'labjack', None)
+            
         is_connected = active_interface and hasattr(active_interface, 'is_connected') and active_interface.is_connected()
         
         if not is_connected:
@@ -2480,7 +2874,7 @@ class SensorController(QObject):
         else:
             print("DEBUG: EF channel cache empty, fetching from interface...")
             try:
-                # Use self.labjack (the correct reference)
+                # Use the active interface
                 if hasattr(active_interface, 'get_ef_channels'): 
                      ef_channels = active_interface.get_ef_channels()
                      if ef_channels:
@@ -2490,7 +2884,7 @@ class SensorController(QObject):
                          print("DEBUG: get_ef_channels() returned empty list or None.")
                          ef_channels = []
                 else:
-                     print("WARNING: active_interface (self.labjack) has no get_ef_channels method.")
+                     print("WARNING: active_interface has no get_ef_channels method.")
                      ef_channels = []
             except Exception as e:
                  print(f"ERROR: Failed to fetch EF channels: {e}")
@@ -2500,13 +2894,13 @@ class SensorController(QObject):
         # Get base channels from the interface
         base_channels = []
         try:
-            # Use self.labjack (the correct reference)
+            # Use the active interface
             if hasattr(active_interface, 'get_labjack_channels'):
                 base_channels = active_interface.get_labjack_channels()
                 ef_channel_names = set([ch['name'] for ch in ef_channels])
                 base_channels = [ch for ch in base_channels if ch.get('name') not in ef_channel_names]
             else:
-                 print("WARNING: active_interface (self.labjack) has no get_labjack_channels method.")
+                 print("WARNING: active_interface has no get_labjack_channels method.")
         except Exception as e:
             print(f"ERROR: Failed to fetch base channels: {e}")
             base_channels = [] 
@@ -2842,6 +3236,14 @@ class SensorController(QObject):
                     sensor.history = []
                     self.main_window.logger.log(f"Fixed missing history for sensor: {sensor.name}", "WARN")
                 
+                if not hasattr(sensor, 'averaging_enabled'):
+                    sensor.averaging_enabled = False
+                    self.main_window.logger.log(f"Fixed missing averaging_enabled flag for sensor: {sensor.name}", "WARN")
+                
+                if not hasattr(sensor, 'stale_timeout_factor'):
+                    sensor.stale_timeout_factor = None
+                    self.main_window.logger.log(f"Fixed missing stale_timeout_factor for sensor: {sensor.name}", "WARN")
+                
                 # Type-specific repairs
                 if sensor.interface_type == "LabJack":
                     # Make sure LabJack sensors have all required properties
@@ -2853,6 +3255,31 @@ class SensorController(QObject):
                     if not hasattr(sensor, 'sequence_config'):
                         sensor.sequence_config = {}
                         self.main_window.logger.log(f"Fixed missing sequence_config for OtherSerial sensor: {sensor.name}", "WARN")
+                
+                elif sensor.interface_type == "OpticalSensor":
+                    # Make sure Optical sensors have optical_config
+                    if not hasattr(sensor, 'optical_config') or not sensor.optical_config:
+                        sensor.optical_config = {}
+                        self.main_window.logger.log(f"WARNING: Optical sensor {sensor.name} has no optical_config - sensor needs to be reconfigured", "WARN")
+                    else:
+                        # Validate that config has required fields
+                        config = sensor.optical_config
+                        if config.get("camera_id") is None or not config.get("mode"):
+                            self.main_window.logger.log(f"WARNING: Optical sensor {sensor.name} has incomplete optical_config (camera_id={config.get('camera_id')}, mode={config.get('mode')}) - sensor needs to be reconfigured", "WARN")
+                
+                elif sensor.interface_type == "AudioSensor":
+                    # Make sure Audio sensors have audio_config
+                    if not hasattr(sensor, 'audio_config') or not sensor.audio_config:
+                        sensor.audio_config = {}
+                        self.main_window.logger.log(f"WARNING: Audio sensor {sensor.name} has no audio_config - sensor needs to be reconfigured", "WARN")
+                    else:
+                        # Validate that config has required fields
+                        config = sensor.audio_config
+                        if config.get("device_id") is None and config.get("device_id") != "default":
+                            # device_id can be None for default device, so this is OK
+                            pass
+                        if not config.get("mode"):
+                            self.main_window.logger.log(f"WARNING: Audio sensor {sensor.name} has incomplete audio_config (mode={config.get('mode')}) - sensor needs to be reconfigured", "WARN")
                         
             except Exception as e:
                 self.main_window.logger.log(f"Error repairing sensor at index {i}: {str(e)}", "ERROR")
@@ -2862,7 +3289,7 @@ class SensorController(QObject):
         # Update the UI after repairs
         self.update_sensor_table() 
     
-    def create_labjack_sensor(self, name, port, unit="", offset=0.0, conversion_factor=1.0, color="#4287f5", enabled=True, show_in_graph=True):
+    def create_labjack_sensor(self, name, port, unit="", offset=0.0, conversion_factor=1.0, color="#4287f5", enabled=True, show_in_graph=True, stale_timeout_factor=None, averaging_enabled=False):
         """Create a new LabJack sensor with consistent settings
         
         Args:
@@ -2874,6 +3301,8 @@ class SensorController(QObject):
             color: Display color
             enabled: Whether the sensor is enabled
             show_in_graph: Whether to show in graphs
+            stale_timeout_factor: Multiplier for sampling interval
+            averaging_enabled: Whether smoothing is enabled
             
         Returns:
             The created sensor object
@@ -2910,7 +3339,9 @@ class SensorController(QObject):
                 conversion_factor=conversion_factor,
                 color=color or "#4287f5",
                 enabled=bool(enabled),
-                show_in_graph=bool(show_in_graph)
+                show_in_graph=bool(show_in_graph),
+                stale_timeout_factor=stale_timeout_factor,
+                averaging_enabled=bool(averaging_enabled)
             )
             
             # Apply additional checks
@@ -2978,6 +3409,14 @@ class SensorController(QObject):
                 # Update the table to show the new color
                 self.update_sensor_table()
                 
+                # Update dashboard if it exists
+                if hasattr(self.main_window, '_tools_window') and self.main_window._tools_window:
+                    if hasattr(self.main_window._tools_window, 'statistics_dashboard'):
+                        self.main_window._tools_window.statistics_dashboard.update_sensor_color(sensor)
+                elif hasattr(self.main_window, 'tools_window') and self.main_window.tools_window:
+                    if hasattr(self.main_window.tools_window, 'statistics_dashboard'):
+                        self.main_window.tools_window.statistics_dashboard.update_sensor_color(sensor)
+                
                 # Log the change
                 self.main_window.logger.log(f"Changed color of sensor {sensor.name} to {sensor.color}")
                 
@@ -3017,42 +3456,16 @@ class SensorController(QObject):
             return
             
         try:
-            # Debug check if Arduino interfaces exists
-            if not hasattr(self.main_window.data_collection_controller, 'interfaces'):
-                print("DEBUG: data_collection_controller has no interfaces attribute")
-                return
-                
-            print(f"DEBUG: Interfaces in data_collection_controller: {list(self.main_window.data_collection_controller.interfaces.keys())}")
-            
             # Check if Arduino is connected
             if ('arduino' in self.main_window.data_collection_controller.interfaces and 
                 self.main_window.data_collection_controller.interfaces['arduino']['connected']):
                 
-                print("DEBUG: Arduino is connected, checking for data")
-                
-                # Check if arduino_thread exists
-                if not hasattr(self.main_window.data_collection_controller, 'arduino_thread'):
-                    print("DEBUG: data_collection_controller has no arduino_thread attribute")
-                    return
-                    
                 # Get latest data from Arduino
                 latest_data = self.main_window.data_collection_controller.arduino_thread.get_latest_data()
                 
-                print(f"DEBUG: Latest Arduino data: {latest_data}")
-                
                 if latest_data:
                     # Process the data
-                    print(f"DEBUG: Processing Arduino data: {latest_data}")
                     self.update_sensor_data(latest_data)
-                else:
-                    print("DEBUG: No Arduino data available")
-            else:
-                arduino_status = 'arduino' in self.main_window.data_collection_controller.interfaces
-                if arduino_status:
-                    connected = self.main_window.data_collection_controller.interfaces['arduino']['connected']
-                    print(f"DEBUG: Arduino interface exists but connected={connected}")
-                else:
-                    print("DEBUG: Arduino interface doesn't exist in interfaces dictionary")
         except Exception as e:
             print(f"ERROR in _check_arduino_data: {str(e)}")
             import traceback
@@ -3124,11 +3537,66 @@ class SensorController(QObject):
             # Connect OtherSerial sensors
             self.initialize_other_serial_connections()
             
+            # Auto-connect audio and optical sensors
+            self.initialize_audio_optical_connections()
+            
+            # Rebuild averaging cache after initialization to ensure it's current
+            if hasattr(self.main_window, 'data_collection_controller'):
+                self.main_window.data_collection_controller._rebuild_averaging_cache()
+                self.main_window.logger.log("Rebuilt averaging cache after sensor controller initialization", "INFO")
+            
         except Exception as e:
             # Log any exceptions during initialization
             if hasattr(self.main_window, 'logger'):
                 self.main_window.logger.log(f"Error initializing sensor controller: {str(e)}", "ERROR")
             print(f"Error initializing sensor controller: {str(e)}")
+    
+    def initialize_audio_optical_connections(self):
+        """Auto-connect audio and optical sensors on startup"""
+        try:
+            # Connect audio sensors - connect all enabled sensors, not just those shown in graph
+            audio_sensors = [s for s in self.sensors if getattr(s, 'interface_type', '') == 'AudioSensor']
+            for sensor in audio_sensors:
+                if getattr(sensor, 'enabled', True):
+                    try:
+                        if self.connect_audio_sensor(sensor):
+                            if hasattr(self.main_window, 'logger'):
+                                self.main_window.logger.log(f"Auto-connected audio sensor: {sensor.name}", "INFO")
+                            print(f"Auto-connected audio sensor: {sensor.name}")
+                        else:
+                            print(f"Failed to auto-connect audio sensor: {sensor.name}")
+                    except Exception as e:
+                        print(f"Error auto-connecting audio sensor {sensor.name}: {e}")
+            
+            # Connect optical sensors - connect all enabled sensors, not just those shown in graph
+            optical_sensors = [s for s in self.sensors if getattr(s, 'interface_type', '') == 'OpticalSensor']
+            for sensor in optical_sensors:
+                if getattr(sensor, 'enabled', True):
+                    try:
+                        if self.connect_optical_sensor(sensor):
+                            if hasattr(self.main_window, 'logger'):
+                                self.main_window.logger.log(f"Auto-connected optical sensor: {sensor.name}", "INFO")
+                    except Exception as e:
+                        if hasattr(self.main_window, 'logger'):
+                            self.main_window.logger.log(f"Error auto-connecting optical sensor {sensor.name}: {e}", "ERROR")
+            
+            # Emit status changed signal after auto-connect to update UI
+            self.status_changed.emit()
+            
+            # Update status indicators (this will update the nav button icon)
+            if hasattr(self.main_window, 'update_status_indicators'):
+                self.main_window.update_status_indicators()
+            
+            # Update device-specific status displays (Audio, Optical, etc.)
+            if hasattr(self.main_window, 'update_audio_sensor_status'):
+                self.main_window.update_audio_sensor_status()
+            if hasattr(self.main_window, 'update_optical_sensor_status'):
+                self.main_window.update_optical_sensor_status()
+                
+        except Exception as e:
+            print(f"Error in initialize_audio_optical_connections: {e}")
+            import traceback
+            traceback.print_exc()
             
     def initialize_other_serial_connections(self, is_explicit_reconnect=False):
         """Initialize connections to OtherSerial devices based on defined sequences."""
@@ -3338,36 +3806,47 @@ class SensorController(QObject):
         for sensor in self.sensors:
             # Check if the sensor is a LabJack sensor and its name/port matches a key in the data
             if sensor.interface_type == "LabJack":
-                sensor_key = sensor.port # LabJack sensors typically use port name (e.g., 'AIN0')
-                if sensor_key in data:
+                sensor_port = sensor.port.strip().upper() if sensor.port else ""
+                
+                # Try to find a match in the data keys
+                matched_key = None
+                if sensor_port in data:
+                    matched_key = sensor_port
+                else:
+                    # Try flexible matching (e.g., AIN0 matching AIN0_EF_READ_A)
+                    for data_key in data.keys():
+                        dk_upper = data_key.upper()
+                        if dk_upper == sensor_port or \
+                           (dk_upper.startswith(sensor_port) and "_EF_READ_" in dk_upper) or \
+                           (sensor_port.startswith(dk_upper) and "_EF_READ_" in sensor_port):
+                            matched_key = data_key
+                            break
+                
+                if matched_key:
                     sensors_matched.append(sensor.name)
                     # Get the *already corrected* value from the input data dict
-                    corrected_value = data[sensor_key]
+                    corrected_value = data[matched_key]
                     try:
                         # Directly update the sensor's current value 
-                        # REMOVE: processed_value = sensor.process_reading(raw_value)
-                        # Directly assign the corrected value. Ensure it's float.
                         sensor.current_value = float(corrected_value)
-                        # print(f"DEBUG SensorController: Updated LabJack sensor '{sensor.name}' ({sensor_key}) current_value to {sensor.current_value:.4f}") # Too frequent
                         updates_made += 1
-                        # if processed_value is not None:
-                        #     # Update the current value - THIS IS KEY for the table
-                        #     sensor.current_value = processed_value 
-                        #     # print(f"DEBUG SensorController: Updated LabJack sensor '{sensor.name}' ({sensor_key}) current_value to {sensor.current_value:.4f}") # Too frequent
-                        #     updates_made += 1
-                        # # else: # Too frequent
-                        #     # print(f"DEBUG SensorController: Processed value for {sensor.name} ({sensor_key}) was None.\")
                     except (ValueError, TypeError) as e:
                         # Handle potential errors if the corrected value isn't a valid float
-                        print(f"ERROR SensorController: Failed to update LabJack sensor {sensor.name} ({sensor_key}) value to float: {corrected_value} - {e}")
+                        print(f"ERROR SensorController: Failed to update LabJack sensor {sensor.name} ({matched_key}) value to float: {corrected_value} - {e}")
                         sensor.current_value = None # Set to None on error
                     except Exception as e:
-                        print(f"ERROR SensorController: Unexpected error updating LabJack sensor {sensor.name} ({sensor_key}): {e}")
+                        print(f"ERROR SensorController: Unexpected error updating LabJack sensor {sensor.name} ({matched_key}): {e}")
                         sensor.current_value = None # Set to None on error
         
         # Log summary only if something was expected or happened
         if updates_made > 0 or sensors_matched:
-             print(f"DEBUG SensorController: update_labjack_data matched sensors: {sensors_matched}, updated values for {updates_made} sensors.")
+             # print(f"DEBUG SensorController: update_labjack_data matched sensors: {sensors_matched}, updated values for {updates_made} sensors.")
+             pass
+            
+        # Update the automation context with the latest LabJack values
+        # This ensures triggers are checked as soon as data arrives (at 10Hz)
+        # instead of waiting for the UI timer (at 2Hz).
+        self.update_automation_context()
             
         # Don't trigger UI update here, let the MainWindow timer handle it
         # self.update_sensor_values() 
@@ -3390,11 +3869,18 @@ class SensorController(QObject):
             # OtherSerial uses key pattern "other_serial_{name}" in the historical buffer
             # Must match the pattern in handle_other_serial_data
             result_key = f"other_serial_{getattr(sensor, 'name', 'unknown')}"
-        else:
-            # Fallback or handle other types
-            result_key = f"unknown_{getattr(sensor, 'name', 'unknown')}"
+        elif interface_type == 'optical_sensor' or interface_type == 'opticalsensor':
+            # OpticalSensor uses key pattern "optical_{name}" in the historical buffer
+            result_key = f"optical_{getattr(sensor, 'name', 'unknown')}"
+        elif interface_type == 'audio_sensor' or interface_type == 'audiosensor':
+            # AudioSensor uses key pattern "audio_{name}" in the historical buffer
+            result_key = f"audio_{getattr(sensor, 'name', 'unknown')}"
+        elif interface_type == 'mqtt':
+            # MQTT uses key pattern "mqtt_{topic}" where topic is stored in 'port'
+            result_key = f"mqtt_{getattr(sensor, 'port', 'unknown')}"
+        # result_key = f"unknown_{getattr(sensor, 'name', 'unknown')}"
             
-        print(f"DEBUG: get_historical_buffer_key for {getattr(sensor, 'name', 'unknown')} (type: {interface_type}) => {result_key}")
+        # print(f"DEBUG: get_historical_buffer_key for {getattr(sensor, 'name', 'unknown')} (type: {interface_type}) => {result_key}")
         return result_key
             
     def get_sensor_by_name(self, name):
@@ -3633,6 +4119,20 @@ class SensorController(QObject):
             
         return value_display
 
+    def subscribe_all_mqtt_topics(self):
+        """Subscribe to all topics for enabled MQTT sensors"""
+        if not hasattr(self.main_window, 'data_collection_controller'):
+            return
+            
+        dcc = self.main_window.data_collection_controller
+        if not hasattr(dcc, 'mqtt_thread') or not dcc.mqtt_thread.is_connected():
+            return
+            
+        for sensor in self.sensors:
+            if getattr(sensor, 'interface_type', '') == 'MQTT' and sensor.enabled and sensor.port:
+                print(f"Subscribing to MQTT topic: {sensor.port}")
+                dcc.mqtt_thread.subscribe(sensor.port)
+
     def reinitialize_other_serial_connections(self, is_explicit_reconnect=False):
         """Reinitialize connections to OtherSerial devices, ensuring Arduino is disconnected first."""
         print(f"DEBUG SensorController: reinitialize_other_serial_connections called with is_explicit_reconnect={is_explicit_reconnect}")
@@ -3663,3 +4163,1093 @@ class SensorController(QObject):
         
         # Return True to indicate success (even if no connections were made)
         return True
+    
+    # =========================================================================
+    # OPTICAL SENSOR METHODS
+    # =========================================================================
+    
+    def _show_add_optical_sensor_dialog(self):
+        """Show the dialog to add a new Optical Sensor"""
+        try:
+            from app.ui.dialogs.optical_sensor_dialog import OpticalSensorAddDialog
+            from app.core.interfaces.optical_sensor_interface import OpticalSensorInterface
+            
+            # Identify which camera index is currently in use by the main application
+            # to avoid probing it, which causes a disconnect.
+            skip_indices = []
+            if hasattr(self.main_window, 'camera_controller') and self.main_window.camera_controller:
+                cam_ctrl = self.main_window.camera_controller
+                if getattr(cam_ctrl, 'is_connected', False) and hasattr(cam_ctrl, 'camera_thread') and cam_ctrl.camera_thread:
+                    current_camera = getattr(cam_ctrl.camera_thread, 'camera_id', None)
+                    if current_camera is not None:
+                        skip_indices.append(current_camera)
+            
+            # Get list of available cameras (not already in use as optical sensors)
+            # Pass skip_indices to avoid probing active cameras
+            available_cameras = OpticalSensorInterface.list_available_cameras(skip_indices=skip_indices)
+            
+            # Exclude cameras already used as optical sensors (already handled inside list_available_cameras via is_camera_available)
+            # but we'll keep the list clean.
+            
+            # Show the add dialog
+            dialog = OpticalSensorAddDialog(self.main_window, available_cameras=available_cameras)
+            
+            if dialog.exec():
+                config = dialog.get_sensor_config()
+                self._add_optical_sensor(
+                    name=config["name"],
+                    camera_id=config["camera_id"],
+                    mode=config["mode"]
+                )
+        except Exception as e:
+            print(f"Error showing optical sensor dialog: {e}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(
+                self.main_window,
+                "Error",
+                f"Could not open Optical Sensor dialog: {str(e)}"
+            )
+    
+    def _add_optical_sensor(self, name, camera_id, mode="light_events"):
+        """Add a new Optical Sensor
+        
+        Args:
+            name: Sensor name
+            camera_id: Camera device ID
+            mode: Detection mode (light_events, brightness, color, position, particle_count, fill_level)
+        """
+        try:
+            from app.core.interfaces.optical_sensor_interface import OpticalSensorInterface
+            from app.models.sensor_model import SensorModel
+            
+            # Check if camera is already in use
+            if not OpticalSensorInterface.is_camera_available(camera_id):
+                QMessageBox.warning(
+                    self.main_window,
+                    "Camera in Use",
+                    f"Camera {camera_id} is already being used as an optical sensor."
+                )
+                return False
+            
+            # Check if camera is used by camera controller
+            if hasattr(self.main_window, 'camera_controller') and self.main_window.camera_controller:
+                cam_ctrl = self.main_window.camera_controller
+                if cam_ctrl.is_connected and hasattr(cam_ctrl, 'camera_thread') and cam_ctrl.camera_thread:
+                    current_camera = getattr(cam_ctrl.camera_thread, 'camera_id', None)
+                    if current_camera == camera_id:
+                        result = QMessageBox.warning(
+                            self.main_window,
+                            "Camera in Use",
+                            f"Camera {camera_id} is currently used for video.\n\n"
+                            "The camera will be disconnected from video mode if you proceed.\n\n"
+                            "Continue?",
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                        )
+                        if result != QMessageBox.StandardButton.Yes:
+                            return False
+                        # Disconnect from camera controller
+                        cam_ctrl.disconnect()
+            
+            # Create the optical sensor interface
+            interface = OpticalSensorInterface(
+                camera_id=camera_id,
+                mode=mode,
+                name=name
+            )
+            
+            # Store interface reference
+            if not hasattr(self, 'optical_sensor_interfaces'):
+                self.optical_sensor_interfaces = {}
+            self.optical_sensor_interfaces[name] = interface
+            
+            # Create sensor model for each output of the mode
+            output_keys = interface.get_output_keys()
+            
+            # Create a primary sensor model
+            sensor = SensorModel(
+                name=name,
+                interface_type="OpticalSensor",
+                port=str(camera_id),
+                unit="",  # Unit depends on mode
+                offset=0.0,
+                conversion_factor=1.0,
+                color="#FF6B6B",
+                enabled=True,
+                show_in_graph=True
+            )
+            
+            # Store optical sensor config
+            sensor.optical_config = {
+                "camera_id": camera_id,
+                "mode": mode,
+                "output_keys": output_keys,
+            }
+            
+            # Add to sensor list
+            self.add_sensor_to_list(sensor)
+            self.update_sensor_table()
+            
+            # Log
+            if hasattr(self.main_window, 'logger'):
+                self.main_window.logger.log(
+                    f"Added Optical Sensor '{name}' (Camera {camera_id}, Mode: {mode})",
+                    "INFO"
+                )
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error adding optical sensor: {e}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(
+                self.main_window,
+                "Error",
+                f"Could not add Optical Sensor: {str(e)}"
+            )
+            return False
+    
+    def connect_optical_sensor(self, sensor):
+        """Connect an optical sensor
+        
+        Args:
+            sensor: SensorModel with interface_type="OpticalSensor"
+        """
+        try:
+            from app.core.interfaces.optical_sensor_interface import OpticalSensorInterface
+            
+            # Use default config if not present
+            if not hasattr(sensor, 'optical_config') or not sensor.optical_config:
+                config = {}
+            else:
+                config = sensor.optical_config
+            
+            camera_id = config.get("camera_id", 0)
+            mode = config.get("mode", "light_events")
+            
+            # Create interface if not exists
+            if not hasattr(self, 'optical_sensor_interfaces'):
+                self.optical_sensor_interfaces = {}
+            
+            if sensor.name not in self.optical_sensor_interfaces:
+                interface = OpticalSensorInterface(
+                    camera_id=camera_id,
+                    mode=mode,
+                    name=sensor.name
+                )
+                self.optical_sensor_interfaces[sensor.name] = interface
+            else:
+                interface = self.optical_sensor_interfaces[sensor.name]
+            
+            # Connect
+            if interface.connect():
+                # Connect data signal with QueuedConnection for thread safety
+                if interface.sensor_thread:
+                    interface.sensor_thread.data_ready.connect(
+                        lambda data, s=sensor: self._handle_optical_sensor_data(s, data),
+                        Qt.ConnectionType.QueuedConnection
+                    )
+                    interface.sensor_thread.event_detected.connect(
+                        lambda event, s=sensor: self._handle_optical_sensor_event(s, event),
+                        Qt.ConnectionType.QueuedConnection
+                    )
+                
+                # Update dashboard camera sources
+                if hasattr(self.main_window, 'refresh_dashboard_camera_sources'):
+                    self.main_window.refresh_dashboard_camera_sources()
+                
+                # Emit status changed signal so the nav button icon updates
+                self.status_changed.emit()
+                
+                # Update optical sensor status display immediately
+                if hasattr(self.main_window, 'update_optical_sensor_status'):
+                    self.main_window.update_optical_sensor_status()
+                
+                return True
+            
+            return False
+            
+        except Exception as e:
+            print(f"Error connecting optical sensor: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def disconnect_optical_sensor(self, sensor):
+        """Disconnect an optical sensor"""
+        try:
+            if hasattr(self, 'optical_sensor_interfaces') and sensor.name in self.optical_sensor_interfaces:
+                interface = self.optical_sensor_interfaces[sensor.name]
+                interface.disconnect()
+                del self.optical_sensor_interfaces[sensor.name]
+                
+                # Update dashboard camera sources
+                if hasattr(self.main_window, 'refresh_dashboard_camera_sources'):
+                    self.main_window.refresh_dashboard_camera_sources()
+                
+                # Emit status changed signal so the nav button icon updates
+                self.status_changed.emit()
+                
+                return True
+            return False
+        except Exception as e:
+            print(f"Error disconnecting optical sensor: {e}")
+            return False
+    
+    def _handle_optical_sensor_data(self, sensor, data):
+        """Handle data from an optical sensor
+        
+        Args:
+            sensor: The SensorModel
+            data: Data dictionary from the optical sensor
+        """
+        try:
+            import time
+            
+            # Validate inputs
+            if not sensor or not data:
+                return
+            
+            if not isinstance(data, dict):
+                print(f"WARNING: Optical sensor data is not a dict: {type(data)}")
+                return
+            
+            # Record data flow for monitoring
+            if hasattr(self.main_window, 'data_flow_controller'):
+                byte_size = len(str(data))
+                self.main_window.data_flow_controller.record_optical_sensor_data(byte_size)
+            
+            # Get the primary value based on mode
+            mode = data.get("mode", "light_events")
+            
+            try:
+                if mode == "light_events":
+                    value = float(data.get("event_count", 0))
+                elif mode == "brightness":
+                    value = float(data.get("brightness_mean", 0))
+                elif mode == "color":
+                    value = float(data.get("hue", 0))
+                elif mode == "position":
+                    value = float(data.get("position_x_percent", 50))
+                elif mode == "particle_count":
+                    value = float(data.get("particle_count", 0))
+                elif mode == "fill_level":
+                    value = float(data.get("fill_level", 0))
+                else:
+                    value = 0.0
+            except (ValueError, TypeError) as e:
+                print(f"WARNING: Could not convert optical sensor value: {e}")
+                value = 0.0
+            
+            # Update sensor value
+            try:
+                sensor.process_reading(value)
+            except Exception as e:
+                print(f"WARNING: Error updating sensor reading: {e}")
+            
+            # Store full optical sensor data for automation triggers
+            try:
+                if not hasattr(self, '_optical_sensor_data'):
+                    self._optical_sensor_data = {}
+                self._optical_sensor_data[sensor.name] = data.copy()
+            except Exception as e:
+                print(f"WARNING: Error storing optical sensor data: {e}")
+            
+            # Update UI (safe to call from any thread due to QueuedConnection)
+            try:
+                self.update_sensor_values()
+            except Exception as e:
+                print(f"WARNING: Error updating sensor values: {e}")
+            
+            # Feed data to graph controller for live plotting
+            try:
+                if self.main_window and hasattr(self.main_window, 'graph_controller') and self.main_window.graph_controller:
+                    graph_data = {
+                        'timestamp': data.get('timestamp', time.time()),
+                        sensor.name: value
+                    }
+                    # Also include additional optical data for detailed logging if needed
+                    for key in data:
+                        if key not in ["timestamp", "mode"]:
+                            try:
+                                graph_data[f"{sensor.name}_{key}"] = data[key]
+                            except Exception:
+                                pass  # Skip invalid keys
+
+                    self.main_window.graph_controller.plot_new_data(graph_data)
+            except Exception as e:
+                print(f"WARNING: Error sending optical data to graph: {e}")
+                import traceback
+                traceback.print_exc()
+
+            # Also store in data collection
+            try:
+                if hasattr(self.main_window, 'data_collection_controller') and self.main_window.data_collection_controller:
+                    data_controller = self.main_window.data_collection_controller
+                    timestamp = data.get("timestamp", time.time())
+                    sensor_data = {
+                        "timestamp": timestamp,
+                        sensor.name: value
+                    }
+                    # Store all output values as separate entries for CSV logging
+                    for key in data:
+                        if key not in ["timestamp", "mode"]:
+                            try:
+                                sensor_data[f"{sensor.name}_{key}"] = data[key]
+                            except Exception:
+                                pass  # Skip invalid keys
+                    
+                    # Store in historical buffer only if collecting
+                    if data_controller.collecting_data:
+                        try:
+                            data_controller.historical_buffer_mutex.lock()
+                            try:
+                                for key, val in sensor_data.items():
+                                    if key != 'timestamp':
+                                        sensor_id = f"optical_{key}"  # Use optical_ prefix for historical buffer
+                                        try:
+                                            data_controller.historical_buffer[sensor_id].append((timestamp, val))
+                                        except Exception as e:
+                                            print(f"WARNING: Error appending to historical buffer for {sensor_id}: {e}")
+                            finally:
+                                data_controller.historical_buffer_mutex.unlock()
+                        except Exception as e:
+                            print(f"WARNING: Error locking historical buffer: {e}")
+                    
+                    # Always add to combined_data for live UI and CSV writing
+                    try:
+                        data_controller.combined_data_mutex.lock()
+                        try:
+                            for key, val in sensor_data.items():
+                                if key != 'timestamp':
+                                    prefixed_key = f"optical_{key}"
+                                    try:
+                                        data_controller.combined_data[prefixed_key] = val
+                                        data_controller._last_sensor_update[prefixed_key] = timestamp
+                                    except Exception as e:
+                                        print(f"WARNING: Error adding to combined_data: {e}")
+                            if 'timestamp' in sensor_data:
+                                try:
+                                    if 'timestamp' not in data_controller.combined_data or sensor_data['timestamp'] > data_controller.combined_data['timestamp']:
+                                        data_controller.combined_data['timestamp'] = sensor_data['timestamp']
+                                except Exception as e:
+                                    print(f"WARNING: Error updating timestamp: {e}")
+                        finally:
+                            data_controller.combined_data_mutex.unlock()
+                    except Exception as e:
+                        print(f"WARNING: Error locking combined_data: {e}")
+            except Exception as e:
+                print(f"WARNING: Error storing optical data in data collection: {e}")
+                import traceback
+                traceback.print_exc()
+                    
+        except Exception as e:
+            print(f"ERROR: Critical error handling optical sensor data: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _handle_optical_sensor_event(self, sensor, event):
+        """Handle an event from an optical sensor (e.g., light flash detected)
+        
+        Args:
+            sensor: The SensorModel
+            event: Event dictionary with type, timestamp, image_path, etc.
+        """
+        try:
+            event_type = event.get("type", "unknown")
+            timestamp = event.get("timestamp", time.time())
+            image_path = event.get("image_path", "")
+            
+            # Format timestamp for display
+            from datetime import datetime
+            time_str = datetime.fromtimestamp(timestamp).strftime("%H:%M:%S.%f")[:-3]
+            
+            # Log the event
+            if hasattr(self.main_window, 'logger'):
+                self.main_window.logger.log(
+                    f"🔆 Optical Event: {sensor.name} - {event_type} at {time_str}" +
+                    (f" (saved to {image_path})" if image_path else ""),
+                    "INFO"
+                )
+            
+            # Play notification sound if enabled
+            try:
+                # Check if sound notifications are enabled (default: True for light events)
+                enable_sound = sensor.extra_settings.get("enable_event_sound", True)
+                if enable_sound:
+                    import winsound
+                    # Play a short beep (frequency 1000Hz, duration 100ms)
+                    winsound.Beep(1000, 100)
+            except Exception:
+                pass  # Sound not available on this platform
+            
+            # Update status bar / UI notification
+            if hasattr(self.main_window, 'statusBar'):
+                self.main_window.statusBar().showMessage(
+                    f"🔆 {sensor.name}: {event_type} detected at {time_str}", 5000
+                )
+            
+            # Track event for automation triggers
+            if not hasattr(self, '_optical_sensor_data'):
+                self._optical_sensor_data = {}
+            if sensor.name not in self._optical_sensor_data:
+                self._optical_sensor_data[sensor.name] = {}
+            
+            # Increment event count for trigger checking
+            current_count = self._optical_sensor_data[sensor.name].get('event_count', 0)
+            self._optical_sensor_data[sensor.name]['event_count'] = current_count + 1
+            self._optical_sensor_data[sensor.name]['last_event_type'] = event_type
+            self._optical_sensor_data[sensor.name]['last_event_time'] = timestamp
+            
+            # Update automation context immediately
+            self.update_automation_context()
+            
+        except Exception as e:
+            print(f"Error handling optical sensor event: {e}")
+    
+    def show_optical_sensor_config(self, sensor):
+        """Show configuration dialog for an optical sensor
+        
+        Args:
+            sensor: SensorModel with interface_type="OpticalSensor"
+        """
+        try:
+            from app.ui.dialogs.optical_sensor_dialog import OpticalSensorConfigDialog
+            
+            # Get current settings
+            current_settings = {}
+            if hasattr(sensor, 'optical_config'):
+                current_settings.update(sensor.optical_config)
+            
+            # If interface exists, get settings from it
+            if hasattr(self, 'optical_sensor_interfaces') and sensor.name in self.optical_sensor_interfaces:
+                interface = self.optical_sensor_interfaces[sensor.name]
+                if interface.sensor_thread:
+                    current_settings.update(interface.sensor_thread.settings)
+                    current_settings["mode"] = interface.mode
+            
+            # Show dialog
+            dialog = OpticalSensorConfigDialog(
+                self.main_window,
+                sensor_name=sensor.name,
+                current_settings=current_settings
+            )
+            
+            # Connect apply signal
+            def on_settings_changed(settings):
+                self._apply_optical_sensor_settings(sensor, settings)
+            
+            dialog.settings_changed.connect(on_settings_changed)
+            
+            if dialog.exec():
+                settings = dialog.get_settings()
+                self._apply_optical_sensor_settings(sensor, settings)
+                
+        except Exception as e:
+            print(f"Error showing optical sensor config: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _apply_optical_sensor_settings(self, sensor, settings):
+        """Apply settings to an optical sensor
+        
+        Args:
+            sensor: SensorModel
+            settings: Settings dictionary
+        """
+        try:
+            # Check if we have an active project run directory
+            run_dir = None
+            if hasattr(self.main_window, 'project_controller'):
+                run_dir = self.main_window.project_controller.get_current_run_directory()
+            
+            # Add run directory to settings if available
+            if run_dir:
+                settings = settings.copy()  # Don't modify the original dict
+                settings["run_directory"] = run_dir
+            
+            # Update sensor config
+            if not hasattr(sensor, 'optical_config'):
+                sensor.optical_config = {}
+            sensor.optical_config.update(settings)
+            
+            # Update interface if connected
+            if hasattr(self, 'optical_sensor_interfaces') and sensor.name in self.optical_sensor_interfaces:
+                interface = self.optical_sensor_interfaces[sensor.name]
+                if settings.get("mode"):
+                    interface.set_mode(settings["mode"])
+                interface.update_settings(settings)
+            
+            if hasattr(self.main_window, 'logger'):
+                self.main_window.logger.log(
+                    f"Updated Optical Sensor '{sensor.name}' settings",
+                    "INFO"
+                )
+                
+        except Exception as e:
+            print(f"Error applying optical sensor settings: {e}")
+    
+    def is_camera_used_as_sensor(self, camera_id):
+        """Check if a camera is being used as an optical sensor
+        
+        Args:
+            camera_id: Camera device ID
+            
+        Returns:
+            True if the camera is in use as an optical sensor
+        """
+        try:
+            from app.core.interfaces.optical_sensor_interface import OpticalSensorInterface
+            return not OpticalSensorInterface.is_camera_available(camera_id)
+        except Exception:
+            return False
+    
+    def get_optical_sensors(self):
+        """Get list of optical sensors
+        
+        Returns:
+            List of SensorModel objects with interface_type="OpticalSensor"
+        """
+        return [s for s in self.sensors if getattr(s, 'interface_type', '') == 'OpticalSensor']
+    
+    # =========================================================================
+    # AUDIO SENSOR METHODS
+    # =========================================================================
+    
+    def _show_add_audio_sensor_dialog(self):
+        """Show the dialog to add a new Audio Sensor"""
+        try:
+            from app.ui.dialogs.audio_sensor_dialog import AudioSensorAddDialog
+            
+            dialog = AudioSensorAddDialog(self.main_window)
+            
+            if dialog.exec():
+                config = dialog.get_sensor_config()
+                self._add_audio_sensor(
+                    name=config["name"],
+                    device_id=config["device_id"],
+                    mode=config["mode"]
+                )
+        except Exception as e:
+            print(f"Error showing audio sensor dialog: {e}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(
+                self.main_window,
+                "Error",
+                f"Could not open Audio Sensor dialog: {str(e)}"
+            )
+    
+    def _add_audio_sensor(self, name, device_id=None, mode="rms"):
+        """Add a new Audio Sensor
+        
+        Args:
+            name: Sensor name
+            device_id: Audio device ID (None = default device)
+            mode: Measurement mode (rms, peak, frequency, band_energy, zero_crossing, db_level, rpm)
+        """
+        try:
+            from app.core.interfaces.audio_interface import AudioSensorInterface
+            from app.models.sensor_model import SensorModel
+            
+            # Create the audio sensor interface
+            interface = AudioSensorInterface(
+                device_id=device_id,
+                mode=mode,
+                name=name
+            )
+            
+            # Store interface reference
+            if not hasattr(self, 'audio_sensor_interfaces'):
+                self.audio_sensor_interfaces = {}
+            self.audio_sensor_interfaces[name] = interface
+            
+            # Determine unit based on mode
+            unit_map = {
+                "rms": "",
+                "peak": "",
+                "frequency": "Hz",
+                "band_energy": "",
+                "zero_crossing": "/s",
+                "db_level": "dB",
+                "rpm": "RPM",
+            }
+            unit = unit_map.get(mode, "")
+            
+            # Create sensor model
+            sensor = SensorModel(
+                name=name,
+                interface_type="AudioSensor",
+                port=str(device_id) if device_id is not None else "default",
+                unit=unit,
+                offset=0.0,
+                conversion_factor=1.0,
+                color="#9C27B0",  # Purple for audio
+                enabled=True,
+                show_in_graph=True
+            )
+            
+            # Store audio sensor config
+            sensor.audio_config = {
+                "device_id": device_id,
+                "mode": mode,
+                "output_keys": interface.get_output_keys(),
+                "rpm_pulses_per_rev": 1.0,
+                "min_frequency_hz": 5.0,
+            }
+            
+            # Add to sensor list
+            self.add_sensor_to_list(sensor)
+            self.update_sensor_table()
+            
+            # Log
+            if hasattr(self.main_window, 'logger'):
+                self.main_window.logger.log(
+                    f"Added Audio Sensor '{name}' (Device: {device_id}, Mode: {mode})",
+                    "INFO"
+                )
+            
+            # Update status
+            if hasattr(self.main_window, 'update_audio_sensor_status'):
+                self.main_window.update_audio_sensor_status()
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error adding audio sensor: {e}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(
+                self.main_window,
+                "Error",
+                f"Could not add Audio Sensor: {str(e)}"
+            )
+            return False
+    
+    def connect_audio_sensor(self, sensor):
+        """Connect an audio sensor
+        
+        Args:
+            sensor: SensorModel with interface_type="AudioSensor"
+        """
+        try:
+            from app.core.interfaces.audio_interface import AudioSensorInterface
+            
+            if not hasattr(sensor, 'audio_config'):
+                print(f"Audio sensor {sensor.name} has no config")
+                return False
+            
+            config = sensor.audio_config
+            device_id = config.get("device_id", None)
+            mode = config.get("mode", "rms")
+
+            # Prepare processing settings that need to be applied to the thread
+            processing_settings = {}
+            for key in ("noise_gate", "smoothing", "band_low", "band_high", "peak_hold_ms", "rpm_pulses_per_rev", "min_frequency_hz"):
+                if key in config:
+                    processing_settings[key] = config[key]
+
+            output_rate = config.get("output_rate", None)
+            
+            # Create interface if not exists
+            if not hasattr(self, 'audio_sensor_interfaces'):
+                self.audio_sensor_interfaces = {}
+            
+            if sensor.name not in self.audio_sensor_interfaces:
+                interface = AudioSensorInterface(
+                    device_id=device_id,
+                    mode=mode,
+                    name=sensor.name
+                )
+                self.audio_sensor_interfaces[sensor.name] = interface
+            else:
+                interface = self.audio_sensor_interfaces[sensor.name]
+                # Ensure interface reflects latest config before connecting
+                interface.device_id = device_id
+                interface.set_mode(mode)
+
+            # Apply output rate from config (if provided) before connecting so the thread picks it up
+            if output_rate is not None:
+                try:
+                    interface.output_rate = max(1, int(output_rate))
+                except (TypeError, ValueError):
+                    pass
+            
+            # Connect the interface (this creates the thread)
+            if interface.connect():
+                # Connect data signal AFTER connect() to ensure thread exists
+                # Disconnect the default handler and connect to our handler instead
+                if interface.sensor_thread:
+                    # Disconnect the default _on_data_ready handler
+                    try:
+                        interface.sensor_thread.data_ready.disconnect(interface._on_data_ready)
+                    except:
+                        pass  # May not be connected yet
+                    
+                    # Use sensor name instead of reference to avoid stale reference issues
+                    sensor_name = sensor.name
+                    
+                    # Create a wrapper that finds the sensor by name
+                    def handle_data(data):
+                        # Find the actual sensor from the list
+                        actual_sensor = None
+                        for s in self.sensors:
+                            if getattr(s, 'name', None) == sensor_name and getattr(s, 'interface_type', '') == 'AudioSensor':
+                                actual_sensor = s
+                                break
+                        if actual_sensor:
+                            self._handle_audio_sensor_data(actual_sensor, data)
+                        else:
+                            print(f"WARNING: Could not find sensor '{sensor_name}' when handling audio data")
+                    
+                    # Connect to our handler with QueuedConnection for thread safety
+                    interface.sensor_thread.data_ready.connect(
+                        handle_data,
+                        Qt.ConnectionType.QueuedConnection
+                    )
+                    
+                    print(f"DEBUG: Connected data_ready signal for audio sensor {sensor.name}")
+                    print(f"DEBUG: Signal receivers: {interface.sensor_thread.receivers(interface.sensor_thread.data_ready)}")
+
+                    # Apply processing settings (including noise_gate) to the running thread
+                    if processing_settings:
+                        interface.update_settings(processing_settings)
+                
+                # Emit status changed signal so the nav button icon updates
+                self.status_changed.emit()
+                
+                # Force an immediate status update
+                if hasattr(self.main_window, 'update_audio_sensor_status'):
+                    self.main_window.update_audio_sensor_status()
+                
+                return True
+            
+            return False
+            
+        except Exception as e:
+            print(f"Error connecting audio sensor: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def disconnect_audio_sensor(self, sensor):
+        """Disconnect an audio sensor"""
+        try:
+            if hasattr(self, 'audio_sensor_interfaces') and sensor.name in self.audio_sensor_interfaces:
+                interface = self.audio_sensor_interfaces[sensor.name]
+                interface.disconnect()
+                del self.audio_sensor_interfaces[sensor.name]
+                
+                # Emit status changed signal so the nav button icon updates
+                self.status_changed.emit()
+                
+                return True
+            return False
+        except Exception as e:
+            print(f"Error disconnecting audio sensor: {e}")
+            return False
+    
+    def _handle_audio_sensor_data(self, sensor, data):
+        """Handle data from an audio sensor
+        
+        Args:
+            sensor: The SensorModel (may be a reference, find the actual one from self.sensors)
+            data: Data dictionary from the audio sensor
+        """
+        try:
+            import time
+            
+            # Validate inputs
+            if not sensor or not data:
+                return
+            
+            if not isinstance(data, dict):
+                print(f"WARNING: Audio sensor data is not a dict: {type(data)}")
+                return
+            
+            # CRITICAL FIX: Find the actual sensor from self.sensors by name
+            # The sensor reference passed might be stale, so we need to find the current one
+            actual_sensor = None
+            for s in self.sensors:
+                if getattr(s, 'name', None) == sensor.name and getattr(s, 'interface_type', '') == 'AudioSensor':
+                    actual_sensor = s
+                    break
+            
+            if not actual_sensor:
+                print(f"WARNING: Could not find audio sensor '{sensor.name}' in self.sensors list")
+                return
+            
+            # Use the actual sensor from the list
+            sensor = actual_sensor
+            
+            # Record data flow for monitoring
+            if hasattr(self.main_window, 'data_flow_controller'):
+                byte_size = len(str(data))
+                self.main_window.data_flow_controller.record_audio_sensor_data(byte_size)
+            
+            # Get the primary value based on mode
+            mode = data.get("mode", "rms")
+            
+            try:
+                if mode == "rms":
+                    value = float(data.get("rms", 0))
+                elif mode == "peak":
+                    value = float(data.get("peak", 0))
+                elif mode == "frequency":
+                    value = float(data.get("dominant_frequency", 0))
+                elif mode == "rpm":
+                    # Convert dominant frequency to RPM if provided
+                    rpm_val = data.get("rpm", None)
+                    if rpm_val is None and "dominant_frequency" in data:
+                        rpm_val = float(data.get("dominant_frequency", 0)) * 60.0
+                    value = float(rpm_val if rpm_val is not None else 0)
+                elif mode == "band_energy":
+                    value = float(data.get("band_energy", 0))
+                elif mode == "zero_crossing":
+                    value = float(data.get("zero_crossing_rate", 0))
+                elif mode == "db_level":
+                    value = float(data.get("db_level", -60))
+                else:
+                    value = float(data.get("rms", 0))
+            except (ValueError, TypeError) as e:
+                print(f"WARNING: Could not convert audio sensor value: {e}")
+                value = 0.0
+            
+            # Update sensor value
+            try:
+                processed_value = sensor.process_reading(value)
+            except Exception as e:
+                print(f"WARNING: Error updating sensor reading: {e}")
+                import traceback
+                traceback.print_exc()
+            
+            # Store full audio sensor data
+            try:
+                if not hasattr(self, '_audio_sensor_data'):
+                    self._audio_sensor_data = {}
+                self._audio_sensor_data[sensor.name] = data.copy()
+            except Exception as e:
+                print(f"WARNING: Error storing audio sensor data: {e}")
+            
+            # Update UI (safe to call from any thread due to QueuedConnection)
+            try:
+                self.update_sensor_values()
+            except Exception as e:
+                print(f"WARNING: Error updating sensor values: {e}")
+            
+            # If not collecting data, send directly to graph for live-only monitoring
+            direct_plot_allowed = True
+            try:
+                if hasattr(self.main_window, 'data_collection_controller') and self.main_window.data_collection_controller:
+                    data_controller = self.main_window.data_collection_controller
+                    direct_plot_allowed = not getattr(data_controller, 'collecting_data', False)
+            except Exception:
+                pass
+
+            if direct_plot_allowed and not (
+                hasattr(self.main_window, 'graph_controller')
+                and self.main_window.graph_controller
+                and getattr(self.main_window.graph_controller, 'live_plotting_active', False)
+            ):
+                try:
+                    if self.main_window and hasattr(self.main_window, 'graph_controller') and self.main_window.graph_controller:
+                        graph_data = {
+                            'timestamp': data.get('timestamp', time.time()),
+                            sensor.name: value
+                        }
+                        for key in data:
+                            if key not in ["timestamp", "mode"]:
+                                try:
+                                    graph_data[f"{sensor.name}_{key}"] = data[key]
+                                except Exception:
+                                    pass
+                        self.main_window.graph_controller.plot_new_data(graph_data)
+                except Exception as e:
+                    print(f"WARNING: Error sending audio data to graph: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            # Store in data collection (aligns to global emit tick)
+            try:
+                if hasattr(self.main_window, 'data_collection_controller') and self.main_window.data_collection_controller:
+                    data_controller = self.main_window.data_collection_controller
+                    timestamp = data.get("timestamp", time.time())
+                    sensor_data = {
+                        "timestamp": timestamp,
+                        sensor.name: value
+                    }
+                    for key in data:
+                        if key not in ["timestamp", "mode"]:
+                            try:
+                                sensor_data[f"{sensor.name}_{key}"] = data[key]
+                            except Exception:
+                                pass
+
+                    # Store in historical buffer only if collecting data
+                    if data_controller.collecting_data:
+                        try:
+                            data_controller.historical_buffer_mutex.lock()
+                            try:
+                                for key, val in sensor_data.items():
+                                    if key != 'timestamp':
+                                        sensor_id = f"audio_{key}"
+                                        try:
+                                            data_controller.historical_buffer[sensor_id].append((timestamp, val))
+                                        except Exception as e:
+                                            print(f"WARNING: Error appending to historical buffer for {sensor_id}: {e}")
+                            finally:
+                                data_controller.historical_buffer_mutex.unlock()
+                        except Exception as e:
+                            print(f"WARNING: Error locking historical buffer: {e}")
+                    
+                    # Always update combined_data and _last_sensor_update for live UI
+                    try:
+                        data_controller.combined_data_mutex.lock()
+                        try:
+                            for key, val in sensor_data.items():
+                                if key != 'timestamp':
+                                    prefixed_key = f"audio_{key}"
+                                    try:
+                                        data_controller.combined_data[prefixed_key] = val
+                                        data_controller._last_sensor_update[prefixed_key] = timestamp
+                                    except Exception as e:
+                                        print(f"WARNING: Error adding to combined_data: {e}")
+                            if 'timestamp' in sensor_data:
+                                try:
+                                    data_controller.combined_data['audio_timestamp'] = sensor_data['timestamp']
+                                    if 'timestamp' not in data_controller.combined_data or sensor_data['timestamp'] > data_controller.combined_data['timestamp']:
+                                        data_controller.combined_data['timestamp'] = sensor_data['timestamp']
+                                except Exception as e:
+                                    print(f"WARNING: Error updating timestamp: {e}")
+                        finally:
+                            data_controller.combined_data_mutex.unlock()
+                    except Exception as e:
+                        print(f"WARNING: Error locking combined_data: {e}")
+            except Exception as e:
+                print(f"WARNING: Error storing audio data in data collection: {e}")
+                import traceback
+                traceback.print_exc()
+            
+        except Exception as e:
+            print(f"ERROR: Critical error handling audio sensor data: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def show_audio_sensor_config(self, sensor):
+        """Show configuration dialog for an audio sensor"""
+        try:
+            from app.ui.dialogs.audio_sensor_dialog import AudioSensorConfigDialog
+            
+            # Get current settings
+            current_settings = {}
+            if hasattr(sensor, 'audio_config'):
+                current_settings = sensor.audio_config.copy()
+            
+            # Show config dialog
+            dialog = AudioSensorConfigDialog(
+                self.main_window,
+                sensor_name=sensor.name,
+                current_settings=current_settings
+            )
+            
+            if dialog.exec():
+                new_settings = dialog.get_settings()
+                
+                # Update sensor config
+                sensor.audio_config = new_settings
+                
+                # If connected, update the interface
+                if hasattr(self, 'audio_sensor_interfaces') and sensor.name in self.audio_sensor_interfaces:
+                    interface = self.audio_sensor_interfaces[sensor.name]
+                    interface.set_mode(new_settings.get("mode", "rms"))
+                    interface.update_settings(new_settings)
+                
+                # Save
+                self.save_sensors()
+                self.update_sensor_table()
+                
+        except Exception as e:
+            print(f"Error showing audio sensor config: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def get_audio_sensors(self):
+        """Get list of audio sensors
+        
+        Returns:
+            List of SensorModel objects with interface_type="AudioSensor"
+        """
+        return [s for s in self.sensors if getattr(s, 'interface_type', '') == 'AudioSensor']
+    
+    def _is_sensor_calibrated(self, sensor):
+        """Check if a sensor has calibration data
+        
+        Args:
+            sensor: SensorModel to check
+            
+        Returns:
+            bool: True if sensor has calibration applied
+        """
+        # Use the sensor model's has_calibration method if available
+        if hasattr(sensor, 'has_calibration'):
+            return sensor.has_calibration()
+        
+        # Fallback checks for older sensor models
+        if hasattr(sensor, 'calibration_data') and sensor.calibration_data:
+            return True
+        
+        # Check if offset is non-zero (simple calibration indicator)
+        if hasattr(sensor, 'offset') and sensor.offset != 0:
+            return True
+        
+        # Check for conversion_factor if available
+        if hasattr(sensor, 'conversion_factor') and sensor.conversion_factor != 1.0:
+            return True
+            
+        return False
+    
+    def open_calibration_for_sensor(self, sensor):
+        """Open the calibration tool with the specified sensor preselected
+        
+        Args:
+            sensor: SensorModel to calibrate
+        """
+        try:
+            # Get or create the tools window
+            if not hasattr(self.main_window, 'tools_window') or self.main_window.tools_window is None:
+                from app.ui.tools import ToolsWindow
+                self.main_window.tools_window = ToolsWindow(self.main_window)
+                self.main_window.tools_window.set_main_window(self.main_window)
+            
+            tools_window = self.main_window.tools_window
+            
+            # Show the window
+            tools_window.show()
+            tools_window.raise_()
+            tools_window.activateWindow()
+            
+            # Switch to the calibration tab (index 1)
+            tools_window.tool_tabs.setCurrentIndex(1)
+            
+            # Preselect the sensor in the calibration tool
+            cal_tool = tools_window.sensor_calibration
+            if hasattr(cal_tool, 'sensor_combo'):
+                # Refresh the sensor list first
+                cal_tool._populate_sensor_combo()
+                
+                # Find and select the sensor
+                sensor_key = f"{sensor.interface_type}_{sensor.name}"
+                for i in range(cal_tool.sensor_combo.count()):
+                    if cal_tool.sensor_combo.itemData(i) == sensor_key:
+                        cal_tool.sensor_combo.setCurrentIndex(i)
+                        break
+            
+            # Show help panel if user might need guidance
+            if not tools_window.help_visible:
+                tools_window._toggle_help()
+                
+        except Exception as e:
+            print(f"Error opening calibration for sensor: {e}")
+            import traceback
+            traceback.print_exc()

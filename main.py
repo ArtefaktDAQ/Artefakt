@@ -6,6 +6,7 @@ import qdarktheme
 
 # Import the main application class from our app package
 from app.main_window import DAQApp
+from app.utils.sound_player import SoundPlayer
 from app import __version__, __author__, __description__
 
 # Import utilities
@@ -13,8 +14,8 @@ from app.utils.directory_setup import ensure_directories_exist
 from app.utils.error_handler import install_exception_handler
 
 def signal_handler(sig, frame):
-    """Handle keyboard interrupt (SIGINT) gracefully"""
-    print("\nKeyboardInterrupt received, shutting down gracefully...")
+    """Handle keyboard interrupt (SIGINT)"""
+    print("\nKeyboardInterrupt received, shutting down...")
     global QApplication
     QApplication.quit()
     sys.exit(0)
@@ -44,8 +45,11 @@ def main():
         app.setStyle("Fusion")
         qdarktheme.setup_theme("dark")
         
+        # Initialize sound player for automations
+        sound_player = SoundPlayer()
+        
         # Create and show main window
-        window = DAQApp()
+        window = DAQApp(sound_player=sound_player)
         window.show()
         
         # Start the event loop

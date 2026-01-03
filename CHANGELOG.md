@@ -2,11 +2,21 @@
 
 # Changelog
 
-## Version 0.2.2 - 2025-10-14
+## Version 0.3 - 2026-01-03
 
 ### Changes:
-- Release v0.2.2: Added gRPC remote streaming and control run visualization (87507e0)
+- Initial release
 
+
+## Version 0.3.0 - 2026-01-01
+
+### Major Features & Improvements:
+- **Optical Sensor Modes**: Added webcam-based sensor modes including Light Events, Brightness, Color Tracking, Position Tracking, Particle Counter, and Fill Level detection.
+- **Microphone Support**: Integrated microphone as a first-class sensor for audio analysis and synchronized recording.
+- **Enhanced Automation Framework**: Comprehensive system with time-based triggers, sensor value thresholds, and multi-step programmable workflows.
+- **On-Demand Tools Window**: New toolbox (Ctrl+Shift+T) featuring FFT analyzer, sensor calibration, diagnostics, and calculator.
+- **Remote DAQ & Control Runs**: Consolidated gRPC streaming and control run overlay functionality.
+- **UI & Stability**: Modernized interface with dark-themed styling and improved error handling.
 
 ## Version 0.2.2 - 2025-10-14
 

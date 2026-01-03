@@ -8,12 +8,19 @@ import serial.tools.list_ports
 import serial
 import time
 
+# Import theme system
+from app.ui.theme import (
+    DialogStyles, GroupBoxStyles, ButtonStyles, TableStyles,
+    ConnectionStyles, COLORS, TabStyles
+)
+
 class AddEditSensorDialog(QDialog):
     """Dialog for adding or editing a virtual sensor"""
     def __init__(self, parent=None, sensor=None, sequences=None):
         super().__init__(parent)
         self.setWindowTitle("Add Sensor" if sensor is None else "Edit Sensor")
         self.resize(400, 300)
+        self.setStyleSheet(DialogStyles.dark_dialog())
         self.sensor = sensor.copy() if sensor else {"name": "", "type": "", "mapping": "", "unit": "", "offset": 0.0, "color": "#4287f5", "show_in_graph": True}
         if not self.sensor.get("interface_type"):
             self.sensor["interface_type"] = "OtherSerial"
@@ -86,7 +93,9 @@ class AddEditSensorDialog(QDialog):
 
         btn_layout = QHBoxLayout()
         ok_btn = QPushButton("OK")
+        ok_btn.setStyleSheet(ButtonStyles.get("primary", "medium"))
         cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
         ok_btn.clicked.connect(self.accept)
         cancel_btn.clicked.connect(self.reject)
         btn_layout.addWidget(ok_btn)
@@ -156,9 +165,10 @@ class OtherSensorsDialog(QDialog):
     """Dialog for managing virtual/other sensors"""
     def __init__(self, parent=None, sensors=None, sequences=None):
         super().__init__(parent)
-        self.setWindowTitle("Other Sensors Management")
+        self.setWindowTitle("Serial Sensors Management")
         self.setMinimumWidth(800)
         self.setMinimumHeight(600)
+        self.setStyleSheet(DialogStyles.dark_dialog())
         
         # Store parent for access to controllers
         self._parent = parent
@@ -182,6 +192,7 @@ class OtherSensorsDialog(QDialog):
         
         # Create tab widget
         self.tab_widget = QTabWidget()
+        self.tab_widget.setStyleSheet(TabStyles.default())
         layout.addWidget(self.tab_widget)
         
         # --- Setup Sequences Tab ---
@@ -197,13 +208,17 @@ class OtherSensorsDialog(QDialog):
         self.sequences_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.sequences_table.verticalHeader().setVisible(False)
         self.sequences_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.sequences_table.setStyleSheet(TableStyles.default())
         sequences_layout.addWidget(self.sequences_table)
         
         # Add sequences buttons
         seq_btn_layout = QHBoxLayout()
         self.add_seq_btn = QPushButton("Add")
+        self.add_seq_btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
         self.edit_seq_btn = QPushButton("Edit")
+        self.edit_seq_btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
         self.remove_seq_btn = QPushButton("Remove")
+        self.remove_seq_btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
         
         self.add_seq_btn.clicked.connect(self.add_sequence)
         self.edit_seq_btn.clicked.connect(self.edit_sequence)
@@ -225,7 +240,7 @@ class OtherSensorsDialog(QDialog):
         
         # Add help instructions
         help_title = QLabel("How to Use Sequences")
-        help_title.setStyleSheet("font-size: 14pt; font-weight: bold; margin-bottom: 10px;")
+        help_title.setStyleSheet(f"font-size: 14pt; font-weight: bold; margin-bottom: 10px; color: {COLORS.TEXT_PRIMARY};")
         help_layout.addWidget(help_title)
         
         help_text = QTextEdit()
@@ -268,7 +283,7 @@ class OtherSensorsDialog(QDialog):
         
         # Add status label
         self.status_label = QLabel("")
-        self.status_label.setStyleSheet("color: gray; font-style: italic;")
+        self.status_label.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-style: italic;")
         bottom_layout.addWidget(self.status_label)
         
         # Add autoconnect checkbox
@@ -284,12 +299,22 @@ class OtherSensorsDialog(QDialog):
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.setMinimumWidth(100)
         self.connect_btn.clicked.connect(self.on_connect_clicked)
+        # Use theme system for button styles
+        self.green_border_style = ConnectionStyles.connected()
+        self.red_border_style = ConnectionStyles.disconnected()
+        self.connect_btn.setStyleSheet(self.green_border_style)  # Initial style
         bottom_layout.addWidget(self.connect_btn)
         
         # Add cancel/ok buttons
         self.button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
+        # Style the button box buttons
+        for btn in self.button_box.buttons():
+            if self.button_box.buttonRole(btn) == QDialogButtonBox.ButtonRole.AcceptRole:
+                btn.setStyleSheet(ButtonStyles.get("primary", "medium"))
+            else:
+                btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
         bottom_layout.addWidget(self.button_box)
         
         layout.addLayout(bottom_layout)
@@ -419,6 +444,7 @@ class OtherSensorsDialog(QDialog):
                     # Re-enable button after disconnection
                     self.connect_btn.setEnabled(True)
                     self.connect_btn.setText("Connect")
+                    self.connect_btn.setStyleSheet(self.green_border_style)
                     print("DEBUG OtherSensorsDialog: Connect button re-enabled and text set to 'Connect'")
                 else:
                     # Connect - use sensor controller if available
@@ -500,7 +526,7 @@ class OtherSensorsDialog(QDialog):
                             self.parent().update_device_connection_status_ui('other', True)
                             print("DEBUG OtherSensorsDialog: Updated device connection status UI to connected")
                         self.connect_btn.setText("Disconnect")
-                        self.connect_btn.setStyleSheet("background-color: #ff5555;")  # Red
+                        self.connect_btn.setStyleSheet(self.red_border_style)
                     else:
                         if hasattr(self.parent(), 'update_other_connected_status'):
                             self.parent().update_other_connected_status(False)
@@ -550,16 +576,16 @@ class OtherSensorsDialog(QDialog):
         # Update button text and style
         if is_connected:
             self.connect_btn.setText("Disconnect")
-            self.connect_btn.setStyleSheet("color: #FF4136; font-weight: bold;")  # Red
+            self.connect_btn.setStyleSheet(self.red_border_style)
             if self.status_label.text() == "":
                 self.status_label.setText("Connected")
-                self.status_label.setStyleSheet("color: green; font-weight: bold;")
+                self.status_label.setStyleSheet(f"color: {COLORS.SUCCESS}; font-weight: bold;")
         else:
             self.connect_btn.setText("Connect")
-            self.connect_btn.setStyleSheet("color: #2ECC40; font-weight: bold;")  # Green
+            self.connect_btn.setStyleSheet(self.green_border_style)
             if self.status_label.text() == "":
                 self.status_label.setText("Not connected")
-                self.status_label.setStyleSheet("color: gray; font-style: italic;")
+                self.status_label.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-style: italic;")
                 
         # Ensure button is enabled
         self.connect_btn.setEnabled(True)
@@ -669,6 +695,7 @@ class AddEditActionDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Add Action" if action is None else "Edit Action")
         self.resize(400, 220)
+        self.setStyleSheet(DialogStyles.dark_dialog())
         self.action = action.copy() if action else {"type": "send", "command": "", "ms": 200, "source": "", "target": "", "parse_mode": "after", "start": "", "end": ""}
         self.variables = variables or []
         self.setup_ui()
@@ -737,7 +764,9 @@ class AddEditActionDialog(QDialog):
 
         btn_layout = QHBoxLayout()
         ok_btn = QPushButton("OK")
+        ok_btn.setStyleSheet(ButtonStyles.get("primary", "medium"))
         cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
         ok_btn.clicked.connect(self.accept)
         cancel_btn.clicked.connect(self.reject)
         btn_layout.addWidget(ok_btn)
@@ -818,6 +847,7 @@ class AddEditSequenceDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Add Sequence" if sequence is None else "Edit Sequence")
         self.resize(500, 440)
+        self.setStyleSheet(DialogStyles.dark_dialog())
         self.sequence = sequence.copy() if sequence else {"name": "", "port": "", "baud": 9600, "actions": [], "poll_interval": 1.0}
         if isinstance(self.sequence.get("actions"), str):
             import json
@@ -858,14 +888,20 @@ class AddEditSequenceDialog(QDialog):
         self.actions_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.actions_table.verticalHeader().setVisible(False)
         self.actions_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.actions_table.setStyleSheet(TableStyles.default())
         layout.addRow(QLabel("Actions:"), self.actions_table)
 
         btn_layout = QHBoxLayout()
         self.add_action_btn = QPushButton("Add")
+        self.add_action_btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
         self.edit_action_btn = QPushButton("Edit")
+        self.edit_action_btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
         self.remove_action_btn = QPushButton("Remove")
+        self.remove_action_btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
         self.up_action_btn = QPushButton("Up")
+        self.up_action_btn.setStyleSheet(ButtonStyles.get("secondary", "small"))
         self.down_action_btn = QPushButton("Down")
+        self.down_action_btn.setStyleSheet(ButtonStyles.get("secondary", "small"))
         btn_layout.addWidget(self.add_action_btn)
         btn_layout.addWidget(self.edit_action_btn)
         btn_layout.addWidget(self.remove_action_btn)
@@ -886,13 +922,16 @@ class AddEditSequenceDialog(QDialog):
         # Test mode placeholder
         test_btn_layout = QHBoxLayout()
         self.test_btn = QPushButton("Test Sequence")
+        self.test_btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
         self.test_btn.clicked.connect(self.open_test_dialog)
         test_btn_layout.addWidget(self.test_btn)
         layout.addRow(test_btn_layout)
 
         ok_cancel_layout = QHBoxLayout()
         ok_btn = QPushButton("OK")
+        ok_btn.setStyleSheet(ButtonStyles.get("primary", "medium"))
         cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
         ok_btn.clicked.connect(self.accept)
         cancel_btn.clicked.connect(self.reject)
         ok_cancel_layout.addWidget(ok_btn)
@@ -1014,6 +1053,7 @@ class TestSequenceDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Test Sequence")
         self.resize(600, 500)
+        self.setStyleSheet(DialogStyles.dark_dialog())
         self.sequence = sequence
         self.actions = sequence.get("actions", [])
         self.port = sequence.get("port", "")
@@ -1039,6 +1079,7 @@ class TestSequenceDialog(QDialog):
         self.steps_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.steps_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.steps_table.verticalHeader().setVisible(False)
+        self.steps_table.setStyleSheet(TableStyles.default())
         layout.addWidget(QLabel(f"Port: {self.port}  Baudrate: {self.baud}"))
         layout.addWidget(self.steps_table)
 
@@ -1056,8 +1097,11 @@ class TestSequenceDialog(QDialog):
 
         btn_layout = QHBoxLayout()
         self.next_btn = QPushButton("Next Step")
+        self.next_btn.setStyleSheet(ButtonStyles.get("primary", "medium"))
         self.repeat_btn = QPushButton("Repeat Step")
+        self.repeat_btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
         self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
         btn_layout.addWidget(self.next_btn)
         btn_layout.addWidget(self.repeat_btn)
         btn_layout.addWidget(self.stop_btn)

@@ -24,8 +24,22 @@ class CollapsibleBox(QWidget):
             QToolButton { 
                 border: none; 
                 text-align: left;
-                padding-left: 5px;
+                padding: 8px 12px;
                 font-weight: bold;
+                font-size: 13px;
+                color: #fff;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #3a4a6a, stop:1 #2a3a5a);
+                border-radius: 6px;
+                margin-top: 4px;
+            }
+            QToolButton:hover {
+                background: #4a5a7a;
+            }
+            QToolButton:checked {
+                background: #4c5c7c;
+                border-bottom-left-radius: 0px;
+                border-bottom-right-radius: 0px;
             }
         """)
         self.toggle_button.setToolButtonStyle(

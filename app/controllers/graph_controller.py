@@ -5,14 +5,20 @@ Manages graph visualization and data plotting.
 """
 
 import pyqtgraph as pg
-from PyQt6.QtGui import QColor, QFont
-from PyQt6.QtWidgets import QGraphicsRectItem, QGraphicsLineItem # Import necessary QtWidgets
+# Enable performance optimizations for pyqtgraph
+pg.setConfigOptions(antialias=False) # Antialiasing is slow for many points
+from PyQt6.QtGui import QColor, QFont, QDesktopServices
+from PyQt6.QtWidgets import QGraphicsRectItem, QGraphicsLineItem, QMenu # Import necessary QtWidgets
 import time
+import os
+import csv
+import glob
 from collections import defaultdict
 import numpy as np # Import numpy for efficient filtering
 import re # Import regular expressions
+import bisect # For efficient data slicing
 from scipy.fft import fft, fftfreq
-from PyQt6.QtCore import QTimer # Import QTimer
+from PyQt6.QtCore import QTimer, Qt, QMutex, QUrl  # Import QTimer, Qt, and QMutex for pen styles and thread safety
 
 class GraphController:
     """Controls graph visualization and plotting"""
@@ -35,13 +41,126 @@ class GraphController:
         self.dashboard_plot_data = {} 
         self.dashboard_graph_widget = None # Will be set in start_live_dashboard_update
         self.last_plot_update_time = 0 # Time of the last visual plot update
-        self.plot_update_interval = 0.2 # Update plot visuals every 200ms
+        self.plot_update_interval = 0.3 # Update plot visuals every 300ms (reduced frequency for performance)
+        
+        # Store automation event markers for graph visualization
+        self.event_markers = []  # List of event dictionaries with timestamps
+        self.event_markers_mutex = QMutex() if hasattr(QMutex, '__init__') else None
+        self.show_automation_markers = True
+        self._event_marker_items = {}
+        self._last_marker_add_time = 0 # Rate limit for UI markers
+        
+        # Track legend labels to prevent duplicates and improve update speed
+        self._dashboard_legend_labels = {} 
+
+        # Replay-specific helpers
+        self.replay_playhead_line = None
+        self.replay_data_bounds = (0.0, 0.0)
+        self.replay_dataset_loaded = False
         
         # Timer for main graph live updates
         self.main_graph_update_timer = QTimer()
         self.main_graph_update_timer.setInterval(1500) # Update every 1.5 seconds
-        self.main_graph_update_timer.timeout.connect(self.update_graph) 
+        self.main_graph_update_timer.timeout.connect(self.update_graph)
+
+    def _resolve_start_time(self, preferred=None, allow_now=False):
+        """Resolve a start_time for marker placement with sensible fallbacks."""
+        if preferred is not None:
+            return preferred
+        if self.dashboard_start_time:
+            return self.dashboard_start_time
+        if hasattr(self.main_window, "data_collection_controller"):
+            st = getattr(self.main_window.data_collection_controller, "start_time", None)
+            if st is not None:
+                return st
+        if hasattr(self, "event_markers") and self.event_markers:
+            return min(e.get("timestamp", time.time()) for e in self.event_markers)
+        return time.time() if allow_now else None
+
+    def _debug(self, message):
+        """Log debug messages when a logger is available."""
+        if hasattr(self.main_window, "logger"):
+            self.main_window.logger.debug(message)
+
+    def _warn(self, message):
+        """Log warnings when a logger is available."""
+        if hasattr(self.main_window, "logger"):
+            self.main_window.logger.warning(message)
+
+    def _error(self, message):
+        """Log errors when a logger is available."""
+        if hasattr(self.main_window, "logger"):
+            self.main_window.logger.error(message)
+
+    def _get_event_markers_snapshot(self):
+        """
+        Thread-safe snapshot of stored automation events.
         
+        Returns:
+            list: Copy of event marker dictionaries
+        """
+        if self.event_markers_mutex:
+            self.event_markers_mutex.lock()
+            try:
+                return list(self.event_markers)
+            finally:
+                self.event_markers_mutex.unlock()
+        return list(self.event_markers)
+
+    def _clear_event_markers_for_widget(self, graph_widget):
+        """Remove automation marker items from a graph widget."""
+        if not graph_widget:
+            return
+        items = self._event_marker_items.get(graph_widget, [])
+        for item in items:
+            try:
+                graph_widget.removeItem(item)
+            except Exception:
+                continue
+        self._event_marker_items[graph_widget] = []
+
+    def set_show_automation_markers(self, enabled: bool):
+        """Enable/disable automation markers and refresh graphs accordingly."""
+        self.show_automation_markers = bool(enabled)
+        self._debug(
+            f"Graph: set_show_automation_markers -> {self.show_automation_markers}, "
+            f"events stored={len(self._get_event_markers_snapshot())}"
+        )
+        print(f"[AUTOMATION MARKERS] toggle -> {self.show_automation_markers}, stored={len(self._get_event_markers_snapshot())}")
+
+        # Always clear existing markers from both graphs
+        self._clear_event_markers_for_widget(self.dashboard_graph_widget)
+        self._clear_event_markers_for_widget(getattr(self.main_window, "graph_widget", None))
+
+        if not self.show_automation_markers:
+            return
+
+        # Re-add markers to dashboard graph if possible
+        dashboard_start = self._resolve_start_time(self.dashboard_start_time, allow_now=True)
+        if self.dashboard_graph_widget:
+            self._debug(f"Graph: re-adding dashboard markers with start={dashboard_start}")
+            self._add_event_markers_to_graph(self.dashboard_graph_widget, dashboard_start, force=True)
+
+        # Re-add markers to main graph if possible
+        if hasattr(self.main_window, "graph_widget") and hasattr(self.main_window, "data_collection_controller"):
+            # Check if current graph type allows markers
+            current_graph_type = ""
+            if hasattr(self.main_window, 'graph_type_combo'):
+                current_graph_type = self.main_window.graph_type_combo.currentText()
+            
+            if current_graph_type not in ["Histogram", "Box Plot"]:
+                main_start = self._resolve_start_time(getattr(self.main_window.data_collection_controller, "start_time", None), allow_now=True)
+                self._debug(f"Graph: re-adding main markers with start={main_start}")
+                self._add_event_markers_to_graph(self.main_window.graph_widget, main_start, force=True)
+
+        # Force a redraw to ensure markers appear after toggling back on
+        for gw in [getattr(self.main_window, 'graph_widget', None), self.dashboard_graph_widget]:
+            if gw:
+                try:
+                    gw.update()
+                except Exception:
+                    pass
+
     def connect_signals(self):
         """Connect UI signals to controller methods"""
         if hasattr(self.main_window, 'graph_type_combo'):
@@ -50,6 +169,261 @@ class GraphController:
             self.main_window.graph_secondary_sensor.currentIndexChanged.connect(self.update_graph)
             self.main_window.graph_timespan.currentIndexChanged.connect(self.on_timespan_changed)
             self.main_window.dashboard_timespan.currentIndexChanged.connect(self.on_dashboard_timespan_changed)
+        
+        # Setup custom context menu for graph widget to override "View All"
+        if hasattr(self.main_window, 'graph_widget'):
+            self._setup_graph_context_menu(self.main_window.graph_widget)
+    
+    def _get_data_bounds(self, graph_widget):
+        """
+        Calculate the actual data bounds from plot items, excluding markers and other non-data items.
+        Only includes regular (non-control) sensor data to match the CSV bounds.
+        Only includes X values where there's actual Y data (not just empty space).
+        
+        Args:
+            graph_widget: The PlotWidget to analyze
+            
+        Returns:
+            tuple: (min_x, max_x, min_y, max_y) or None if no data found
+        """
+        if not graph_widget:
+            return None
+        
+        plot_item = graph_widget.getPlotItem()
+        if not plot_item:
+            return None
+        
+        # Get all data items in the plot
+        all_items = plot_item.listDataItems()
+        
+        # Filter to only PlotDataItem (actual data curves, not markers or other items)
+        data_items = [item for item in all_items if isinstance(item, pg.PlotDataItem)]
+        
+        if not data_items:
+            return None
+        
+        # Collect x and y values from data items, but only where both X and Y are valid
+        # Store data per item to find the main data cluster
+        sensor_x_ranges = []  # List of (min_x, max_x, point_count) for each sensor
+        all_x_values = []
+        all_y_values = []
+        
+        for item in data_items:
+            try:
+                # Get the data from the plot item
+                x_data = item.xData
+                y_data = item.yData
+                
+                # Skip if data is empty
+                if x_data is None or len(x_data) == 0:
+                    continue
+                if y_data is None or len(y_data) == 0:
+                    continue
+                
+                # Check if this is control run data by checking the pen style
+                # Control sensors use dashed lines, regular sensors use solid lines
+                is_control = self._is_control_item(item)
+                
+                # Skip control run data - we only want the actual CSV data bounds
+                if is_control:
+                    self._debug(f"Skipping control run data item (dashed line or control in name)")
+                    continue
+                
+                # Convert to arrays for easier processing
+                if isinstance(x_data, np.ndarray):
+                    x_arr = x_data
+                else:
+                    x_arr = np.array(x_data, dtype=float)
+                
+                if isinstance(y_data, np.ndarray):
+                    y_arr = y_data
+                else:
+                    y_arr = np.array(y_data, dtype=float)
+                
+                # Only include points where BOTH X and Y are finite and valid
+                # This ensures we only count actual data points, not gaps or invalid data
+                valid_mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+                
+                if np.any(valid_mask):
+                    valid_x = x_arr[valid_mask]
+                    valid_y = y_arr[valid_mask]
+                    
+                    if len(valid_x) > 0:
+                        # Store the range for this sensor
+                        sensor_x_ranges.append((np.min(valid_x), np.max(valid_x), len(valid_x)))
+                        all_x_values.extend(valid_x.tolist())
+                        all_y_values.extend(valid_y.tolist())
+                    
+            except Exception as e:
+                self._debug(f"Error getting data from plot item: {e}")
+                continue
+        
+        if not all_x_values:
+            self._debug("No valid X values found in data items")
+            return None
+        
+        min_x = min(all_x_values)
+        
+        # Find the maximum X from the main data cluster
+        # If we have multiple sensors, use the maximum X where most sensors have data
+        # This prevents a single outlier sensor from extending the range too far
+        if len(sensor_x_ranges) > 1:
+            # Find the maximum X that's within the range of at least 2 sensors
+            # This ensures we don't include sparse outliers
+            max_xes = [r[1] for r in sensor_x_ranges]  # Get max X for each sensor
+            max_xes.sort()
+            # Use the second-highest max (or highest if only 2 sensors)
+            # This helps filter out single-sensor outliers
+            if len(max_xes) >= 2:
+                # Use the maximum X from sensors that have substantial data
+                # Find sensors with more than 10 data points
+                substantial_sensors = [r for r in sensor_x_ranges if r[2] > 10]
+                if substantial_sensors:
+                    max_x = max(r[1] for r in substantial_sensors)
+                else:
+                    # All sensors have few points, use the median max X
+                    max_x = np.median(max_xes)
+            else:
+                max_x = max_xes[-1]
+        else:
+            # Single sensor or all sensors have similar ranges
+            max_x = max(all_x_values)
+        
+        # Y values are optional - if we have them, use them, otherwise just set X range
+        if all_y_values:
+            min_y = min(all_y_values)
+            max_y = max(all_y_values)
+        else:
+            # If no Y values, we'll let Y auto-range
+            min_y = None
+            max_y = None
+        
+        self._debug(f"Data bounds calculated: X=[{min_x:.2f}, {max_x:.2f}] seconds, Y=[{min_y}, {max_y}], from {len(sensor_x_ranges)} regular sensors")
+        
+        return (min_x, max_x, min_y, max_y)
+    
+    def _is_control_item(self, item):
+        """Check if a plot item is a control run item"""
+        try:
+            if hasattr(item, 'opts') and 'pen' in item.opts:
+                pen = item.opts['pen']
+                if hasattr(pen, 'style'):
+                    if pen.style() == pg.QtCore.Qt.PenStyle.DashLine:
+                        return True
+            item_name = ""
+            if hasattr(item, 'name'):
+                item_name = str(item.name()) if callable(item.name) else str(item.name)
+            elif hasattr(item, 'opts') and 'name' in item.opts:
+                item_name = str(item.opts['name'])
+            
+            if item_name and ('_ctrl' in item_name.lower() or 'control' in item_name.lower()):
+                return True
+        except:
+            pass
+        return False
+    
+    def _view_all_data(self, graph_widget):
+        """
+        Zoom to show only the actual data bounds (up to last CSV line), not all items.
+        
+        Args:
+            graph_widget: The PlotWidget to zoom
+        """
+        bounds = self._get_data_bounds(graph_widget)
+        if bounds is None:
+            # Fallback to standard autoRange if no data bounds found
+            self._debug("No data bounds found, using standard autoRange")
+            graph_widget.autoRange()
+            return
+        
+        min_x, max_x, min_y, max_y = bounds
+        
+        # Add small padding (2%) for better visualization
+        x_range = max_x - min_x
+        x_padding = x_range * 0.02 if x_range > 0 else 1
+        
+        self._debug(f"Setting X range to [{min_x - x_padding:.2f}, {max_x + x_padding:.2f}]")
+        
+        # Set the X range to show only the data (up to last CSV line)
+        graph_widget.setXRange(min_x - x_padding, max_x + x_padding, padding=0)
+        
+        # Set Y range if we have Y bounds, otherwise let it auto-range
+        if min_y is not None and max_y is not None:
+            y_range = max_y - min_y
+            y_padding = y_range * 0.02 if y_range > 0 else 1
+            graph_widget.setYRange(min_y - y_padding, max_y + y_padding, padding=0)
+        else:
+            # Only auto-range Y axis
+            graph_widget.enableAutoRange(axis='y')
+    
+    def _setup_graph_context_menu(self, graph_widget):
+        """
+        Setup custom context menu for graph widget to override "View All" behavior.
+        
+        Args:
+            graph_widget: The PlotWidget to setup context menu for
+        """
+        if not graph_widget:
+            return
+        
+        # Get the PlotItem's ViewBox
+        plot_item = graph_widget.getPlotItem()
+        if not plot_item:
+            return
+        
+        view_box = plot_item.getViewBox()
+        if not view_box:
+            return
+        
+        # Store reference to graph_widget and controller for the menu handler
+        view_box._graph_widget = graph_widget
+        view_box._graph_controller = self
+        
+        # Override the getMenu method to customize the context menu
+        # Save the original method
+        if not hasattr(view_box, '_original_get_menu'):
+            view_box._original_get_menu = view_box.getMenu
+        
+        def custom_get_menu(ev):
+            """Create custom context menu with overridden View All"""
+            try:
+                # Get the original menu first
+                original_menu = view_box._original_get_menu(ev)
+                
+                if not original_menu:
+                    # If no original menu, create a basic one with our custom View All
+                    menu = QMenu(graph_widget)
+                    view_all_action = menu.addAction("View All")
+                    view_all_action.triggered.connect(lambda checked, gw=graph_widget: self._view_all_data(gw))
+                    return menu
+                
+                # Find and modify the "View All" action in the original menu
+                for action in original_menu.actions():
+                    action_text = action.text() if action.text() else ""
+                    action_text_lower = action_text.lower()
+                    
+                    # Check for View All or Auto Range actions
+                    if "view all" in action_text_lower or "auto range" in action_text_lower:
+                        # Disconnect all existing connections
+                        try:
+                            action.triggered.disconnect()
+                        except:
+                            pass
+                        # Connect to our custom handler
+                        action.triggered.connect(lambda checked, gw=graph_widget: self._view_all_data(gw))
+                        break  # Only modify the first match
+                
+                return original_menu
+            except Exception as e:
+                # If anything goes wrong, fall back to original menu
+                self._debug(f"Error creating custom context menu: {e}")
+                try:
+                    return view_box._original_get_menu(ev)
+                except:
+                    return None
+        
+        # Override the getMenu method
+        view_box.getMenu = custom_get_menu
     
     def on_graph_type_changed(self):
         """Handle graph type change"""
@@ -73,12 +447,20 @@ class GraphController:
     
     def update_graph(self):
         """Update the main graph"""
-        # Only update if data collection is active
-        if not hasattr(self.main_window, 'data_collection_controller') or not self.main_window.data_collection_controller.collecting_data:
-            print("DEBUG: Skipping main graph update as data collection is not active")
+        if not hasattr(self.main_window, 'data_collection_controller'):
             return
+
+        # Update if data collection is active OR if we are in replay/review mode
+        collecting = self.main_window.data_collection_controller.collecting_data
+        replay_mode = getattr(self.main_window, 'replay_mode_enabled', False)
+
+        if not collecting and not replay_mode:
+            self._debug("Skipping main graph update as neither collection nor replay is active")
+            return
+
         if hasattr(self.main_window, 'logger'):
-            self.main_window.logger.debug("Updating main graph (triggered by timer or UI change)")
+            self.main_window.logger.debug(f"Updating main graph (collecting={collecting}, replay={replay_mode})")
+        
         # Trigger the main window's update method which gathers params and calls update_specific_graph
         if hasattr(self.main_window, 'update_graph'):
             self.main_window.update_graph()
@@ -104,22 +486,24 @@ class GraphController:
         if hasattr(self.main_window, 'logger'):
             self.main_window.logger.debug("Updating dashboard graph")
 
-        # If live plotting is active, don't overwrite the live plot when tab is changed
+        # If live plotting is active, visuals are handled by plot_new_data/timer
         if self.live_plotting_active:
              return
              
-        # TODO: Implement logic to display historical data if needed when not live plotting
+        # If not live plotting, update visuals to reflect current buffer/timespan
         if self.dashboard_graph_widget:
-             self.dashboard_graph_widget.clear()
-             # Optionally add placeholder text
-             self.dashboard_graph_widget.setLabel('bottom', 'Time (s)')
-             self.dashboard_graph_widget.setLabel('left', 'Value')
-             self.dashboard_graph_widget.addLegend()
+             self._update_all_plot_visuals(force=True)
 
     def start_live_dashboard_update(self, start_time):
         """Prepare and start live plotting on the dashboard graph."""
         self.main_window.logger.log("Starting live dashboard graph updates.", "INFO")
         print(f"DEBUG: start_live_dashboard_update called with start_time: {start_time}")
+        # Update header to reflect live context
+        if hasattr(self.main_window, "_update_dashboard_header_for_run"):
+            run_dir = None
+            if hasattr(self.main_window, "project_controller"):
+                run_dir = self.main_window.project_controller.get_current_run_directory()
+            self.main_window._update_dashboard_header_for_run(run_dir, mode_label="Live")
         
         if not hasattr(self.main_window, 'dashboard_graph_widget'):
             self.main_window.logger.log("Dashboard graph widget not found.", "ERROR")
@@ -128,20 +512,85 @@ class GraphController:
             
         self.dashboard_graph_widget = self.main_window.dashboard_graph_widget    
         self.dashboard_graph_widget.clear()
+        
+        # Clear the legend explicitly to prevent orphaned items from previous runs
+        try:
+            plot_item = self.dashboard_graph_widget.getPlotItem()
+            if hasattr(plot_item, 'legend') and plot_item.legend:
+                plot_item.legend.clear()
+        except Exception:
+            pass
+
+        self._dashboard_legend_labels.clear()
+
+        # Configure global downsampling on the PlotItem for better performance
+        # This is safer than per-plot downsampling in some pyqtgraph versions
+        try:
+            # Check for setting
+            downsampling_enabled = True
+            if hasattr(self.main_window, 'graph_downsampling_checkbox'):
+                downsampling_enabled = self.main_window.graph_downsampling_checkbox.isChecked()
+            elif self.settings_model:
+                downsampling_enabled = self.settings_model.get_bool("graph_downsampling", True)
+
+            plot_item = self.dashboard_graph_widget.getPlotItem()
+            if downsampling_enabled:
+                plot_item.setDownsampling(ds=True, auto=True, mode='peak')
+            else:
+                plot_item.setDownsampling(ds=False)
+            plot_item.setClipToView(True)
+        except Exception as e:
+            print(f"DEBUG: Could not set global downsampling: {e}")
+
         self.dashboard_plot_data.clear()
         self.dashboard_start_time = start_time
         self.live_plotting_active = True
+        self.replay_dataset_loaded = False
+        self.replay_playhead_line = None
         print(f"DEBUG: Set live_plotting_active={self.live_plotting_active}, dashboard_start_time={self.dashboard_start_time}")
 
         # Set up axes and legend
         print("DEBUG: Setting up dashboard graph axes and legend")
         self.dashboard_graph_widget.setLabel('bottom', 'Time (s)')
         self.dashboard_graph_widget.setLabel('left', 'Value') # Generic Y-label
-        # Clear any existing legend first
-        if hasattr(self.dashboard_graph_widget, 'legend') and self.dashboard_graph_widget.legend is not None:
-            self.dashboard_graph_widget.legend.scene().removeItem(self.dashboard_graph_widget.legend)
-        self.dashboard_graph_widget.addLegend()
+        # Clear any existing legend first via PlotItem
+        plot_item = self.dashboard_graph_widget.getPlotItem()
+        legend = getattr(plot_item, 'legend', None)
+        if not legend:
+            # Check if it's stored on the widget (our custom attribute)
+            legend = getattr(self.dashboard_graph_widget, 'legend', None)
+            
+        if legend:
+            try:
+                # Remove from scene
+                scene = legend.scene()
+                if scene:
+                    scene.removeItem(legend)
+                legend.setParentItem(None)
+            except Exception:
+                pass
+            plot_item.legend = None
+            if hasattr(self.dashboard_graph_widget, 'legend'):
+                self.dashboard_graph_widget.legend = None
+        
+        # Create a fresh legend
+        legend = plot_item.addLegend(offset=(30, 30))
+        self.dashboard_graph_widget.legend = legend # Store reference
+        
+        if legend:
+            legend.setVisible(True)
+            legend.setBrush(pg.mkBrush(20, 20, 30, 180)) # Dark, slightly purple background
+            legend.setPen(pg.mkPen(150, 150, 150, 150))  # Muted border
+            legend.setZValue(1000)
+            # Ensure the legend can be seen
+            # LegendItem's layout often needs a nudge
+            legend.update()
+        
         self.dashboard_graph_widget.showGrid(x=True, y=True, alpha=0.3)
+        
+        # Add event markers to dashboard graph
+        start_time = self._resolve_start_time(self.dashboard_start_time, allow_now=self.show_automation_markers)
+        self._add_event_markers_to_graph(self.dashboard_graph_widget, start_time, force=self.show_automation_markers)
         
         # Set auto range on the plot so it updates as new data comes in
         self.dashboard_graph_widget.enableAutoRange()
@@ -181,60 +630,81 @@ class GraphController:
             line_width = self.main_window.plot_line_width.value()
         
         for sensor in sensors:
-            show_in_graph = getattr(sensor, 'show_in_graph', False)
-            enabled = getattr(sensor, 'enabled', False)
-            if show_in_graph and enabled:
-                color_str = getattr(sensor, 'color', '#FFFFFF')
-                sensor_name_for_legend = getattr(sensor, 'name', 'Unknown Sensor')
-                interface_type = getattr(sensor, 'interface_type', 'Unknown')
-
-                # --- Determine the CORRECT key for matching incoming data --- 
-                sensor_key_for_data = None
-                if interface_type == "Arduino":
-                    # Use the sensor name for Arduino data keys (address is often empty)
-                    sensor_key_for_data = getattr(sensor, 'name', None)
-                    if not sensor_key_for_data:
-                        print(f"WARNING GRAPH: Arduino sensor '{sensor_name_for_legend}' has no name defined. Skipping plot.")
-                        continue
-                elif interface_type == "LabJack":
-                    # LabJack uses channel name (port/address field in SensorModel)
-                    sensor_key_for_data = getattr(sensor, 'port', None) # Assuming 'port' holds the channel name
-                    if not sensor_key_for_data:
-                        print(f"WARNING GRAPH: LabJack sensor '{sensor_name_for_legend}' has no port/channel defined. Skipping plot.")
-                        continue
-                elif interface_type == "OtherSerial":
-                    # OtherSerial data is keyed by the user-defined sensor name
-                    sensor_key_for_data = sensor_name_for_legend 
-                else:
-                    print(f"WARNING GRAPH: Unknown interface type '{interface_type}' for sensor '{sensor_name_for_legend}'. Skipping plot.")
-                    continue
-                # --------------------------------------------------------
-
-                print(f"DEBUG: Adding sensor to graph: Name='{sensor_name_for_legend}', KeyForData='{sensor_key_for_data}', Type='{interface_type}', Color='{color_str}'")
+            try:
+                # Use getattr with defaults to be safe
+                show_in_graph = getattr(sensor, 'show_in_graph', True)
+                enabled = getattr(sensor, 'enabled', True)
                 
-                try:
-                    color = QColor(color_str)
-                    pen = pg.mkPen(color=color, width=line_width)
-                    # Create plot item using sensor_name_for_legend for the legend
-                    plot_item = self.dashboard_graph_widget.plot([], [], pen=pen, name=sensor_name_for_legend)
-                    # Store plot data using sensor_key_for_data as the dictionary key
-                    self.dashboard_plot_data[sensor_key_for_data] = {
-                        'x': [], 
-                        'y': [], 
-                        'plot_item': plot_item,
-                        'name': sensor_name_for_legend, # Keep user-defined name for reference
-                        'color': color_str
-                    }
-                    sensors_added += 1
-                    print(f"DEBUG: Successfully added plot for sensor '{sensor_name_for_legend}' (key: '{sensor_key_for_data}').")
-                    self.main_window.logger.log(f"Added plot for sensor '{sensor_name_for_legend}' (key: '{sensor_key_for_data}') to dashboard.", "INFO")
-                except Exception as e:
-                    print(f"ERROR: Failed to add sensor {sensor_name_for_legend} to graph: {e}")
-                    self.main_window.logger.log(f"Error adding sensor {sensor_name_for_legend} to graph: {e}. Color string: {color_str}", "ERROR")
-                    import traceback
-                    traceback_text = traceback.format_exc()
-                    print(traceback_text)
-                    self.main_window.logger.log(traceback_text, "ERROR")
+                if show_in_graph and enabled:
+                    color_str = getattr(sensor, 'color', '#FFFFFF')
+                    sensor_name_for_legend = getattr(sensor, 'name', 'Unknown Sensor')
+                    interface_type = getattr(sensor, 'interface_type', 'Unknown')
+
+                    # --- Determine the CORRECT key for matching incoming data --- 
+                    sensor_key_for_data = None
+                    if interface_type == "Arduino":
+                        # Use the sensor name for Arduino data keys (address is often empty)
+                        sensor_key_for_data = getattr(sensor, 'name', None)
+                        if not sensor_key_for_data:
+                            print(f"WARNING GRAPH: Arduino sensor '{sensor_name_for_legend}' has no name defined. Skipping plot.")
+                            continue
+                    elif interface_type == "LabJack":
+                        # LabJack uses channel name (port/address field in SensorModel)
+                        sensor_key_for_data = getattr(sensor, 'port', None) # Assuming 'port' holds the channel name
+                        if not sensor_key_for_data:
+                            print(f"WARNING GRAPH: LabJack sensor '{sensor_name_for_legend}' has no port/channel defined. Skipping plot.")
+                            continue
+                    elif interface_type == "OtherSerial":
+                        # OtherSerial data is keyed by the user-defined sensor name
+                        sensor_key_for_data = sensor_name_for_legend 
+                    elif interface_type == "OpticalSensor":
+                        # OpticalSensor uses the sensor name for data keys
+                        sensor_key_for_data = sensor_name_for_legend
+                    elif interface_type == "AudioSensor":
+                        # AudioSensor uses the sensor name for data keys
+                        sensor_key_for_data = sensor_name_for_legend
+                    else:
+                        print(f"WARNING GRAPH: Unknown interface type '{interface_type}' for sensor '{sensor_name_for_legend}'. Skipping plot.")
+                        continue
+                    # --------------------------------------------------------
+
+                    print(f"DEBUG: Adding sensor to graph: Name='{sensor_name_for_legend}', KeyForData='{sensor_key_for_data}', Type='{interface_type}', Color='{color_str}'")
+                    
+                    try:
+                        color = QColor(color_str)
+                        pen = pg.mkPen(color=color, width=line_width)
+                        # Create plot item using sensor_name_for_legend for the legend
+                        # connect='finite' prevents drawing lines across NaN gaps (stale data)
+                        # Create plot with performance optimizations
+                        plot_item = self.dashboard_graph_widget.plot(
+                            [], [], 
+                            pen=pen, 
+                            name=sensor_name_for_legend,
+                            connect='finite'
+                        )
+                        # Store plot data using sensor_key_for_data as the dictionary key
+                        self.dashboard_plot_data[sensor_key_for_data] = {
+                            'x': [], 
+                            'y': [], 
+                            'plot_item': plot_item,
+                            'name': sensor_name_for_legend, # Keep user-defined name for reference
+                            'color': color_str,
+                            'sensor_obj': sensor
+                        }
+                        sensors_added += 1
+                        print(f"DEBUG: Successfully added plot for sensor '{sensor_name_for_legend}' (key: '{sensor_key_for_data}').")
+                        self.main_window.logger.log(f"Added plot for sensor '{sensor_name_for_legend}' (key: '{sensor_key_for_data}') to dashboard.", "INFO")
+                    except Exception as e:
+                        print(f"ERROR: Failed to add sensor {sensor_name_for_legend} to graph: {e}")
+                        self.main_window.logger.log(f"Error adding sensor {sensor_name_for_legend} to graph: {e}. Color string: {color_str}", "ERROR")
+                        import traceback
+                        traceback_text = traceback.format_exc()
+                        print(traceback_text)
+                        self.main_window.logger.log(traceback_text, "ERROR")
+            except Exception as e:
+                print(f"ERROR GRAPH: Unexpected error processing sensor: {e}")
+                if hasattr(self.main_window, 'logger'):
+                    self.main_window.logger.log(f"Unexpected error processing sensor: {e}", "ERROR")
 
         print(f"DEBUG: Added {sensors_added} plots. Final dashboard_plot_data keys: {list(self.dashboard_plot_data.keys())}")
         self.main_window.logger.log(f"Added {sensors_added} plots to the dashboard graph", "INFO")
@@ -256,11 +726,13 @@ class GraphController:
                  text.setPos(0, 0) 
             self.dashboard_graph_widget.addItem(text)
             
-        # --- Set up dashboard update timer to match sampling interval, but not faster than 1s ---
+        # --- Set up dashboard update timer to match sampling rate, but not faster than 1s ---
         update_interval_ms = 1000  # Default 1s
         if hasattr(self.main_window, 'sampling_rate_spinbox'):
-            interval = self.main_window.sampling_rate_spinbox.value()
-            update_interval_ms = max(int(interval * 1000), 1000)
+            rate_hz = self.main_window.sampling_rate_spinbox.value()
+            if rate_hz > 0:
+                # Convert Hz to ms interval: 1000 / Hz
+                update_interval_ms = max(int(1000 / rate_hz), 1000)
         if not hasattr(self, 'dashboard_update_timer'):
             from PyQt6.QtCore import QTimer
             self.dashboard_update_timer = QTimer()
@@ -283,10 +755,331 @@ class GraphController:
             self.dashboard_update_timer.stop()
         # Keep the plot data and items, don't clear graph here
         # User might want to see the final state
+    
+    def load_replay_dataset(self, rows, automation_columns=None):
+        """Preload full replay dataset into dashboard plots and set up playhead."""
+        if not self.dashboard_graph_widget:
+            self._warn("Graph: dashboard_graph_widget missing; cannot load replay data")
+            return
+
+        # Ensure legend exists for replay and clear it to prevent orphans
+        if not hasattr(self.dashboard_graph_widget, 'legend') or self.dashboard_graph_widget.legend is None:
+            self.dashboard_graph_widget.legend = self.dashboard_graph_widget.addLegend()
+        else:
+            try:
+                self.dashboard_graph_widget.legend.clear()
+            except Exception:
+                pass
+        
+        self._dashboard_legend_labels.clear()
+        
+        # Clear previous replay state
+        self.replay_dataset_loaded = False
+        self.replay_data_bounds = (0.0, 0.0)
+        if self.replay_playhead_line:
+            try:
+                self.dashboard_graph_widget.removeItem(self.replay_playhead_line)
+            except Exception:
+                pass
+            self.replay_playhead_line = None
+
+        if not rows:
+            self._warn("Graph: No replay rows provided to load")
+            return
+
+        automation_columns = automation_columns or []
+
+        # Collect sensor keys present in the replay CSV (excluding timestamps/automation)
+        replay_sensor_keys = set()
+        for row in rows:
+            for key in row.keys():
+                if key in ("timestamp", "_timestamp", "_rel_time"):
+                    continue
+                # Filter out all timestamp columns (arduino_timestamp, labjack_timestamp, etc.)
+                if key.endswith("_timestamp"):
+                    continue
+                if key in automation_columns:
+                    continue
+                replay_sensor_keys.add(key)
+
+        def _resolve_sensor_color_and_name(sensor_key):
+            """
+            Try to resolve the configured color and display name for a replay sensor column
+            using the current sensor list (matches the sensor management table).
+            Handles prefixed keys like 'audio_Mic1', 'arduino_Temp', 'labjack_AIN0'.
+            """
+            color_str = None
+            legend_name = sensor_key
+            matched_sensor_obj = None
+
+            if not hasattr(self.main_window, "sensor_controller"):
+                return color_str, legend_name, matched_sensor_obj
+
+            sc = self.main_window.sensor_controller
+            sensors = getattr(sc, "sensors", [])
+
+            prefix_map = {
+                "arduino_": "Arduino",
+                "labjack_": "LabJack",
+                "other_serial_": "OtherSerial",
+                "audio_": "AudioSensor",
+                "optical_": "OpticalSensor",
+            }
+
+            matched_iface = None
+            base_key = sensor_key
+            for prefix, iface in prefix_map.items():
+                if sensor_key.startswith(prefix):
+                    matched_iface = iface
+                    base_key = sensor_key[len(prefix) :]
+                    break
+
+            # Helper to test a sensor against the base key and iface
+            def matches_sensor(sensor, base_key, iface_hint):
+                iface = getattr(sensor, "interface_type", "")
+                if iface_hint and iface != iface_hint:
+                    return False
+
+                name = getattr(sensor, "name", None)
+                port = getattr(sensor, "port", None)
+
+                if iface == "LabJack":
+                    return port == base_key
+
+                # Allow derived audio fields like "<name>_rms" to match base sensor name
+                if iface == "AudioSensor":
+                    return name == base_key or (name and base_key.startswith(name))
+
+                # Other interfaces match directly on name (case-insensitive for robustness)
+                if name and base_key:
+                    return name.lower() == base_key.lower()
+                return name == base_key
+
+            for sensor in sensors:
+                if matches_sensor(sensor, base_key, matched_iface):
+                    color_str = getattr(sensor, "color", None)
+                    legend_name = getattr(sensor, "name", legend_name)
+                    matched_sensor_obj = sensor
+                    break
+
+            # If no prefix matched and still not found, try direct name/port fallback
+            if color_str is None:
+                for sensor in sensors:
+                    iface = getattr(sensor, "interface_type", "")
+                    name = getattr(sensor, "name", None)
+                    port = getattr(sensor, "port", None)
+                    if sensor_key == name or sensor_key == port:
+                        color_str = getattr(sensor, "color", None)
+                        legend_name = name or legend_name
+                        matched_sensor_obj = sensor
+                        break
+
+            return color_str, legend_name, matched_sensor_obj
+
+        # Remove plots that are not part of the replay dataset to avoid mixing live sensors
+        keys_to_remove = [k for k in list(self.dashboard_plot_data.keys()) if k not in replay_sensor_keys]
+        for key in keys_to_remove:
+            plot_info = self.dashboard_plot_data.pop(key, None)
+            if plot_info and plot_info.get("plot_item"):
+                try:
+                    self.dashboard_graph_widget.removeItem(plot_info["plot_item"])
+                except Exception:
+                    pass
+
+        # Reset buffers for remaining plots
+        for plot_info in self.dashboard_plot_data.values():
+            plot_info["x"] = []
+            plot_info["y"] = []
+            if plot_info.get("plot_item"):
+                plot_info["plot_item"].setData([], [])
+
+        min_x = None
+        max_x = None
+        # Clear previously stored automation markers so we only show the current run
+        self.event_markers = []
+
+        color_index = 0
+        for row in rows:
+            rel_time = float(row.get("_rel_time", 0.0) or 0.0)
+            min_x = rel_time if min_x is None else min(min_x, rel_time)
+            max_x = rel_time if max_x is None else max(max_x, rel_time)
+
+            for key, val in row.items():
+                if key in ("timestamp", "_timestamp", "_rel_time"):
+                    continue
+                # Filter out all timestamp columns (arduino_timestamp, labjack_timestamp, etc.)
+                if key.endswith("_timestamp"):
+                    continue
+                if key in automation_columns:
+                    # automation markers handled separately after loop
+                    continue
+                # If the key is missing (sensor disabled today), create a temporary plot
+                if key not in self.dashboard_plot_data:
+                    try:
+                        # Try to match the configured color/name from the sensor table; fallback to auto colors
+                        color_str, legend_name, sensor_obj = _resolve_sensor_color_and_name(key)
+                        if color_str:
+                            color = QColor(color_str)
+                        else:
+                            color = pg.intColor(color_index)
+                            color_index += 1
+                        pen = pg.mkPen(color=color, width=2)
+                        # Create plot with performance optimizations
+                        plot_item = self.dashboard_graph_widget.plot(
+                            [], [], 
+                            pen=pen, 
+                            name=legend_name,
+                            connect='finite'
+                        )
+                        self.dashboard_plot_data[key] = {
+                            "x": [],
+                            "y": [],
+                            "plot_item": plot_item,
+                            "name": legend_name,
+                            "color": color.name() if hasattr(color, "name") else (color_str or "#FFFFFF"),
+                            "sensor_obj": sensor_obj
+                        }
+                    except Exception:
+                        continue
+                # Skip empty values
+                if val is None or val == "":
+                    continue
+                try:
+                    val_f = float(val)
+                except (TypeError, ValueError):
+                    continue
+                plot_info = self.dashboard_plot_data[key]
+                plot_info["x"].append(rel_time)
+                plot_info["y"].append(val_f)
+
+            # Capture automation markers for this row
+            if any(row.get(col) for col in automation_columns):
+                event = {
+                    "timestamp": row.get("_timestamp", time.time()),
+                    "type": "replay_event",
+                    "sequence_name": row.get("automation_sequence", ""),
+                    "trigger_description": row.get("automation_trigger", ""),
+                    "action_description": row.get("automation_action", ""),
+                    "image_path": row.get("automation_image", ""),
+                }
+                try:
+                    self.add_event_marker(event)
+                except Exception:
+                    pass
+
+        # Push full datasets to plot items and cache as numpy for fast slicing
+        for plot_info in self.dashboard_plot_data.values():
+            if plot_info.get("plot_item"):
+                # Cache as numpy arrays for efficient searchsorted and slicing during replay
+                plot_info["x"] = np.array(plot_info["x"], dtype=float)
+                plot_info["y"] = np.array(plot_info["y"], dtype=float)
+                plot_item = plot_info["plot_item"]
+                plot_item.setData(plot_info["x"], plot_info["y"])
+                
+                # Pre-setup legend entries for replay to avoid dynamic addition lag
+                try:
+                    legend = self.dashboard_graph_widget.getPlotItem().legend
+                    if legend:
+                        # Clean up any existing entry for this item
+                        legend.removeItem(plot_item)
+                        # Add with base name; value will be updated during replay scrubbing
+                        legend.addItem(plot_item, plot_info['name'])
+                except Exception:
+                    pass
+
+        if min_x is None or max_x is None:
+            self._warn("Graph: Replay data bounds could not be determined")
+            return
+
+        self.replay_data_bounds = (min_x, max_x)
+        # Add vertical playhead line
+        try:
+            pen = pg.mkPen(color="#ffaa00", width=2, style=Qt.PenStyle.DashLine)
+            self.replay_playhead_line = pg.InfiniteLine(pos=min_x, angle=90, pen=pen, movable=False)
+            self.dashboard_graph_widget.addItem(self.replay_playhead_line)
+        except Exception as e:
+            self._warn(f"Graph: Failed to add replay playhead line: {e}")
+
+        # Fit view to full dataset initially
+        try:
+            self.dashboard_graph_widget.setXRange(min_x, max_x, padding=0.05)
+            vb = self.dashboard_graph_widget.getViewBox()
+            if vb:
+                vb.enableAutoRange(axis="y", enable=True)
+        except Exception:
+            pass
+
+        # Set dashboard_start_time from the first row's timestamp if available
+        # This ensures event markers can be properly positioned
+        if rows and not self.dashboard_start_time:
+            first_timestamp = rows[0].get("_timestamp") or rows[0].get("timestamp")
+            if first_timestamp:
+                try:
+                    self.dashboard_start_time = float(first_timestamp)
+                except (TypeError, ValueError):
+                    pass
+
+        # Add all event markers to the graph now that we have the start time
+        if self.dashboard_graph_widget and self.show_automation_markers and self.event_markers:
+            try:
+                actual_start_time = self._resolve_start_time(self.dashboard_start_time, allow_now=True)
+                self._add_event_markers_to_graph(self.dashboard_graph_widget, actual_start_time)
+            except Exception as e:
+                self._warn(f"Graph: Failed to add event markers after loading replay: {e}")
+
+        self.replay_dataset_loaded = True
+
+    def update_replay_position(self, rel_time):
+        """Move the playhead and adjust view based on the replay time."""
+        if not self.replay_dataset_loaded or not self.dashboard_graph_widget:
+            return
+
+        rel_time = float(rel_time)
+        min_x, max_x = self.replay_data_bounds
+        if self.replay_playhead_line:
+            try:
+                self.replay_playhead_line.setPos(rel_time)
+            except Exception:
+                pass
+
+        # Determine zoom window from dashboard timespan selection
+        window_seconds = None
+        if hasattr(self.main_window, "dashboard_timespan"):
+            window_seconds = self._parse_timespan_string(self.main_window.dashboard_timespan.currentText())
+        elif hasattr(self.main_window, "dashboard_timespan_combo"):
+            window_seconds = self._parse_timespan_string(self.main_window.dashboard_timespan_combo.currentText())
+
+        try:
+            if window_seconds is None:
+                self.dashboard_graph_widget.setXRange(min_x, max_x, padding=0.05)
+            else:
+                # Center the view on the current position
+                # Per user request: timespan amount into past AND into future
+                start = max(min_x, rel_time - window_seconds)
+                end = min(max_x, rel_time + window_seconds)
+                
+                # Ensure we have a minimum width to avoid crashes
+                if end - start < 0.1:
+                    end = start + 0.1
+                
+                self.dashboard_graph_widget.setXRange(start, end, padding=0)
+            vb = self.dashboard_graph_widget.getViewBox()
+            if vb:
+                vb.enableAutoRange(axis="y", enable=True)
+                
+            # Update the legend values for the current replay position
+            self._update_all_plot_visuals(force=True, elapsed_time_override=rel_time)
+        except Exception as e:
+            self._warn(f"Graph: Failed to adjust replay view: {e}")
         
     def plot_new_data(self, data):
         """Plot new incoming data point(s)."""
-        if not self.live_plotting_active or self.dashboard_start_time is None:
+        # In review mode, ignore live incoming data; only accept replay-tagged payloads
+        if hasattr(self.main_window, "replay_mode_enabled") and self.main_window.replay_mode_enabled:
+            if data.get("_source") != "replay":
+                return
+
+        if not self.live_plotting_active:
             return
             
         try:
@@ -294,12 +1087,19 @@ class GraphController:
             # (Keep the previous code here for finding data source, checking plot keys, getting timestamp)
             
             # --- Check for empty plots and reinitialize if needed ---
-            plot_keys = list(self.dashboard_plot_data.keys())
-            if len(plot_keys) == 0:
+            # Added a flag to prevent repeated reinitialization in the same call
+            if not self.dashboard_plot_data:
+                # If we've already tried to initialize in this call, don't do it again
+                if getattr(self, '_is_initializing', False):
+                    return
+                    
                 print("DEBUG GRAPH: No plots are set up. Attempting to reinitialize.")
-                self.main_window.logger.log("No plots set up, reinitializing graph.", "WARNING")
                 if hasattr(self.main_window, 'data_collection_controller') and hasattr(self.main_window.data_collection_controller, 'start_time'):
-                    self.start_live_dashboard_update(self.main_window.data_collection_controller.start_time)
+                    self._is_initializing = True
+                    try:
+                        self.start_live_dashboard_update(self.main_window.data_collection_controller.start_time)
+                    finally:
+                        self._is_initializing = False
                 return # Exit after reinit attempt
             # -----------------------------------------------------------
 
@@ -314,13 +1114,17 @@ class GraphController:
                 timestamp = time.time()
                 
             if self.dashboard_start_time is None:
-                print(f"DEBUG GRAPH: dashboard_start_time was None. Setting it now to {timestamp}")
+                self._debug(f"Graph: dashboard_start_time was None. Setting it now to {timestamp}")
                 self.dashboard_start_time = float(timestamp)
+                # Now that we have a start_time, add any pending event markers
+                if hasattr(self, 'event_markers') and self.event_markers and self.dashboard_graph_widget:
+                    self._debug(f"Graph: Adding {len(self.event_markers)} pending event markers now that start_time is set")
+                    self._add_event_markers_to_graph(self.dashboard_graph_widget, self.dashboard_start_time)
             elif not isinstance(self.dashboard_start_time, (float, int)):
                 try:
                     self.dashboard_start_time = float(self.dashboard_start_time)
                 except (ValueError, TypeError):
-                    print(f"DEBUG GRAPH: dashboard_start_time invalid: {self.dashboard_start_time}. Resetting.")
+                    self._debug(f"Graph: dashboard_start_time invalid: {self.dashboard_start_time}. Resetting.")
                     self.dashboard_start_time = float(timestamp)
             
             # Ensure timestamp is float for arithmetic
@@ -329,11 +1133,25 @@ class GraphController:
             except (ValueError, TypeError):
                 timestamp = time.time()
             
-            elapsed_time = timestamp - self.dashboard_start_time
+            # --- Robust Start Time Management ---
+            if self.dashboard_start_time is None:
+                # If start time is missing, try to get it from controller
+                if hasattr(self.main_window, 'data_collection_controller') and self.main_window.data_collection_controller.start_time:
+                    self.dashboard_start_time = float(self.main_window.data_collection_controller.start_time)
+                else:
+                    self.dashboard_start_time = timestamp
+            
+            elapsed_time = timestamp - float(self.dashboard_start_time)
             if elapsed_time < 0:
-                 print(f"WARNING GRAPH: Negative elapsed time detected ({elapsed_time:.2f}s). Using 0.")
-                 elapsed_time = 0.0
-            # --------------------------
+                 # If negative, maybe start_time was reset or wall time jumped
+                 # Only reset if it's significantly negative to avoid jitter issues
+                 if elapsed_time < -1.0:
+                     print(f"WARNING GRAPH: Large negative elapsed time detected ({elapsed_time:.2f}s). Resetting start_time.")
+                     self.dashboard_start_time = timestamp
+                     elapsed_time = 0.0
+                 else:
+                     elapsed_time = 0.0
+            # -----------------------------------
 
             # Process data points and add to internal buffers
             keys_to_process = [k for k in data.keys() if k != 'timestamp']
@@ -355,8 +1173,21 @@ class GraphController:
             
             # --- Throttle visual updates --- 
             current_time = time.time()
-            if data_added and (current_time - self.last_plot_update_time > self.plot_update_interval):
-                # print(f"DEBUG GRAPH: Performing visual update. Time since last: {current_time - self.last_plot_update_time:.2f}s") # Optional debug
+            # During replay, allow faster updates if force is requested in data
+            is_replay = hasattr(self.main_window, "replay_mode_enabled") and self.main_window.replay_mode_enabled
+            update_threshold = self.plot_update_interval
+            
+            # Check if this is high-speed LabJack data (has labjack_ prefix and multiple data points)
+            # Allow faster updates for LabJack to support high-speed data acquisition
+            has_labjack_data = any(k.startswith('labjack_') for k in data.keys() if k != 'timestamp')
+            if has_labjack_data and len([k for k in data.keys() if k != 'timestamp']) > 0:
+                # Allow up to 100 Hz updates for LabJack data (10ms minimum interval)
+                update_threshold = 0.01  # 10ms = 100 Hz max visual update rate
+            
+            if is_replay and data.get("_force_update", False):
+                update_threshold = 0.05 # Allow 20Hz updates during replay scrub
+
+            if data_added and (current_time - self.last_plot_update_time > update_threshold):
                 self._update_all_plot_visuals()
                 self.last_plot_update_time = current_time
             # ------------------------------- 
@@ -382,7 +1213,7 @@ class GraphController:
         if sensor_id in self.dashboard_plot_data:
             plot_info = self.dashboard_plot_data[sensor_id]
             matched_key = sensor_id
-            print(f"DEBUG GRAPH: Direct match found for sensor_id='{sensor_id}'")
+            self._debug(f"Graph: Direct match found for sensor_id='{sensor_id}'")
         # Try for OtherSerial sensors which may have prefixes
         elif sensor_id.startswith("other_serial_"):
             # Extract the actual sensor name from the prefixed key
@@ -390,19 +1221,21 @@ class GraphController:
             if unprefixed_key in self.dashboard_plot_data:
                 plot_info = self.dashboard_plot_data[unprefixed_key]
                 matched_key = unprefixed_key
-                print(f"DEBUG GRAPH: OtherSerial match found: prefixed_key='{sensor_id}', unprefixed='{unprefixed_key}'")
-        # Check for other prefixed keys like arduino_ or labjack_
-        elif any(sensor_id.startswith(prefix) for prefix in ["arduino_", "labjack_"]):
+                self._debug(f"Graph: OtherSerial match found: prefixed_key='{sensor_id}', unprefixed='{unprefixed_key}'")
+        # Check for other prefixed keys like arduino_, labjack_, or audio_
+        elif any(sensor_id.startswith(prefix) for prefix in ["arduino_", "labjack_", "audio_"]):
             # Extract the actual sensor name from the prefixed key
             if sensor_id.startswith("arduino_"):
                 unprefixed_key = sensor_id[len("arduino_"):]
             elif sensor_id.startswith("labjack_"):
                 unprefixed_key = sensor_id[len("labjack_"):]
+            elif sensor_id.startswith("audio_"):
+                unprefixed_key = sensor_id[len("audio_"):]
             
             if unprefixed_key in self.dashboard_plot_data:
                 plot_info = self.dashboard_plot_data[unprefixed_key]
                 matched_key = unprefixed_key
-                print(f"DEBUG GRAPH: Prefix match found: prefixed_key='{sensor_id}', unprefixed='{unprefixed_key}'")
+                self._debug(f"Graph: Prefix match found: prefixed_key='{sensor_id}', unprefixed='{unprefixed_key}'")
             
         if plot_info:
             plot_info['x'].append(elapsed_time)
@@ -410,78 +1243,216 @@ class GraphController:
             return True
             
         if "other_serial" in sensor_id:
-            print(f"DEBUG GRAPH: *** No plot found *** for OtherSerial sensor: {sensor_id}")
-            # Print dashboard plot keys for debugging
-            print(f"DEBUG GRAPH: Available plot keys: {list(self.dashboard_plot_data.keys())}")
+            self._debug(f"Graph: No plot found for OtherSerial sensor: {sensor_id}")
+            self._debug(f"Graph: Available plot keys: {list(self.dashboard_plot_data.keys())}")
         return False
 
-    def _update_all_plot_visuals(self):
+    def _update_all_plot_visuals(self, force=False, elapsed_time_override=None):
         """Updates the setData for all plots based on current buffers and selected timespan, and updates legend with current sensor values."""
-        # Only update visuals if data collection is active
-        if not hasattr(self.main_window, 'data_collection_controller') or not self.main_window.data_collection_controller.collecting_data:
-            print("DEBUG: Skipping graph visual update as data collection is not active")
-            return
+        # Only skip when neither live collection nor replay is active, unless forced
+        collecting = hasattr(self.main_window, 'data_collection_controller') and self.main_window.data_collection_controller.collecting_data
+        in_replay = hasattr(self.main_window, 'replay_mode_enabled') and self.main_window.replay_mode_enabled
         
+        # Determine the current time position
+        now = time.time()
+        current_elapsed_time = 0
+        
+        if elapsed_time_override is not None:
+            current_elapsed_time = elapsed_time_override
+        elif in_replay:
+            # For replay mode, use the current playhead position if available
+            if self.replay_playhead_line:
+                current_elapsed_time = self.replay_playhead_line.value()
+            else:
+                # Fallback to the maximum time in the dataset if playhead isn't ready
+                all_x_for_span = [t for plot_info in self.dashboard_plot_data.values() for t in plot_info.get('x', [])]
+                current_elapsed_time = max(all_x_for_span) if all_x_for_span else 0
+        elif not collecting and not force:
+            self._debug("Skipping graph visual update as data collection is not active")
+            return
+        elif not collecting:
+            # If not collecting but forced, use the latest data point
+            all_x_for_span = [t for plot_info in self.dashboard_plot_data.values() for t in plot_info.get('x', [])]
+            current_elapsed_time = max(all_x_for_span) if all_x_for_span else 0
+        else:
+            # For live plotting, we use the wall clock to keep the sliding window moving smoothly
+            current_elapsed_time = now - self.dashboard_start_time if self.dashboard_start_time else 0
+
         if not hasattr(self.main_window, 'dashboard_timespan'):
-            print("WARNING GRAPH: dashboard_timespan widget not found. Cannot apply timespan filter.")
+            self._warn("Graph: dashboard_timespan widget not found. Cannot apply timespan filter.")
             return
             
         selected_timespan_str = self.main_window.dashboard_timespan.currentText()
         timespan_seconds = self._parse_timespan_string(selected_timespan_str)
         
-        now = time.time()
-        current_elapsed_time = now - self.dashboard_start_time if self.dashboard_start_time else 0
-
-        min_time = -np.inf # Default to show all if timespan is invalid or "All"
+        # Determine the X range for the view
         if timespan_seconds is not None:
-            max_time = current_elapsed_time
-            all_x = [t for plot_info in self.dashboard_plot_data.values() for t in plot_info.get('x', [])]
-            if all_x:
-                max_time = max(max(all_x), current_elapsed_time)
-            min_time = max_time - timespan_seconds
+            if in_replay:
+                # Replay mode: Centered window (past and future)
+                min_time = current_elapsed_time - timespan_seconds
+                max_time = current_elapsed_time + timespan_seconds
+            else:
+                # Live mode: Trailing window
+                min_time = current_elapsed_time - timespan_seconds
+                max_time = current_elapsed_time
+            
+            # Apply the range to the graph
+            if self.dashboard_graph_widget:
+                # Only apply if not in "All" mode (which is handled by auto-range)
+                self.dashboard_graph_widget.setXRange(min_time, max_time, padding=0)
+        else:
+            # "All" selected or invalid timespan - show all data
+            if self.dashboard_graph_widget:
+                # If we have an override (replay playhead scrubbing), we might want to keep the current range
+                # but for "All" it's usually best to auto-range
+                if elapsed_time_override is None:
+                    self.dashboard_graph_widget.enableAutoRange(axis='x', enable=True)
+                    self.dashboard_graph_widget.enableAutoRange(axis='y', enable=True)
+
+        # min_time_val is used for data slicing below
+        min_time_val = -np.inf
+        if timespan_seconds is not None:
+             min_time_val = current_elapsed_time - timespan_seconds
 
         # --- Update plot data and legend names with current values ---
         for sensor_id, plot_info in self.dashboard_plot_data.items():
-            if plot_info.get('plot_item') and plot_info.get('x') and plot_info.get('y'):
-                try:
-                    x_data = np.array(plot_info['x'])
-                    y_data = np.array(plot_info['y'])
-                    indices = np.where(x_data >= min_time)[0]
-                    if len(indices) > 0:
-                        filtered_x = x_data[indices]
-                        filtered_y = y_data[indices]
-                        plot_info['plot_item'].setData(filtered_x, filtered_y)
+            if not plot_info.get('plot_item'):
+                continue
+                
+            x_data = plot_info.get('x', [])
+            y_data = plot_info.get('y', [])
+            
+            if len(x_data) == 0:
+                continue
+
+            try:
+                # 1. Update Plot Data (Slicing/Filtering)
+                if timespan_seconds is not None:
+                    # Efficiently find the start index for the visible timespan
+                    if isinstance(x_data, np.ndarray):
+                        start_idx = np.searchsorted(x_data, min_time_val)
+                    else:
+                        start_idx = bisect.bisect_left(x_data, min_time_val)
+                    
+                    if start_idx < len(x_data):
+                        # Use slicing (O(1) for numpy, O(k) for list)
+                        # Load data for the entire visible range
+                        # In replay, we need past and future data
+                        # In live mode, max_time_val is essentially "now"
+                        max_time_val = current_elapsed_time + (timespan_seconds if in_replay else 0)
+                        
+                        if isinstance(x_data, np.ndarray):
+                            end_idx = np.searchsorted(x_data, max_time_val)
+                        else:
+                            end_idx = bisect.bisect_right(x_data, max_time_val)
+                        
+                        plot_info['plot_item'].setData(x_data[start_idx:end_idx], y_data[start_idx:end_idx])
                     else:
                         plot_info['plot_item'].setData([], [])
-                except Exception as e:
-                    print(f"ERROR GRAPH: Failed to filter/update plot for {sensor_id}: {e}")
-                    plot_info['plot_item'].setData(plot_info['x'], plot_info['y'])
+                else:
+                    # "All" selected - show full buffer
+                    plot_info['plot_item'].setData(x_data, y_data)
+            except Exception as e:
+                self._debug(f"Graph: Error updating data for {sensor_id}: {e}")
 
-            # --- Update legend name with current value ---
-            # Find the sensor object by name (for Arduino/OtherSerial) or port (for LabJack)
-            sensor_obj = None
-            if hasattr(self.main_window, 'sensor_controller'):
-                for sensor in self.main_window.sensor_controller.sensors:
-                    if (getattr(sensor, 'name', None) == plot_info['name']) or (getattr(sensor, 'port', None) == sensor_id):
-                        sensor_obj = sensor
-                        break
+            # 2. Update Legend (Current Value)
             value_str = "N/A"
-            if sensor_obj is not None:
-                val = getattr(sensor_obj, 'current_value', None)
-                if val is not None:
-                    try:
-                        value_str = f"{val:.2f}"
-                    except Exception:
-                        value_str = str(val)
-                unit = getattr(sensor_obj, 'unit', None)
-                if unit:
-                    value_str = f"{value_str} {unit}"
+            try:
+                # Find value at current playhead/time
+                if in_replay or elapsed_time_override is not None:
+                    # For replay, we always use the indexed value from the data buffer
+                    if isinstance(x_data, np.ndarray):
+                        idx = np.searchsorted(x_data, current_elapsed_time)
+                    else:
+                        idx = bisect.bisect_left(x_data, current_elapsed_time)
+                        
+                    if idx >= len(y_data):
+                        idx = len(y_data) - 1
+                    
+                    if idx >= 0:
+                        val = y_data[idx]
+                        value_str = f"{val:.2f}" if val is not None else "N/A"
+                else:
+                    # For live mode, use the latest value from the sensor object
+                    sensor_obj = plot_info.get('sensor_obj')
+                    if sensor_obj:
+                        val = getattr(sensor_obj, 'current_value', None)
+                        value_str = f"{val:.2f}" if val is not None else "N/A"
+            except Exception:
+                pass
+
+            unit = None
+            if plot_info.get('sensor_obj'):
+                unit = getattr(plot_info.get('sensor_obj'), 'unit', None)
+            
+            if unit:
+                value_str = f"{value_str} {unit}"
+            
             legend_name = f"{plot_info['name']} ({value_str})"
-            # Update the legend entry (PyQtGraph does not support direct legend label update, so we update the plot item's name)
-            plot_info['plot_item'].opts['name'] = legend_name
-            # If legend is visible, force update
-            if hasattr(self.dashboard_graph_widget, 'legend') and self.dashboard_graph_widget.legend is not None:
-                self.dashboard_graph_widget.legend.updateItem(plot_info['plot_item'])
+            
+            # 3. Fast Legend Label Update
+            try:
+                plot_item_parent = self.dashboard_graph_widget.getPlotItem()
+                legend = getattr(plot_item_parent, 'legend', None)
+                if not legend:
+                    legend = getattr(self.dashboard_graph_widget, 'legend', None)
+                
+                if legend:
+                    # Check if we have a cached label for this sensor
+                    label = self._dashboard_legend_labels.get(sensor_id)
+                    if label:
+                        try:
+                            label.setText(legend_name)
+                        except Exception:
+                            # If label is orphaned, remove from cache to trigger re-add
+                            if sensor_id in self._dashboard_legend_labels:
+                                del self._dashboard_legend_labels[sensor_id]
+                            label = None
+                    
+                    if not label:
+                        # Robust iteration for different pyqtgraph versions
+                        try:
+                            # LegendItem.items is a list of tuples (ItemSample, LabelItem) or ItemRecord
+                            for item in list(legend.items):
+                                try:
+                                    # Handle both ItemRecord (newer) and tuple (older)
+                                    if hasattr(item, 'sample') and hasattr(item, 'label'):
+                                        sample = item.sample
+                                        lbl = item.label
+                                    elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                                        sample = item[0]
+                                        lbl = item[1]
+                                    else:
+                                        continue
+
+                                    actual_item = getattr(sample, 'item', sample)
+                                    if actual_item is plot_info['plot_item']:
+                                        lbl.setText(legend_name)
+                                        self._dashboard_legend_labels[sensor_id] = lbl
+                                        label = lbl
+                                        break
+                                except Exception:
+                                    continue
+                        except Exception:
+                            pass
+                        
+                        if not label:
+                            # Not in legend yet, add it
+                            legend.addItem(plot_info['plot_item'], legend_name)
+                            # Re-scan to catch the label reference
+                            for sample, lbl in legend.items:
+                                actual_item = getattr(sample, 'item', sample)
+                                if actual_item is plot_info['plot_item']:
+                                    self._dashboard_legend_labels[sensor_id] = lbl
+                                    break
+                    
+                    # Ensure legend appearance
+                    legend.setBrush(pg.mkBrush(20, 20, 30, 180))
+                    legend.setPen(pg.mkPen(150, 150, 150, 150))
+                    legend.setZValue(1000)
+                    legend.setVisible(True)
+            except Exception as e:
+                pass
 
     def _parse_timespan_string(self, timespan_str):
         """Parse timespan string (e.g., '10s', '5min', '1h', 'All') into seconds."""
@@ -546,6 +1517,25 @@ class GraphController:
 
         # Clear the graph and add legend
         graph_widget.clear()
+        
+        # Configure global downsampling on the PlotItem for better performance
+        try:
+            # Check for setting
+            downsampling_enabled = True
+            if hasattr(self.main_window, 'graph_downsampling_checkbox'):
+                downsampling_enabled = self.main_window.graph_downsampling_checkbox.isChecked()
+            elif self.settings_model:
+                downsampling_enabled = self.settings_model.get_bool("graph_downsampling", True)
+
+            plot_item = graph_widget.getPlotItem()
+            if downsampling_enabled:
+                plot_item.setDownsampling(ds=True, auto=True, mode='peak')
+            else:
+                plot_item.setDownsampling(ds=False)
+            plot_item.setClipToView(True)
+        except Exception as e:
+            self._debug(f"Graph: Could not set global downsampling: {e}")
+
         if hasattr(graph_widget, 'legend') and graph_widget.legend is not None:
             try:
                 graph_widget.legend.scene().removeItem(graph_widget.legend)
@@ -555,6 +1545,9 @@ class GraphController:
         graph_widget.showGrid(x=True, y=True, alpha=0.3)
         graph_widget.setLabel('bottom', 'Elapsed Time (s)')
         graph_widget.setLabel('left', 'Value') # Default Y label
+        
+        # Note: Event markers will be added after we fetch the data, so we can calculate
+        # the correct start_time from the actual data being plotted
 
         # --- Ensure Y Axis is visible by default before specific types hide it ---
         graph_widget.getAxis('left').setWidth() # Reset width to default
@@ -600,21 +1593,33 @@ class GraphController:
             return
         
         # Debug logging for required sensor keys
-        print(f"DEBUG GRAPH: Required sensor keys for graph: {required_sensor_keys}")
+        self._debug(f"Graph: Required sensor keys for graph: {required_sensor_keys}")
         
         # Separate control sensor keys (ending with _ctrl) from regular keys
         control_sensor_keys = [k for k in required_sensor_keys if k.endswith('_ctrl')]
         regular_sensor_keys = [k for k in required_sensor_keys if not k.endswith('_ctrl')]
         
         if control_sensor_keys:
-            print(f"DEBUG GRAPH: Control sensor keys: {control_sensor_keys}")
+            self._debug(f"Graph: Control sensor keys: {control_sensor_keys}")
         if regular_sensor_keys:
-            print(f"DEBUG GRAPH: Regular sensor keys: {regular_sensor_keys}")
+            self._debug(f"Graph: Regular sensor keys: {regular_sensor_keys}")
         
         # Check for any OtherSerial sensors in the required keys
         other_serial_keys = [k for k in regular_sensor_keys if 'other_serial' in k]
         if other_serial_keys:
-            print(f"DEBUG GRAPH: OtherSerial sensors in regular keys: {other_serial_keys}")
+            self._debug(f"Graph: OtherSerial sensors in regular keys: {other_serial_keys}")
+        
+        # Determine the start_time to use for relative time calculation
+        # Use dashboard_start_time if available. 
+        # Only fall back to data collection controller's start_time if we're actively collecting data.
+        # Otherwise, pass None so get_historical_data can derive it from the data itself.
+        graph_start_time = None
+        if self.dashboard_start_time is not None:
+            graph_start_time = self.dashboard_start_time
+        elif hasattr(self.main_window, 'data_collection_controller'):
+            dc = self.main_window.data_collection_controller
+            if getattr(dc, 'collecting_data', False):
+                graph_start_time = getattr(dc, 'start_time', None)
         
         # Fetch data (assuming a method in DataCollectionController)
         try:
@@ -623,17 +1628,16 @@ class GraphController:
             if regular_sensor_keys:
                 data_to_plot = self.main_window.data_collection_controller.get_historical_data(
                     sensor_ids=regular_sensor_keys,
-                    timespan_seconds=timespan_seconds
+                    timespan_seconds=timespan_seconds,
+                    start_time=graph_start_time
                 )
-                print(f"DEBUG GRAPH: Fetched {len(data_to_plot)} regular sensors")
+                self._debug(f"Graph: Fetched {len(data_to_plot)} regular sensors with start_time={graph_start_time}")
             
             # Handle control sensors
             if control_sensor_keys:
                 if control_run_data is None:
                     # Control sensors selected but no control run data available
-                    if hasattr(self.main_window, 'logger'):
-                        self.main_window.logger.warning(f"Control sensors selected but no control run configured or loaded")
-                    print(f"WARNING GRAPH: Control sensors selected ({control_sensor_keys}) but no control run data available")
+                    self._warn(f"Control sensors selected ({control_sensor_keys}) but no control run configured or loaded")
                 else:
                     # Add control run data for control sensors
                     if hasattr(self.main_window, 'logger'):
@@ -670,9 +1674,9 @@ class GraphController:
             # Debug any OtherSerial data retrieved
             for key, data in data_to_plot.items():
                 if 'other_serial' in key:
-                    print(f"DEBUG GRAPH: Found OtherSerial data for key '{key}': {len(data['time'])} points")
+                    self._debug(f"Graph: Found OtherSerial data for key '{key}': {len(data['time'])} points")
                     if len(data['time']) > 0:
-                        print(f"DEBUG GRAPH: First few values: {data['value'][:5]}")
+                        self._debug(f"Graph: First few values: {data['value'][:5]}")
                         
         except AttributeError:
             self.main_window.logger.error("'get_historical_data' method not found in DataCollectionController.")
@@ -685,7 +1689,7 @@ class GraphController:
 
         if not data_to_plot:
             graph_widget.setTitle(f"No data available for selected sensors/timespan")
-            self.main_window.logger.warning(f"No historical data returned for keys: {required_sensor_keys}, timespan: {timespan}")
+            self.main_window.logger.debug(f"No historical data returned for keys: {required_sensor_keys}, timespan: {timespan}")
             return
 
         # Apply current formatting settings before plotting
@@ -693,6 +1697,13 @@ class GraphController:
 
         # --- Plotting Logic ---
         try:
+            # Determine current elapsed time for gap injection at the "now" point
+            now = time.time()
+            collecting = hasattr(self.main_window, 'data_collection_controller') and self.main_window.data_collection_controller.collecting_data
+            # Also allow gaps if live plotting is active (monitoring)
+            is_monitoring = getattr(self, 'live_plotting_active', False)
+            current_elapsed_time = now - self.dashboard_start_time if ((collecting or is_monitoring) and self.dashboard_start_time) else 0
+            
             if graph_type == "Standard Time Series":
                 graph_widget.setTitle(f"Time Series - Timespan: {timespan}")
                 graph_widget.setLabel('left', 'Sensor Value')
@@ -705,6 +1716,29 @@ class GraphController:
                         data = data_to_plot[sensor_key]
                         times = np.array(data['time'], dtype=float)
                         values = np.array(data['value'], dtype=float)
+
+                        # Inject a NaN point at "now" when the sensor is stale, so gaps appear immediately (like dashboard)
+                        try:
+                            dc = getattr(self.main_window, 'data_collection_controller', None)
+                            if dc:
+                                # Prefixed keys are used in historical buffer (e.g., arduino_temp)
+                                pref_key = sensor_key
+                                # Determine per-sensor timeout if available, else fall back
+                                stale_timeout = None
+                                if hasattr(dc, '_get_stale_timeout_for_key'):
+                                    stale_timeout = dc._get_stale_timeout_for_key(pref_key)
+                                if stale_timeout is None:
+                                    stale_timeout = getattr(dc, 'stale_timeout_seconds', None)
+
+                                if stale_timeout and stale_timeout > 0 and times.size > 0:
+                                    last_rel = float(times[-1])
+                                    # current elapsed time matches dashboard clock
+                                    current_rel = current_elapsed_time
+                                    if (current_rel - last_rel) > stale_timeout:
+                                        times = np.append(times, current_rel)
+                                        values = np.append(values, np.nan)
+                        except Exception:
+                            pass
                         
                         # Get sensor display name
                         sensor_name = self._get_sensor_display_name(sensor_key)
@@ -754,7 +1788,14 @@ class GraphController:
                                 value_str = f"{value_str} {unit}"
                         
                         legend_name = f"{sensor_name} ({value_str})"
-                        graph_widget.plot(times, values, pen=pen, name=legend_name)
+                        # connect='finite' prevents lines across NaN/None gaps
+                        # Create plot with performance optimizations
+                        graph_widget.plot(
+                            times, values, 
+                            pen=pen, 
+                            name=legend_name, 
+                            connect='finite'
+                        )
                     else:
                          self.main_window.logger.warning(f"No data found for sensor key '{sensor_key}' in Standard Time Series plot")
 
@@ -785,8 +1826,17 @@ class GraphController:
                     val2_interp = np.interp(time_combined, t2, v2)
                     
                     difference = val1_interp - val2_interp
-                    pen = pg.mkPen(color='c', width=getattr(self.main_window, 'plot_line_width_value', 2))
-                    graph_widget.plot(time_combined, difference, pen=pen, name=f"{primary_sensor_name}-{secondary_sensor_name}") # Use names in legend
+                    
+                    # Get primary sensor color
+                    sensor_obj = self.main_window.sensor_controller.get_sensor_by_historical_key(primary_sensor_key)
+                    color = getattr(sensor_obj, 'color', '#FFFFFF') if sensor_obj else '#FFFFFF'
+                    
+                    pen = pg.mkPen(color=color, width=getattr(self.main_window, 'plot_line_width_value', 2))
+                    graph_widget.plot(
+                        time_combined, difference, 
+                        pen=pen, 
+                        name=f"{primary_sensor_name}-{secondary_sensor_name}"
+                    ) # Use names in legend
                 else:
                     graph_widget.setTitle("Select two valid sensors for difference plot")
 
@@ -801,8 +1851,17 @@ class GraphController:
                     
                     # Calculate gradient (rate of change)
                     rate = np.gradient(values, times)
-                    pen = pg.mkPen(color='m', width=getattr(self.main_window, 'plot_line_width_value', 2))
-                    graph_widget.plot(times, rate, pen=pen, name=f"d({primary_sensor_name})/dt") # Use name in legend
+                    
+                    # Get primary sensor color
+                    sensor_obj = self.main_window.sensor_controller.get_sensor_by_historical_key(primary_sensor_key)
+                    color = getattr(sensor_obj, 'color', '#FFFFFF') if sensor_obj else '#FFFFFF'
+                    
+                    pen = pg.mkPen(color=color, width=getattr(self.main_window, 'plot_line_width_value', 2))
+                    graph_widget.plot(
+                        times, rate, 
+                        pen=pen, 
+                        name=f"d({primary_sensor_name})/dt"
+                    ) # Use name in legend
                 else:
                      graph_widget.setTitle("Select a valid sensor with at least 2 data points for rate plot")
 
@@ -862,15 +1921,36 @@ class GraphController:
 
                     # Plotting
                     line_width = getattr(self.main_window, 'plot_line_width_value', 2)
-                    avg_pen = pg.mkPen(color='y', width=line_width)
-                    std_pen = pg.mkPen(color=(255, 255, 0, 100), width=1, style=pg.QtCore.Qt.PenStyle.DashLine) # Use pg.QtCore.Qt
+                    
+                    # Get primary sensor color
+                    sensor_obj = self.main_window.sensor_controller.get_sensor_by_historical_key(primary_sensor_key)
+                    color = getattr(sensor_obj, 'color', '#FFFFFF') if sensor_obj else '#FFFFFF'
+                    
+                    avg_pen = pg.mkPen(color=color, width=line_width)
+                    
+                    # Create a semi-transparent version for standard deviation
+                    std_color = QColor(color)
+                    std_color.setAlpha(100)
+                    std_pen = pg.mkPen(color=std_color, width=1, style=pg.QtCore.Qt.PenStyle.DashLine)
 
                     # Plot average
-                    graph_widget.plot(time_avg, moving_avg, pen=avg_pen, name=f"Avg({primary_sensor_name}, N={window_size})")
+                    graph_widget.plot(
+                        time_avg, moving_avg, 
+                        pen=avg_pen, 
+                        name=f"Avg({primary_sensor_name}, N={window_size})"
+                    )
 
                     # Plot +/- 1 Standard Deviation Lines
-                    graph_widget.plot(time_avg, moving_avg + moving_std, pen=std_pen, name=f"+1 Std Dev")
-                    graph_widget.plot(time_avg, moving_avg - moving_std, pen=std_pen, name=f"-1 Std Dev")
+                    graph_widget.plot(
+                        time_avg, moving_avg + moving_std, 
+                        pen=std_pen, 
+                        name=f"+1 Std Dev"
+                    )
+                    graph_widget.plot(
+                        time_avg, moving_avg - moving_std, 
+                        pen=std_pen, 
+                        name=f"-1 Std Dev"
+                    )
 
                     # Optional: Fill between standard deviations (can be visually busy)
                     # fill_brush = pg.mkBrush(255, 255, 0, 50) # Semi-transparent yellow
@@ -881,10 +1961,10 @@ class GraphController:
                     graph_widget.setTitle("Select sensor, ensure sufficient data and valid window size (>1) for moving average")
             
             elif graph_type == "Fourier Analysis":
-                graph_widget.setTitle(f"Fourier Analysis ({primary_sensor_name}) - Timespan: {timespan}")
                 graph_widget.setLabel('bottom', 'Frequency (Hz)')
                 graph_widget.setLabel('left', 'Amplitude')
-                legend.setVisible(False) # Legend not very useful for FFT
+                legend.setVisible(False)  # Legend not very useful for FFT
+                
                 if primary_sensor_key and primary_sensor_key in data_to_plot and len(data_to_plot[primary_sensor_key]['time']) > 1:
                     data = data_to_plot[primary_sensor_key]
                     # Ensure data is numerical numpy arrays
@@ -892,9 +1972,9 @@ class GraphController:
                     values = np.array(data['value'], dtype=float)
                     
                     n = len(values)
-                    if n < 2:
-                         graph_widget.setTitle("Not enough data for Fourier Analysis")
-                         return
+                    if n < 8:  # Need at least 8 points for meaningful FFT
+                        graph_widget.setTitle("Not enough data for Fourier Analysis (min. 8 points)")
+                        return
                          
                     # Calculate average sample spacing, check for validity
                     sample_spacing = np.mean(np.diff(times)) 
@@ -902,18 +1982,127 @@ class GraphController:
                         graph_widget.setTitle("Invalid or non-uniform time data for Fourier Analysis")
                         return
                     
-                    yf = fft(values)
-                    xf = fftfreq(n, sample_spacing)[:n//2] # Get positive frequencies
+                    sample_rate = 1.0 / sample_spacing
+                    nyquist_freq = sample_rate / 2.0
+                    
+                    # Apply Hanning window for cleaner spectrum (reduces spectral leakage)
+                    window = np.hanning(n)
+                    # Remove DC offset and apply window
+                    values_windowed = (values - np.mean(values)) * window
+                    
+                    yf = fft(values_windowed)
+                    xf = fftfreq(n, sample_spacing)[:n//2]  # Get positive frequencies
                     
                     amplitude = 2.0/n * np.abs(yf[0:n//2])
                     
-                    graph_widget.plot(xf, amplitude, pen=pg.mkPen(color='g', width=getattr(self.main_window, 'plot_line_width_value', 2)))
+                    # Plot the spectrum
+                    line_width = getattr(self.main_window, 'plot_line_width_value', 2)
+                    
+                    # Get primary sensor color
+                    sensor_obj = self.main_window.sensor_controller.get_sensor_by_historical_key(primary_sensor_key)
+                    color = getattr(sensor_obj, 'color', '#FFFFFF') if sensor_obj else '#FFFFFF'
+                    
+                    graph_widget.plot(
+                        xf, amplitude, 
+                        pen=pg.mkPen(color=color, width=line_width)
+                    )
+                    
+                    # === Peak Detection ===
+                    # Find peaks above noise threshold (5% of max amplitude)
+                    max_amplitude = np.max(amplitude)
+                    noise_threshold = max_amplitude * 0.05
+                    
+                    # Only consider frequencies above 0.5 Hz (ignore near-DC)
+                    valid_indices = np.where((xf > 0.5) & (amplitude > noise_threshold))[0]
+                    
+                    if len(valid_indices) > 0:
+                        # Find local maxima (simple peak detection)
+                        peaks = []
+                        for i in valid_indices:
+                            if i > 0 and i < len(amplitude) - 1:
+                                if amplitude[i] > amplitude[i-1] and amplitude[i] > amplitude[i+1]:
+                                    peaks.append((xf[i], amplitude[i], i))
+                        
+                        # Sort by amplitude (descending) and take top 5
+                        peaks.sort(key=lambda x: x[1], reverse=True)
+                        top_peaks = peaks[:5]
+                        
+                        if len(top_peaks) > 0:
+                            # Fundamental frequency is the strongest peak
+                            fundamental_freq = top_peaks[0][0]
+                            fundamental_amp = top_peaks[0][1]
+                            
+                            # === Mark peaks on the plot ===
+                            colors = ['#FF5722', '#FFC107', '#03A9F4', '#E91E63', '#9C27B0']  # Orange, Yellow, Blue, Pink, Purple
+                            peak_info_parts = []
+                            
+                            for idx, (freq, amp, _) in enumerate(top_peaks):
+                                color = colors[idx % len(colors)]
+                                
+                                # Vertical line at peak frequency
+                                peak_line = pg.InfiniteLine(
+                                    pos=freq, 
+                                    angle=90, 
+                                    pen=pg.mkPen(color=color, width=1, style=Qt.PenStyle.DashLine)
+                                )
+                                graph_widget.addItem(peak_line)
+                                
+                                # Text label for the peak
+                                # Check if this might be a harmonic of fundamental
+                                harmonic_num = None
+                                if idx > 0 and fundamental_freq > 0:
+                                    ratio = freq / fundamental_freq
+                                    # Check if it's close to an integer multiple (within 5%)
+                                    for h in range(2, 11):
+                                        if abs(ratio - h) < 0.05 * h:
+                                            harmonic_num = h
+                                            break
+                                
+                                if harmonic_num:
+                                    label_text = f"{freq:.1f} Hz ({harmonic_num}x)"
+                                else:
+                                    label_text = f"{freq:.1f} Hz"
+                                
+                                text_item = pg.TextItem(label_text, color=color, anchor=(0, 1))
+                                text_item.setPos(freq, amp)
+                                graph_widget.addItem(text_item)
+                                
+                                # Collect info for title
+                                if idx == 0:
+                                    peak_info_parts.append(f"f₀={freq:.2f} Hz")
+                                elif harmonic_num:
+                                    peak_info_parts.append(f"{harmonic_num}x")
+                            
+                            # === Calculate THD if harmonics detected ===
+                            harmonic_amplitudes_sq = []
+                            for h in range(2, 11):  # 2nd to 10th harmonic
+                                target_freq = fundamental_freq * h
+                                if target_freq < nyquist_freq:
+                                    # Find closest frequency bin
+                                    closest_idx = np.argmin(np.abs(xf - target_freq))
+                                    harmonic_amplitudes_sq.append(amplitude[closest_idx] ** 2)
+                            
+                            if fundamental_amp > 0 and len(harmonic_amplitudes_sq) > 0:
+                                thd = np.sqrt(sum(harmonic_amplitudes_sq)) / fundamental_amp * 100
+                                thd_text = f" | THD={thd:.1f}%"
+                            else:
+                                thd_text = ""
+                            
+                            # Build title with peak info
+                            peaks_str = ", ".join(peak_info_parts[:3])  # Show max 3 peaks in title
+                            graph_widget.setTitle(
+                                f"FFT: {primary_sensor_name} | {peaks_str}{thd_text} | SR={sample_rate:.1f} Hz"
+                            )
+                        else:
+                            graph_widget.setTitle(f"FFT: {primary_sensor_name} | No significant peaks | SR={sample_rate:.1f} Hz")
+                    else:
+                        graph_widget.setTitle(f"FFT: {primary_sensor_name} | No peaks above threshold | SR={sample_rate:.1f} Hz")
                 else:
-                    graph_widget.setTitle(f"Select a sensor with at least 2 data points for Fourier Analysis ({primary_sensor_name})") # Show name even on error
+                    graph_widget.setTitle(f"Select a sensor with sufficient data for Fourier Analysis ({primary_sensor_name})")
 
             elif graph_type == "Histogram":
                 graph_widget.setTitle(f"Histogram ({primary_sensor_name}, Bins: {histogram_bins}) - Timespan: {timespan}")
-                graph_widget.setLabel('bottom', 'Value Bins')
+                graph_widget.setLabel('bottom', 'Sensor Value')
                 graph_widget.setLabel('left', 'Frequency')
                 legend.setVisible(False)
                 if primary_sensor_key and primary_sensor_key in data_to_plot and histogram_bins is not None and histogram_bins > 0 and len(data_to_plot[primary_sensor_key]['value']) > 0:
@@ -929,13 +2118,17 @@ class GraphController:
                     
                     hist, bin_edges = np.histogram(values, bins=histogram_bins)
                     
-                    # Create bar graph
-                    bar_graph = pg.BarGraphItem(x=bin_edges[:-1], height=hist, width=(bin_edges[1]-bin_edges[0])*0.9, brush='b')
+                    # Create bar graph - ensure bars start from y=0 baseline
+                    
+                    # Get primary sensor color
+                    sensor_obj = self.main_window.sensor_controller.get_sensor_by_historical_key(primary_sensor_key)
+                    color = getattr(sensor_obj, 'color', '#FFFFFF') if sensor_obj else '#FFFFFF'
+                    
+                    bar_graph = pg.BarGraphItem(x=bin_edges[:-1], y=0, height=hist, width=(bin_edges[1]-bin_edges[0])*0.9, brush=color)
                     graph_widget.addItem(bar_graph)
                     # Set Y range manually if needed, as autorange might be weird for single bars
                     if len(hist) > 0:
                         graph_widget.setYRange(0, max(hist) * 1.1)
-                    graph_widget.getAxis('bottom').setLabel("Sensor Value")
                     # Adjust X range for better visualization
                     if len(bin_edges) > 1:
                         graph_widget.setXRange(bin_edges[0], bin_edges[-1])
@@ -974,8 +2167,18 @@ class GraphController:
                     # Drawing parameters
                     y_center = 0
                     box_height = 0.6 # Arbitrary height for visual clarity
-                    pen = pg.mkPen(color='w', width=getattr(self.main_window, 'plot_line_width_value', 2))
-                    brush = pg.mkBrush(color=(0, 0, 255, 150))
+                    
+                    # Get primary sensor color
+                    sensor_obj = self.main_window.sensor_controller.get_sensor_by_historical_key(primary_sensor_key)
+                    color = getattr(sensor_obj, 'color', '#FFFFFF') if sensor_obj else '#FFFFFF'
+                    
+                    pen = pg.mkPen(color=color, width=getattr(self.main_window, 'plot_line_width_value', 2))
+                    
+                    # Create semi-transparent brush from sensor color
+                    box_color = QColor(color)
+                    box_color.setAlpha(150)
+                    brush = pg.mkBrush(color=box_color)
+                    
                     outlier_pen = pg.mkPen(color=(255, 0, 0, 150), width=1)
                     outlier_brush = pg.mkBrush(color=(255, 0, 0, 150))
                     outlier_size = max(5, getattr(self.main_window, 'plot_line_width_value', 2) * 2)
@@ -992,7 +2195,7 @@ class GraphController:
                     graph_widget.addItem(median_line)
 
                     # Create Whiskers (Lines)
-                    whisker_pen = pg.mkPen(color='w', width=pen.widthF(), style=pg.QtCore.Qt.PenStyle.DashLine) # Use pg.QtCore.Qt
+                    whisker_pen = pg.mkPen(color=color, width=pen.widthF(), style=pg.QtCore.Qt.PenStyle.DashLine) # Use pg.QtCore.Qt
                     # Low whisker line
                     line_low = QGraphicsLineItem(actual_whisker_low, y_center, q1, y_center) # Use direct import
                     line_low.setPen(whisker_pen)
@@ -1051,7 +2254,15 @@ class GraphController:
                     val2_interp = np.interp(time_combined, t2, v2)
 
                     # Create scatter plot
-                    scatter = pg.ScatterPlotItem(size=5, pen=pg.mkPen(None), brush=pg.mkBrush(255, 255, 255, 120))
+                    
+                    # Get primary sensor color
+                    sensor_obj = self.main_window.sensor_controller.get_sensor_by_historical_key(primary_sensor_key)
+                    color = getattr(sensor_obj, 'color', '#FFFFFF') if sensor_obj else '#FFFFFF'
+                    
+                    scatter_color = QColor(color)
+                    scatter_color.setAlpha(120)
+                    
+                    scatter = pg.ScatterPlotItem(size=5, pen=pg.mkPen(None), brush=pg.mkBrush(scatter_color))
                     scatter.addPoints(x=val1_interp, y=val2_interp)
                     graph_widget.addItem(scatter)
                     
@@ -1101,7 +2312,25 @@ class GraphController:
                 graph_widget.enableAutoRange()
         else:
             # For other graph types, use standard autorange
-            graph_widget.enableAutoRange() 
+            graph_widget.enableAutoRange()
+        
+        # Add event markers if available (after plotting data so markers appear on top)
+        # Skip markers for Histogram and Box Plot as they don't have a time-based X-axis
+        if graph_type not in ["Histogram", "Box Plot"]:
+            # Use the same start_time that was used for relative time calculation
+            # This ensures markers align correctly with the plotted data
+            start_time = None
+            if graph_start_time is not None:
+                start_time = graph_start_time
+            elif hasattr(self.main_window, 'data_collection_controller'):
+                start_time = getattr(self.main_window.data_collection_controller, 'start_time', None)
+            
+            if start_time is not None:
+                start_time = self._resolve_start_time(start_time, allow_now=self.show_automation_markers)
+                print(f"DEBUG: update_specific_graph: Adding event markers with start_time={start_time}, show_automation_markers={self.show_automation_markers}")
+                self._add_event_markers_to_graph(graph_widget, start_time, force=self.show_automation_markers)
+            else:
+                print(f"DEBUG: update_specific_graph: Cannot add event markers - no start_time available") 
     
     def apply_plot_formatting(self):
         """Apply plot formatting based on settings"""
@@ -1255,6 +2484,25 @@ class GraphController:
             widget.showGrid(x=True, y=True, alpha=0.3)
         else:
             widget.showGrid(x=True, y=True, alpha=0.2)
+            
+        # Apply downsampling (Graph Simplification)
+        try:
+            # Check for setting in SettingsModel or UI checkbox
+            downsampling_enabled = True
+            if hasattr(self.main_window, 'graph_downsampling_checkbox'):
+                downsampling_enabled = self.main_window.graph_downsampling_checkbox.isChecked()
+            elif self.settings_model:
+                downsampling_enabled = self.settings_model.get_bool("graph_downsampling", True)
+                
+            plot_item = widget.getPlotItem()
+            if downsampling_enabled:
+                plot_item.setDownsampling(ds=True, auto=True, mode='peak')
+            else:
+                plot_item.setDownsampling(ds=False)
+            plot_item.setClipToView(True)
+        except Exception as e:
+            if hasattr(self.main_window, 'logger'):
+                self.main_window.logger.debug(f"Could not apply downsampling to widget: {e}")
         
         # Apply line width to all plots in the graph
         # This would be better handled when creating/updating the plots themselves
@@ -1270,11 +2518,13 @@ class GraphController:
             print("Main graph live update not started: checkbox is not checked")
             return
             
-        # Set timer interval to match sampling interval, but not faster than 1s
+        # Set timer interval to match sampling rate, but not faster than 1s
         update_interval_ms = 1500
         if hasattr(self.main_window, 'sampling_rate_spinbox'):
-            interval = self.main_window.sampling_rate_spinbox.value()
-            update_interval_ms = max(int(interval * 1000), 1000)
+            rate_hz = self.main_window.sampling_rate_spinbox.value()
+            if rate_hz > 0:
+                # Convert Hz to ms interval: 1000 / Hz
+                update_interval_ms = max(int(1000 / rate_hz), 1000)
         self.main_graph_update_timer.setInterval(update_interval_ms)
         # Only start the timer if data collection is active
         if hasattr(self.main_window, 'data_collection_controller') and self.main_window.data_collection_controller.collecting_data:
@@ -1310,8 +2560,10 @@ class GraphController:
                         # Timer is already active, just update the interval if needed
                         update_interval_ms = 1500
                         if hasattr(self.main_window, 'sampling_rate_spinbox'):
-                            interval = self.main_window.sampling_rate_spinbox.value()
-                            update_interval_ms = max(int(interval * 1000), 1000)
+                            rate_hz = self.main_window.sampling_rate_spinbox.value()
+                            if rate_hz > 0:
+                                # Convert Hz to ms interval: 1000 / Hz
+                                update_interval_ms = max(int(1000 / rate_hz), 1000)
                         self.main_graph_update_timer.setInterval(update_interval_ms)
                         print("DEBUG: Main graph live update timer already active, updated interval")
                 else:
@@ -1324,6 +2576,17 @@ class GraphController:
         """Clear all graphs and plot data buffers"""
         # Clear internal data buffers
         self.dashboard_plot_data.clear()
+        
+        # --- ADDED: Clear automation markers for new run ---
+        if self.event_markers_mutex:
+            self.event_markers_mutex.lock()
+        try:
+            self.event_markers = []
+        finally:
+            if self.event_markers_mutex:
+                self.event_markers_mutex.unlock()
+        self._event_marker_items = {} 
+        # --------------------------------------------------
         
         # Reset time tracking
         self.dashboard_start_time = None
@@ -1344,12 +2607,13 @@ class GraphController:
         
         print("DEBUG: All graphs and plot data cleared")
         
-    def plot_historical_data(self, historical_data):
+    def plot_historical_data(self, historical_data, run_dir=None):
         """
         Plot historical data from the CSV file at program start.
         
         Args:
             historical_data: Data in the format {sensor_id: {'time': [...], 'value': [...]}}
+            run_dir: Optional run directory path to load automation events from
         """
         print(f"DEBUG: plot_historical_data called with {len(historical_data)} sensors")
         
@@ -1357,7 +2621,26 @@ class GraphController:
         if not historical_data:
             print("DEBUG: No historical data to plot")
             return
-            
+        
+        # Load automation events from CSV if run directory is provided
+        if run_dir:
+            print(f"DEBUG: plot_historical_data: Loading automation events from run_dir={run_dir}")
+            # Load events but don't add markers yet (we'll add them after plotting with correct base_time)
+            self.load_automation_events_from_csv(run_dir, add_markers_immediately=False)
+            # Check how many events were loaded
+            markers_count = len(self._get_event_markers_snapshot())
+            print(f"DEBUG: plot_historical_data: After loading, {markers_count} events stored in event_markers")
+        elif hasattr(self.main_window, 'project_controller'):
+            # Try to get run directory from project controller
+            project_controller = self.main_window.project_controller
+            if hasattr(project_controller, 'get_current_run_directory'):
+                run_dir = project_controller.get_current_run_directory()
+                if run_dir:
+                    print(f"DEBUG: plot_historical_data: Loading automation events from project controller run_dir={run_dir}")
+                    self.load_automation_events_from_csv(run_dir, add_markers_immediately=False)
+                    markers_count = len(self._get_event_markers_snapshot())
+                    print(f"DEBUG: plot_historical_data: After loading, {markers_count} events stored in event_markers")
+        
         # Get the main graph widget
         graph_widget = None
         if hasattr(self.main_window, 'graph_widget'):
@@ -1379,9 +2662,28 @@ class GraphController:
                 
         legend = graph_widget.addLegend()
         graph_widget.showGrid(x=True, y=True, alpha=0.3)
-        graph_widget.setLabel('bottom', 'Elapsed Time (s)')
+        graph_widget.setLabel('bottom', 'Time Since Run Start (s)')
         graph_widget.setLabel('left', 'Sensor Value')
         graph_widget.setTitle("Historical Data from Last Run")
+        
+        # Determine a common zero so the X axis shows elapsed time from the run start
+        base_time = None
+        try:
+            all_times = []
+            for sensor_data in historical_data.values():
+                times = sensor_data.get('time') if isinstance(sensor_data, dict) else None
+                if times:
+                    for t in times:
+                        try:
+                            all_times.append(float(t))
+                        except (TypeError, ValueError):
+                            continue
+            if all_times:
+                base_time = min(all_times)
+                self._debug(f"Graph: Using base_time {base_time:.3f} for historical x-axis")
+        except Exception as e:
+            self._warn(f"Graph: Failed to derive base_time for historical data: {e}")
+            base_time = None
         
         # Apply formatting
         self.apply_plot_formatting()
@@ -1392,6 +2694,8 @@ class GraphController:
                 try:
                     # Convert to numpy arrays for efficient handling
                     times = np.array(data['time'], dtype=float)
+                    if base_time is not None:
+                        times = times - base_time
                     values = np.array(data['value'], dtype=float)
                     
                     # Get sensor information for better display
@@ -1409,13 +2713,38 @@ class GraphController:
                     pen = pg.mkPen(color=color, width=getattr(self.main_window, 'plot_line_width_value', 2))
                     
                     # Add the plot to the graph
-                    graph_widget.plot(times, values, pen=pen, name=sensor_name)
+                    graph_widget.plot(
+                        times, values, 
+                        pen=pen, 
+                        name=sensor_name
+                    )
                     print(f"DEBUG: Plotted {len(times)} points for sensor {sensor_name}")
                 except Exception as e:
                     print(f"DEBUG: Error plotting historical data for sensor {sensor_id}: {e}")
         
         # Set auto range so all data is visible
         graph_widget.autoRange()
+        
+        # Add event markers if available (after plotting data so markers appear on top)
+        # Use base_time as the start_time for historical data so markers align with sensor data
+        if base_time is not None:
+            start_time = base_time
+        elif hasattr(self.main_window, 'data_collection_controller'):
+            start_time = getattr(self.main_window.data_collection_controller, 'start_time', None)
+        else:
+            start_time = None
+            
+        if start_time is not None:
+            start_time = self._resolve_start_time(start_time, allow_now=self.show_automation_markers)
+            self._debug(f"Graph: Adding event markers to historical graph with start_time={start_time}, base_time={base_time}")
+            print(f"DEBUG: plot_historical_data: Adding event markers with start_time={start_time}, show_automation_markers={self.show_automation_markers}")
+            markers_before = len(self._get_event_markers_snapshot())
+            print(f"DEBUG: plot_historical_data: {markers_before} events available before adding markers")
+            self._add_event_markers_to_graph(graph_widget, start_time, force=self.show_automation_markers)
+        else:
+            self._debug("Graph: Cannot add event markers - no start_time available")
+            print("DEBUG: plot_historical_data: Cannot add event markers - no start_time available")
+        
         print("DEBUG: Historical data plotting completed")
     
     def _merge_control_and_current_data(self, control_data, current_data, required_sensor_keys):
@@ -1483,3 +2812,405 @@ class GraphController:
                         self.main_window.logger.debug(f"Merged {len(all_times)} data points for sensor {sensor_key}")
         
         return merged_data
+    
+    def add_event_marker(self, event):
+        """
+        Add an automation event marker for visualization in graphs.
+        Thread-safe: schedules the UI update on the main thread.
+        """
+        if not event:
+            return
+
+        # Use a single-shot timer to ensure the marker is added on the main thread
+        # and not during a sensitive part of the graphing update cycle.
+        QTimer.singleShot(0, lambda: self._add_event_marker_ui(event))
+
+    def _add_event_marker_ui(self, event):
+        """Internal method to add marker to UI, called on main thread."""
+        print(f"DEBUG: _add_event_marker_ui called with event: type={event.get('type')}, trigger='{event.get('trigger_description', '')}', action='{event.get('action_description', '')}', timestamp={event.get('timestamp')}")
+        
+        # Skip trigger events - only show action events on graph
+        event_type = event.get('type', 'unknown')
+        if event_type == 'trigger':
+            print("DEBUG: _add_event_marker_ui: Skipping trigger event")
+            return
+        
+        # Store event (always store, even if dashboard not started yet)
+        event_copy = event.copy()
+        if self.event_markers_mutex:
+            self.event_markers_mutex.lock()
+        try:
+            # Rate limit marker storage per-sequence to prevent memory issues if triggers rapid-fire
+            # but allow different sequences to trigger simultaneously
+            current_time = time.time()
+            seq_name = event_copy.get('sequence_name', 'unknown')
+            
+            # Find if a similar event happened recently
+            # Only check for duplicates if we're in live collection mode (not loading from CSV)
+            # When loading from CSV, we want to show all events even if they're close together
+            is_duplicate = False
+            event_timestamp = event_copy.get('timestamp', current_time)
+            # Only check for duplicates if this is a live event (timestamp is very recent)
+            # Events loaded from CSV have historical timestamps, so we don't filter them as duplicates
+            if abs(current_time - event_timestamp) < 1.0:  # Only check duplicates for recent events
+                for last_event in reversed(self.event_markers[-10:]): # Check last 10 markers
+                    last_timestamp = last_event.get('timestamp', 0)
+                    # Only consider it a duplicate if timestamps are very close AND it's a recent event
+                    if (abs(event_timestamp - last_timestamp) < 0.1 and 
+                        abs(current_time - last_timestamp) < 1.0 and
+                        last_event.get('sequence_name') == seq_name and
+                        last_event.get('type') == event_type):
+                        is_duplicate = True
+                        break
+            
+            if is_duplicate:
+                # Too many similar markers in storage, skip this one for UI (still in CSV)
+                print(f"DEBUG: _add_event_marker_ui: Event filtered as duplicate")
+                return
+
+            self.event_markers.append(event_copy)
+            print(f"DEBUG: _add_event_marker_ui: Event added to event_markers. Total events: {len(self.event_markers)}")
+            
+            # Do not delete events - preserve all scientific data
+            # The user controls visibility via the "Show automation events" checkbox
+            # All events are preserved regardless of age to maintain data integrity
+        finally:
+            if self.event_markers_mutex:
+                self.event_markers_mutex.unlock()
+        
+        # Dashboard: draw if widget exists and markers are enabled
+        if self.dashboard_graph_widget and self.show_automation_markers:
+            # For replay events loaded from CSV, always add them (they're historical data)
+            # For live events during replay playback, rate limit to avoid performance issues
+            is_replay_event = event.get('type') == 'replay_event'
+            in_replay = hasattr(self.main_window, "replay_mode_enabled") and self.main_window.replay_mode_enabled
+            
+            # Always add replay events (loaded from CSV), or if not in replay, or if rate limit allows
+            if is_replay_event or not in_replay or (time.time() - getattr(self, '_last_marker_add_time', 0) > 0.5):
+                actual_start_time = self._resolve_start_time(self.dashboard_start_time, allow_now=True)
+                self._add_single_event_marker(self.dashboard_graph_widget, event, actual_start_time, force=True)
+                if not is_replay_event:  # Only update rate limit for live events
+                    self._last_marker_add_time = time.time()
+        
+        # Main graph: draw if widget exists and collection active and markers enabled
+        # Skip markers for Histogram and Box Plot as they don't have a time-based X-axis
+        current_graph_type = ""
+        if hasattr(self.main_window, 'graph_type_combo'):
+            current_graph_type = self.main_window.graph_type_combo.currentText()
+            
+        if (current_graph_type not in ["Histogram", "Box Plot"] and
+            hasattr(self.main_window, 'data_collection_controller') and 
+            hasattr(self.main_window.data_collection_controller, 'collecting_data') and
+            self.main_window.data_collection_controller.collecting_data and
+            hasattr(self.main_window, 'graph_widget') and 
+            self.main_window.graph_widget and
+            self.show_automation_markers):
+            start_time = self._resolve_start_time(getattr(self.main_window.data_collection_controller, 'start_time', None), allow_now=True)
+            self._add_single_event_marker(self.main_window.graph_widget, event, start_time, force=True)
+    
+    def load_automation_events_from_csv(self, run_dir, add_markers_immediately=True):
+        """
+        Load automation events from CSV file in the run directory and add them as event markers.
+        
+        Args:
+            run_dir: Path to the run directory containing the CSV file
+            add_markers_immediately: If True, add markers to graphs immediately. If False, only load events into storage.
+        """
+        if not run_dir or not os.path.isdir(run_dir):
+            self._debug(f"Graph: Invalid run directory for loading automation events: {run_dir}")
+            return
+        
+        # Find the most recent CSV file in the run directory
+        csv_files = glob.glob(os.path.join(run_dir, 'rundata_*.csv'))
+        if not csv_files:
+            # Try a broader search in case naming convention differs
+            csv_files = glob.glob(os.path.join(run_dir, '*.csv'))
+            if not csv_files:
+                self._debug(f"Graph: No CSV files found in {run_dir} for automation events")
+                return
+        
+        latest_csv = max(csv_files, key=os.path.getmtime)
+        self._debug(f"Graph: Loading automation events from {latest_csv}")
+        
+        # Automation columns to check
+        automation_columns = [
+            "automation_trigger",
+            "automation_action",
+            "automation_sequence",
+            "automation_image",
+        ]
+        
+        try:
+            events_loaded = 0
+            first_timestamp = None
+            
+            with open(latest_csv, 'r', newline='') as csvfile:
+                reader = csv.DictReader(csvfile)
+                
+                for row in reader:
+                    # Check if this row has any automation data
+                    if not any(row.get(col) for col in automation_columns):
+                        continue
+                    
+                    try:
+                        # Get timestamp
+                        timestamp = float(row.get('timestamp', 0))
+                        if first_timestamp is None:
+                            first_timestamp = timestamp
+                        
+                        # Get automation data
+                        trigger = row.get("automation_trigger", "").strip()
+                        action = row.get("automation_action", "").strip()
+                        sequence = row.get("automation_sequence", "").strip()
+                        image = row.get("automation_image", "").strip()
+                        
+                        # Only create event if there's actual content (not just empty strings)
+                        if not (trigger or action or sequence):
+                            continue
+                        
+                        # Create event marker
+                        event = {
+                            "timestamp": timestamp,
+                            "type": "replay_event",
+                            "sequence_name": sequence,
+                            "trigger_description": trigger,
+                            "action_description": action,
+                            "image_path": image,
+                        }
+                        
+                        self._debug(f"Graph: Loading event from CSV: timestamp={timestamp}, trigger='{trigger}', action='{action}', sequence='{sequence}'")
+                        
+                        # Add event marker directly (synchronously) when loading from CSV
+                        # This ensures events are stored before we try to add them to the graph
+                        self._add_event_marker_ui(event)
+                        events_loaded += 1
+                        
+                    except (ValueError, TypeError) as e:
+                        # Skip rows with invalid timestamp
+                        continue
+            
+            self._debug(f"Graph: Loaded {events_loaded} automation events from CSV")
+            print(f"DEBUG: load_automation_events_from_csv: Loaded {events_loaded} events from CSV")
+            
+            # Verify events were stored
+            stored_count = len(self._get_event_markers_snapshot())
+            print(f"DEBUG: load_automation_events_from_csv: {stored_count} events now stored in event_markers")
+            
+            # If we loaded events and should add markers immediately, update the graph
+            if add_markers_immediately and events_loaded > 0 and first_timestamp is not None:
+                # Update dashboard graph if it exists
+                if self.dashboard_graph_widget:
+                    self._add_event_markers_to_graph(
+                        self.dashboard_graph_widget, 
+                        first_timestamp, 
+                        force=self.show_automation_markers
+                    )
+                
+                # Update main graph if it exists
+                if hasattr(self.main_window, 'graph_widget') and self.main_window.graph_widget:
+                    self._add_event_markers_to_graph(
+                        self.main_window.graph_widget,
+                        first_timestamp,
+                        force=self.show_automation_markers
+                    )
+                    
+        except Exception as e:
+            self._warn(f"Graph: Error loading automation events from CSV: {e}")
+    
+    def _add_event_markers_to_graph(self, graph_widget, start_time=None, force=False):
+        """
+        Add vertical lines and labels for automation events to a graph
+        
+        Args:
+            graph_widget: The pyqtgraph widget to add markers to
+            start_time: Start time of the data collection (for relative time calculation)
+        """
+        # Clear existing markers to avoid duplicates
+        self._clear_event_markers_for_widget(graph_widget)
+
+        if not self.show_automation_markers and not force:
+            self._debug("Graph: Skipping marker add (disabled and not forced)")
+            return
+        markers = self._get_event_markers_snapshot()
+        print(f"DEBUG: _add_event_markers_to_graph: Found {len(markers)} stored event markers")
+        if not markers:
+            self._debug("Graph: No stored event markers to add")
+            print("DEBUG: _add_event_markers_to_graph: No markers to add, returning early")
+            return
+        
+        if start_time is None:
+            # Prefer dashboard start, then data collection start.
+            if self.dashboard_start_time:
+                start_time = self.dashboard_start_time
+            elif hasattr(self.main_window, "data_collection_controller"):
+                start_time = getattr(self.main_window.data_collection_controller, "start_time", None)
+            # If still missing and forced, fall back to earliest event or now.
+            if start_time is None and force:
+                if self.event_markers:
+                    start_time = min(e.get("timestamp", time.time()) for e in self.event_markers)
+                else:
+                    start_time = time.time()
+            if start_time is None:
+                self._debug("Graph: No start_time available for markers; skip drawing until start_time is set")
+                return
+        self._debug(
+            f"Graph: _add_event_markers_to_graph start "
+            f"show={self.show_automation_markers} force={force} "
+            f"events={len(markers)} start_time={start_time}"
+        )
+        
+        added = 0
+        # Get current view range to only add visible markers (optimization)
+        try:
+            vb = graph_widget.getViewBox()
+            view_range = vb.viewRange()[0] if vb else None
+        except Exception:
+            view_range = None
+
+        # Calculate relative times for events
+        for event in markers:
+            event_timestamp = event.get('timestamp', 0)
+            relative_time = event_timestamp - start_time if start_time else 0
+
+            # If we have a view range, skip markers far outside of it
+            if view_range is not None:
+                # Add a small buffer to avoid flickering at edges
+                buffer = (view_range[1] - view_range[0]) * 0.1
+                if relative_time < view_range[0] - buffer or relative_time > view_range[1] + buffer:
+                    continue
+
+            self._add_single_event_marker(graph_widget, event, start_time, force=True)
+            added += 1
+
+        self._debug(f"Graph: Re-added {added} automation markers (force={force}, start_time={start_time})")
+    
+    def _add_single_event_marker(self, graph_widget, event, start_time, force=False):
+        """
+        Add a single event marker to a graph widget immediately
+        
+        Args:
+            graph_widget: The pyqtgraph widget to add marker to
+            event: Event dictionary
+            start_time: Start time of data collection for relative time calculation
+        """
+        if not graph_widget:
+            self._debug(f"Graph: Cannot add event marker - graph_widget missing")
+            return
+
+        # Fallback start_time logic: use provided, else controller start, else earliest event time, else now (only if forced)
+        if not start_time:
+            if hasattr(self.main_window, "data_collection_controller"):
+                start_time = getattr(self.main_window.data_collection_controller, "start_time", None)
+            if start_time is None and hasattr(self, "event_markers") and self.event_markers:
+                start_time = min(e.get("timestamp", time.time()) for e in self.event_markers)
+            if start_time is None and force:
+                start_time = time.time()
+            if start_time is None:
+                self._debug("Graph: Cannot add marker - no start_time available")
+                return
+
+        if not self.show_automation_markers and not force:
+            return
+        
+        event_timestamp = event.get('timestamp', time.time())
+        relative_time = event_timestamp - start_time
+        
+        # --- Safety check: Don't add NaN/Inf markers as they crash pyqtgraph ---
+        if not np.isfinite(relative_time):
+            self._debug(f"Graph: Skipping invalid relative time for marker: {relative_time}")
+            return
+        # ---------------------------------------------------------------------
+
+        self._debug(
+            f"Graph: Adding event marker - event_time={event_timestamp:.3f}, "
+            f"start_time={start_time:.3f}, relative_time={relative_time:.3f}, force={force}"
+        )
+        
+        # Never drop markers because of negative drift; clamp to zero
+        if relative_time < 0:
+            self._debug(f"Graph: Clamping negative relative time ({relative_time:.3f}s) to 0")
+            relative_time = 0
+            
+        # --- Safety check: Limit total number of markers on graph ---
+        if graph_widget not in self._event_marker_items:
+            self._event_marker_items[graph_widget] = []
+            
+        current_markers = self._event_marker_items[graph_widget]
+        if len(current_markers) > 500:
+            # Remove oldest marker to stay within limit
+            oldest = current_markers.pop(0)
+            try:
+                graph_widget.removeItem(oldest)
+            except Exception:
+                pass
+        # ------------------------------------------------------------
+        
+        # Determine color based on event type and build a descriptive label
+        event_type = event.get('type')
+        trigger_desc = event.get('trigger_description') or ""
+        action_desc = event.get('action_description') or ""
+        generic_desc = event.get('description') or ""
+
+        # Prefer a meaningful description even for replay events
+        best_desc = trigger_desc or action_desc or generic_desc or "Event"
+
+        if event_type == 'trigger':
+            color = '#FF6B6B'  # Red for triggers
+            label = f"Trigger: {best_desc}"
+        elif event_type == 'action':
+            color = '#4ECDC4'  # Teal for actions
+            label = f"Action: {best_desc}"
+        else:
+            color = '#95A5A6'  # Gray for unknown/replay/misc
+            label = best_desc
+
+        # Add sequence name if available
+        sequence_name = event.get('sequence_name', '')
+        if sequence_name:
+            label = f"{sequence_name}: {label}"
+        
+        # Check if there's an image associated with this event
+        image_path = event.get('image_path')
+        if image_path:
+            label += " 📸" # Add camera emoji to label if image exists
+        
+        # Create vertical line
+        line = pg.InfiniteLine(
+            pos=relative_time,
+            angle=90,
+            pen=pg.mkPen(color=color, width=2, style=pg.QtCore.Qt.PenStyle.DashLine),
+            label=label,
+            labelOpts={'position': 0.95, 'color': color} # Simplified label options
+        )
+        
+        # Attach image path if it exists and make clickable
+        if image_path:
+            line.image_path = image_path
+            # Make it slightly more interactive
+            line.setHoverPen(pg.mkPen(color='#FFFFFF', width=3))
+            # Connect click signal
+            line.sigClicked.connect(lambda obj: self._handle_marker_clicked(obj))
+            
+        graph_widget.addItem(line)
+        self._event_marker_items[graph_widget].append(line)
+
+    def _handle_marker_clicked(self, marker):
+        """Handle clicking on a graph marker (open associated image if any)"""
+        image_path = getattr(marker, 'image_path', None)
+        if not image_path:
+            return
+            
+        # If it's a semicolon-separated list of paths (multiple snapshots at once), 
+        # just open the first one for now or handle them.
+        if ';' in image_path:
+            image_path = image_path.split(';')[0].strip()
+            
+        if image_path and os.path.exists(image_path):
+            self._debug(f"Graph: Opening image: {image_path}")
+            # Use the system default image viewer
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(image_path)))
+        else:
+            self._warn(f"Graph: Associated image not found at: {image_path}")
+            # Show a tooltip or message in status bar?
+            if hasattr(self.main_window, 'statusBar'):
+                self.main_window.statusBar().showMessage(f"Snapshot file not found: {os.path.basename(image_path)}", 3000)

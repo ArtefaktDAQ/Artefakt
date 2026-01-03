@@ -17,6 +17,7 @@ service DAQService {
   // Streaming endpoints
   rpc StreamSensorData(StreamRequest) returns (stream SensorData);
   rpc StreamVideo(VideoRequest) returns (stream VideoFrame);
+  rpc StreamAudio(AudioRequest) returns (stream AudioFrame);
   rpc StreamCombinedData(CombinedRequest) returns (stream CombinedData);
   
   // Remote control (with security)
@@ -51,6 +52,7 @@ message ConnectRequest {
   bool request_sensors = 4;
   bool request_video = 5;
   string client_name = 6;
+  bool request_audio = 7;
 }
 
 message ConnectResponse {
@@ -59,6 +61,7 @@ message ConnectResponse {
   string session_id = 3;
   repeated RemoteSensor available_sensors = 4;
   bool video_available = 5;
+  bool audio_available = 6;
 }
 
 message AvailableSensorsResponse {
@@ -149,6 +152,7 @@ message DisconnectResponse {
 
 message SensorsRequest {}
 message VideoRequest {}
+message AudioRequest {}
 message CombinedRequest {}
 message StreamRequest {}
 
@@ -175,6 +179,13 @@ message VideoFrame {
   int32 width = 3;
   int32 height = 4;
   int32 channels = 5;
+}
+
+message AudioFrame {
+  bytes pcm_data = 1;     // Little-endian PCM samples (e.g. int16)
+  int64 timestamp = 2;    // Milliseconds since epoch
+  int32 sample_rate = 3;  // Samples per second
+  int32 channels = 4;     // Channel count (1 = mono)
 }
 
 message CombinedData {

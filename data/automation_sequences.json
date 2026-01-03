@@ -1,40 +1,78 @@
 [
     {
-        "name": "LION script",
-        "loop": true,
+        "name": "AIN2 >= 30 and 31 and 32",
+        "loop": false,
         "checked": true,
         "steps": [
             {
                 "trigger": {
-                    "type": "TIME_DURATION",
-                    "name": "Unnamed Trigger",
-                    "minutes": 0,
-                    "seconds": 10
+                    "type": "SENSOR_VALUE",
+                    "name": "AIN2 >= 30",
+                    "sensor_name": "AIN2",
+                    "operator": ">=",
+                    "threshold": 30.0,
+                    "hysteresis": 0.0
                 },
                 "action": {
-                    "type": "SERIAL_COMMAND",
+                    "type": "SYSTEM_ACTION",
                     "name": "Unnamed Action",
-                    "port": "4",
-                    "command": "100\n",
-                    "baudrate": 9600,
-                    "timeout": 1.0
+                    "specific_action_type": "take_snapshot",
+                    "parameters": {}
                 },
                 "enabled": true
             },
             {
                 "trigger": {
-                    "type": "TIME_DURATION",
-                    "name": "Unnamed Trigger",
-                    "minutes": 60,
-                    "seconds": 0
+                    "type": "SENSOR_VALUE",
+                    "name": "AIN2 >= 31",
+                    "sensor_name": "AIN2",
+                    "operator": ">=",
+                    "threshold": 31.0,
+                    "hysteresis": 0.0
                 },
                 "action": {
-                    "type": "SERIAL_COMMAND",
+                    "type": "SYSTEM_ACTION",
                     "name": "Unnamed Action",
-                    "port": "4",
-                    "command": "200\n",
-                    "baudrate": 9600,
-                    "timeout": 1.0
+                    "specific_action_type": "take_snapshot",
+                    "parameters": {}
+                },
+                "enabled": true
+            },
+            {
+                "trigger": {
+                    "type": "SENSOR_VALUE",
+                    "name": "AIN2 >= 32",
+                    "sensor_name": "AIN2",
+                    "operator": ">",
+                    "threshold": 32.0,
+                    "hysteresis": 0.0
+                },
+                "action": {
+                    "type": "SYSTEM_ACTION",
+                    "name": "Unnamed Action",
+                    "specific_action_type": "take_snapshot",
+                    "parameters": {}
+                },
+                "enabled": true
+            }
+        ]
+    },
+    {
+        "name": "Motion -> Picture",
+        "loop": false,
+        "checked": false,
+        "steps": [
+            {
+                "trigger": {
+                    "type": "EVENT",
+                    "name": "Unnamed Trigger",
+                    "event_type": "motion_detected"
+                },
+                "action": {
+                    "type": "SYSTEM_ACTION",
+                    "name": "Unnamed Action",
+                    "specific_action_type": "take_snapshot",
+                    "parameters": {}
                 },
                 "enabled": true
             }

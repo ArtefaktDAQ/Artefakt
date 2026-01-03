@@ -7,6 +7,7 @@ Provides easy-to-use interface for both master (streaming) and client (receiving
 
 import time
 import threading
+import queue
 import grpc
 from concurrent import futures
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer, QThread
@@ -20,6 +21,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QFont
 
 from app.core.logger import Logger
+from app.ui.theme import GroupBoxStyles, ButtonStyles, CardStyles, COLORS
 from app.utils.common_types import StatusState
 
 # Import protobuf generated files
@@ -64,8 +66,10 @@ class StreamController(QObject):
         self.current_stream_options = {
             'enable_sensors': True,
             'enable_video': True,
+            'enable_audio': False,
             'enable_remote_control': False
         }
+        self.current_request_audio = False
         
         # gRPC components
         self.grpc_server = None
@@ -90,60 +94,72 @@ class StreamController(QObject):
     def add_stream_button_to_ui(self):
         """Add the stream button to the UI after it's fully initialized"""
         try:
-            # Find the devices status container where Arduino, LabJack, and Other Sensors are located
-            for child in self.main_window.findChildren(QWidget):
-                if hasattr(child, 'layout') and child.layout():
-                    layout = child.layout()
-                    # Check if this is the grid layout containing the device containers
-                    if (isinstance(layout, QGridLayout) and 
-                        layout.count() >= 3 and  # Should have at least 3 widgets (Arduino, LabJack, Other)
-                        hasattr(child, 'setFixedHeight') and 
-                        child.height() == 155):  # The devices status container has fixed height 155
-                        
-                        # Create the remote DAQ container similar to other device containers
-                        remote_container = QFrame()
-                        remote_container.setFrameShape(QFrame.Shape.Box)
-                        remote_container.setFrameShadow(QFrame.Shadow.Raised)
-                        remote_container.setLineWidth(2)
-                        remote_container.setStyleSheet("""
-                            QFrame { 
-                                border: 2px solid #999; 
-                                border-radius: 8px; 
-                                background-color: transparent; 
-                            }
-                            QFrame:hover { 
-                                background-color: rgba(200, 200, 200, 0.3); 
-                                border: 2px solid #777; 
-                            }
-                        """)
-                        remote_container.setCursor(Qt.CursorShape.PointingHandCursor)
-                        
-                        # Create layout for the remote container
-                        remote_layout = QVBoxLayout(remote_container)
-                        remote_layout.setContentsMargins(5, 5, 5, 5)
-                        remote_layout.setSpacing(2)
-                        
-                        # Add label with two lines
-                        remote_label = QLabel("Create/Connect to\nRemote DAQ")
-                        remote_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                        remote_label.setStyleSheet("font-size: 11px; font-weight: bold; border: none; background-color: transparent; margin: 0; padding: 0; line-height: 1.2;")
-                        remote_layout.addWidget(remote_label)
-                        
-                        # Add click event to open stream dialog
-                        remote_container.mousePressEvent = lambda event: self.show_stream_dialog()
-                        
-                        # Store reference to remote container for status updates
-                        self.remote_container = remote_container
-                        
-                        # Add the container to the grid layout in the 4th column (index 3)
-                        layout.addWidget(remote_container, 0, 3)
-                        
-                        self.logger.log("Remote DAQ button added to devices status container", "INFO")
-                        print("StreamController: Remote DAQ button added successfully!")  # Debug output
-                        return True
+            # Check if main_window has the devices_cards_layout (vertical layout)
+            if hasattr(self.main_window, 'devices_cards_layout'):
+                layout = self.main_window.devices_cards_layout
+                
+                # Check if Remote DAQ container already exists
+                if hasattr(self, 'remote_container') and self.remote_container:
+                    return True
+                
+                # Get the card style and size from main_window
+                card_style = getattr(self.main_window, 'device_card_style', CardStyles.device_card(False))
+                card_size = getattr(self.main_window, 'device_card_size', (100, 85))
+                
+                # Create the remote DAQ container with matching style
+                remote_container = QFrame()
+                remote_container.setFixedSize(card_size[0], card_size[1])
+                remote_container.setStyleSheet(card_style)
+                remote_container.setCursor(Qt.CursorShape.PointingHandCursor)
+                
+                # Create layout for the remote container
+                remote_layout = QVBoxLayout(remote_container)
+                remote_layout.setContentsMargins(6, 6, 6, 6)
+                remote_layout.setSpacing(2)
+                
+                # Add icon
+                # Use a network icon to avoid implying public internet
+                remote_icon = QLabel("🖧")
+                remote_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                remote_icon.setStyleSheet("font-size: 28px; background-color: transparent; border: none;")
+                remote_layout.addWidget(remote_icon)
+                
+                # Add label
+                remote_label = QLabel("Remote gRPC")
+                remote_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                remote_label.setStyleSheet("font-size: 10px; font-weight: bold; color: #fff; border: none; background-color: transparent;")
+                remote_layout.addWidget(remote_label)
+                
+                # Add status label
+                self.remote_status_label = QLabel("LAN / VPN only")
+                self.remote_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.remote_status_label.setStyleSheet("font-size: 9px; color: #888; border: none; background-color: transparent;")
+                remote_layout.addWidget(self.remote_status_label)
+                
+                # Add click event to open stream dialog
+                remote_container.setToolTip("gRPC link for local/LAN use; for internet use VPN/SSH tunnels.")
+                remote_container.mousePressEvent = lambda event: self.show_stream_dialog()
+                
+                # Store reference to remote container for status updates
+                self.remote_container = remote_container
+                
+                # Add at the end of the vertical layout (after MQTT)
+                # Insert before the stretch if it exists, otherwise just add
+                item_count = layout.count()
+                if item_count > 0:
+                    # Check if last item is a stretch (spacer item)
+                    last_item = layout.itemAt(item_count - 1)
+                    if last_item and last_item.spacerItem():
+                        layout.insertWidget(item_count - 1, remote_container)
+                    else:
+                        layout.addWidget(remote_container)
+                else:
+                    layout.addWidget(remote_container)
+                
+                self.logger.log("Remote DAQ button added to devices cards", "INFO")
+                return True
             
-            self.logger.log("Could not find devices status container", "WARNING")
-            print("StreamController: Could not find devices status container")  # Debug output
+            self.logger.log("Could not find devices_cards_layout", "WARNING")
             return False
             
         except Exception as e:
@@ -156,14 +172,15 @@ class StreamController(QObject):
         dialog.exec()
     
     def start_master_streaming(self, stream_name, password, description, 
-                             enable_sensors=True, enable_video=True):
+                             enable_sensors=True, enable_video=True,
+                             enable_audio=False):
         """Start streaming as master (data source)"""
         try:
             self.is_master = True
             
             # Start gRPC server
             self.start_grpc_server(stream_name, password, description,
-                                 enable_sensors, enable_video)
+                                 enable_sensors, enable_video, enable_audio)
             
             # Store current stream info
             self.current_stream_name = stream_name
@@ -171,7 +188,8 @@ class StreamController(QObject):
             self.current_stream_description = description
             self.current_stream_options = {
                 'enable_sensors': enable_sensors,
-                'enable_video': enable_video
+                'enable_video': enable_video,
+                'enable_audio': enable_audio
             }
             
             self.logger.log(f"Started master streaming: {stream_name}", "INFO")
@@ -188,7 +206,8 @@ class StreamController(QObject):
             return False, str(e)
     
     def connect_to_master_stream(self, master_address, stream_name, password, 
-                               client_name, request_sensors=True, request_video=True):
+                               client_name, request_sensors=True, request_video=True,
+                               request_audio=False):
         """Connect as client to a master stream"""
         try:
             self.is_client = True
@@ -204,7 +223,8 @@ class StreamController(QObject):
                 password=password,
                 request_sensors=request_sensors,
                 request_video=request_video,
-                client_name=client_name
+                client_name=client_name,
+                request_audio=request_audio
             )
             
             response = self.client_stub.ConnectToStream(request)
@@ -216,6 +236,7 @@ class StreamController(QObject):
                 self.current_stream_name = stream_name
                 self.current_stream_password = password
                 self.current_client_name = client_name
+                self.current_request_audio = request_audio
                 
                 self.logger.log(f"Connected to stream: {stream_name}", "INFO")
                 self.stream_connected.emit(stream_name)
@@ -228,6 +249,8 @@ class StreamController(QObject):
                     self.start_sensor_streaming(stream_name)
                 if request_video:
                     self.start_video_streaming(stream_name)
+                if request_audio:
+                    self.start_audio_streaming(stream_name)
                 
                 return True, "Connected successfully"
             else:
@@ -239,7 +262,7 @@ class StreamController(QObject):
             return False, str(e)
     
     def start_grpc_server(self, stream_name, password, description,
-                         enable_sensors, enable_video):
+                         enable_sensors, enable_video, enable_audio):
         """Start gRPC server for streaming"""
         if daq_service_pb2_grpc is None:
             raise ImportError("gRPC protobuf files not available")
@@ -248,7 +271,7 @@ class StreamController(QObject):
         self.grpc_server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
         
         # Add service
-        service_servicer = DAQServiceServicer(self.main_window, stream_name, password)
+        service_servicer = DAQServiceServicer(self.main_window, stream_name, password, enable_audio=enable_audio)
         daq_service_pb2_grpc.add_DAQServiceServicer_to_server(service_servicer, self.grpc_server)
         
         # Start server
@@ -293,6 +316,55 @@ class StreamController(QObject):
         # Start in separate thread
         video_thread = threading.Thread(target=receive_video_data, daemon=True)
         video_thread.start()
+
+    def start_audio_streaming(self, stream_name):
+        """Start receiving audio data from stream and play back locally"""
+        if not self.client_stub:
+            return
+        
+        def receive_audio_data():
+            try:
+                try:
+                    import sounddevice as sd
+                except ImportError:
+                    self.logger.log("Audio streaming requires 'sounddevice' package", "ERROR")
+                    return
+                
+                audio_request = daq_service_pb2.AudioRequest()
+                output_stream = None
+                
+                for audio_frame in self.client_stub.StreamAudio(audio_request):
+                    # Lazily create output stream using first frame parameters
+                    if output_stream is None:
+                        sample_rate = audio_frame.sample_rate or 44100
+                        channels = audio_frame.channels or 1
+                        output_stream = sd.RawOutputStream(
+                            samplerate=sample_rate,
+                            channels=channels,
+                            dtype='int16',
+                        )
+                        output_stream.start()
+                    
+                    if output_stream:
+                        try:
+                            output_stream.write(audio_frame.pcm_data)
+                        except Exception as write_error:
+                            self.logger.log(f"Audio playback error: {write_error}", "ERROR")
+                            break
+            
+            except Exception as e:
+                self.logger.log(f"Audio streaming error: {str(e)}", "ERROR")
+            
+            finally:
+                try:
+                    if 'output_stream' in locals() and output_stream:
+                        output_stream.stop()
+                        output_stream.close()
+                except Exception:
+                    pass
+        
+        audio_thread = threading.Thread(target=receive_audio_data, daemon=True)
+        audio_thread.start()
     
     def process_remote_sensor_data(self, sensor_data):
         """Process received sensor data and add to local sensors"""
@@ -368,6 +440,7 @@ class StreamController(QObject):
             self.current_stream_name = ""
             self.current_stream_password = ""
             self.current_client_name = ""
+            self.current_request_audio = False
             
             self.logger.log(f"Disconnected from stream: {stream_name}", "INFO")
             self.stream_disconnected.emit()
@@ -397,6 +470,7 @@ class StreamController(QObject):
             self.current_stream_options = {
                 'enable_sensors': True,
                 'enable_video': True,
+                'enable_audio': False,
                 'enable_remote_control': False
             }
             
@@ -417,41 +491,31 @@ class StreamController(QObject):
         # Update the remote DAQ button text to show status
         if hasattr(self, 'remote_container') and self.remote_container:
             if self.is_master:
-                self.remote_container.setStyleSheet("""
-                    QFrame { 
-                        border: 2px solid #4CAF50; 
-                        border-radius: 8px; 
-                        background-color: rgba(76, 175, 80, 0.1); 
-                    }
-                    QFrame:hover { 
-                        background-color: rgba(76, 175, 80, 0.2); 
-                        border: 2px solid #45a049; 
-                    }
-                """)
+                self.remote_container.setStyleSheet(CardStyles.device_card(connected=True))
             elif self.is_client:
-                self.remote_container.setStyleSheet("""
-                    QFrame { 
-                        border: 2px solid #2196F3; 
-                        border-radius: 8px; 
-                        background-color: rgba(33, 150, 243, 0.1); 
-                    }
-                    QFrame:hover { 
-                        background-color: rgba(33, 150, 243, 0.2); 
-                        border: 2px solid #1976D2; 
-                    }
+                # Use a blue version for client mode - similar to status("info") but matching device_card layout
+                base_bottom = "rgba(35, 35, 55, 0.85)"
+                self.remote_container.setStyleSheet(f"""
+                    QFrame {{
+                        background: qlineargradient(x1:0, y1:0, x2:0.5, y2:1,
+                            stop:0 rgba(33, 150, 243, 0.2),
+                            stop:1 {base_bottom});
+                        border-radius: 12px;
+                        border: 2px solid {COLORS.INFO};
+                    }}
+                    QFrame:hover {{
+                        background: qlineargradient(x1:0, y1:0, x2:0.5, y2:1,
+                            stop:0 rgba(33, 150, 243, 0.3),
+                            stop:1 rgba(45, 45, 75, 0.95));
+                        border: 2px solid {COLORS.INFO_BRIGHT};
+                    }}
+                    QLabel {{
+                        background: transparent;
+                        border: none;
+                    }}
                 """)
             else:
-                self.remote_container.setStyleSheet("""
-                    QFrame { 
-                        border: 2px solid #999; 
-                        border-radius: 8px; 
-                        background-color: transparent; 
-                    }
-                    QFrame:hover { 
-                        background-color: rgba(200, 200, 200, 0.3); 
-                        border: 2px solid #777; 
-                    }
-                """)
+                self.remote_container.setStyleSheet(CardStyles.device_card(connected=False))
         
         # Update main window status bar with prominent indicator
         if hasattr(self.main_window, 'statusBar'):
@@ -495,12 +559,13 @@ else:
 class DAQServiceServicer(DAQServiceBase):
     """gRPC service implementation for DAQ streaming"""
     
-    def __init__(self, main_window, stream_name, password):
+    def __init__(self, main_window, stream_name, password, enable_audio=False):
         self.main_window = main_window
         self.stream_name = stream_name
         self.password = password
         self.connected_clients = {}
         self.logger = Logger("DAQServiceServicer")
+        self.enable_audio = enable_audio
     
     def ConnectToStream(self, request, context):
         """Handle client connection requests"""
@@ -516,7 +581,8 @@ class DAQServiceServicer(DAQServiceBase):
             "name": request.client_name,
             "connected_at": time.time(),
             "request_sensors": request.request_sensors,
-            "request_video": request.request_video
+            "request_video": request.request_video,
+            "request_audio": getattr(request, "request_audio", False)
         }
         
         # Get available sensors
@@ -535,16 +601,18 @@ class DAQServiceServicer(DAQServiceBase):
                     color=sensor.color
                 ))
         
-        # Check if video is available
+        # Check if video/audio are available
         video_available = hasattr(self.main_window, 'camera_controller') and \
                          self.main_window.camera_controller.is_connected
+        audio_available = bool(self.enable_audio)
         
         return daq_service_pb2.ConnectResponse(
             success=True,
             message="Connected successfully",
             session_id=client_id,
             available_sensors=available_sensors,
-            video_available=video_available
+            video_available=video_available,
+            audio_available=audio_available
         )
     
     def StreamSensorData(self, request, context):
@@ -582,6 +650,59 @@ class DAQServiceServicer(DAQServiceBase):
                     )
             time.sleep(0.033)  # ~30 FPS
 
+    def StreamAudio(self, request, context):
+        """Stream audio data (PCM) to clients when enabled"""
+        if not self.enable_audio:
+            self.logger.log("Audio streaming requested but not enabled on server", "WARNING")
+            return
+        
+        try:
+            try:
+                import sounddevice as sd
+            except ImportError:
+                self.logger.log("sounddevice not available; cannot stream audio", "ERROR")
+                return
+            
+            sample_rate = 44100
+            channels = 1
+            blocksize = 1024
+            audio_queue = queue.Queue(maxsize=10)
+            
+            def audio_callback(indata, frames, time_info, status):
+                try:
+                    # Ensure we push a copy (int16) to the queue
+                    audio_queue.put_nowait(indata.copy())
+                except queue.Full:
+                    # Drop if clients cannot keep up
+                    pass
+            
+            with sd.InputStream(
+                samplerate=sample_rate,
+                channels=channels,
+                dtype='int16',
+                blocksize=blocksize,
+                callback=audio_callback
+            ):
+                while context.is_active():
+                    try:
+                        chunk = audio_queue.get(timeout=1.0)
+                    except queue.Empty:
+                        continue
+                    
+                    try:
+                        yield daq_service_pb2.AudioFrame(
+                            pcm_data=chunk.tobytes(),
+                            timestamp=int(time.time() * 1000),
+                            sample_rate=sample_rate,
+                            channels=channels
+                        )
+                    except Exception as e:
+                        self.logger.log(f"Error yielding audio chunk: {e}", "ERROR")
+                        break
+        
+        except Exception as e:
+            self.logger.log(f"Audio streaming error: {str(e)}", "ERROR")
+
 
 class StreamConnectionDialog(QDialog):
     """User-friendly dialog for stream connections"""
@@ -589,9 +710,13 @@ class StreamConnectionDialog(QDialog):
     def __init__(self, stream_controller):
         super().__init__()
         self.stream_controller = stream_controller
-        self.setWindowTitle("Remote DAQ Connection")
+        self.setWindowTitle("Remote DAQ (gRPC over LAN)")
         self.setModal(True)
         self.resize(500, 400)
+        
+        # Apply dark dialog style
+        from app.ui.theme import DialogStyles
+        self.setStyleSheet(DialogStyles.dark_dialog())
         
         self.setup_ui()
         self.update_ui_from_stream_status()
@@ -599,6 +724,12 @@ class StreamConnectionDialog(QDialog):
     def setup_ui(self):
         """Setup the dialog UI"""
         layout = QVBoxLayout()
+        
+        # Clarify connection scope up front
+        scope_label = QLabel("Remote DAQ uses gRPC for local/LAN connections. Internet access requires a secure tunnel (e.g., VPN or SSH port forward) and is not the default use case.")
+        scope_label.setWordWrap(True)
+        scope_label.setStyleSheet("color: #f5c542; background-color: rgba(245, 197, 66, 0.1); border: 1px solid #f5c542; border-radius: 6px; padding: 8px; font-weight: bold;")
+        layout.addWidget(scope_label)
         
         # Create tab widget
         tab_widget = QTabWidget()
@@ -619,6 +750,7 @@ class StreamConnectionDialog(QDialog):
         
         # Current stream info display
         self.stream_info_group = QGroupBox("Current Stream Status")
+        self.stream_info_group.setStyleSheet(GroupBoxStyles.default())
         self.stream_info_layout = QVBoxLayout()
         
         self.stream_status_label = QLabel("No active stream")
@@ -647,6 +779,7 @@ class StreamConnectionDialog(QDialog):
         
         # Stream settings group
         settings_group = QGroupBox("Stream Settings")
+        settings_group.setStyleSheet(GroupBoxStyles.default())
         settings_layout = QFormLayout()
         
         self.stream_name_edit = QLineEdit()
@@ -668,6 +801,7 @@ class StreamConnectionDialog(QDialog):
         
         # Options group
         options_group = QGroupBox("Stream Options")
+        options_group.setStyleSheet(GroupBoxStyles.default())
         options_layout = QVBoxLayout()
         
         self.enable_sensors_check = QCheckBox("Stream Sensor Data")
@@ -678,6 +812,10 @@ class StreamConnectionDialog(QDialog):
         self.enable_video_check.setChecked(True)
         options_layout.addWidget(self.enable_video_check)
         
+        self.enable_audio_check = QCheckBox("Stream Audio (PCM)")
+        self.enable_audio_check.setChecked(False)
+        options_layout.addWidget(self.enable_audio_check)
+        
 
         
         options_group.setLayout(options_layout)
@@ -685,39 +823,13 @@ class StreamConnectionDialog(QDialog):
         
         # Start button
         self.start_stream_btn = QPushButton("Start Streaming")
-        self.start_stream_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                border: none;
-                padding: 15px;
-                font-size: 16px;
-                border-radius: 8px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-        """)
+        self.start_stream_btn.setStyleSheet(ButtonStyles.success("large"))
         self.start_stream_btn.clicked.connect(self.start_streaming)
         layout.addWidget(self.start_stream_btn)
         
         # Stop button
         self.stop_stream_btn = QPushButton("Stop Streaming")
-        self.stop_stream_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #f44336;
-                color: white;
-                border: none;
-                padding: 15px;
-                font-size: 16px;
-                border-radius: 8px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #da190b;
-            }
-        """)
+        self.stop_stream_btn.setStyleSheet(ButtonStyles.danger("large"))
         self.stop_stream_btn.clicked.connect(self.stop_streaming)
         self.stop_stream_btn.setEnabled(False)
         layout.addWidget(self.stop_stream_btn)
@@ -735,6 +847,7 @@ class StreamConnectionDialog(QDialog):
         
         # Connection settings group
         connection_group = QGroupBox("Connection Settings")
+        connection_group.setStyleSheet(GroupBoxStyles.default())
         connection_layout = QFormLayout()
         
         self.master_address_edit = QLineEdit()
@@ -759,6 +872,7 @@ class StreamConnectionDialog(QDialog):
         
         # Data options group
         data_group = QGroupBox("Data Options")
+        data_group.setStyleSheet(GroupBoxStyles.default())
         data_layout = QVBoxLayout()
         
         self.request_sensors_check = QCheckBox("Receive Sensor Data")
@@ -769,44 +883,22 @@ class StreamConnectionDialog(QDialog):
         self.request_video_check.setChecked(True)
         data_layout.addWidget(self.request_video_check)
         
+        self.request_audio_check = QCheckBox("Receive Audio Stream")
+        self.request_audio_check.setChecked(False)
+        data_layout.addWidget(self.request_audio_check)
+        
         data_group.setLayout(data_layout)
         layout.addWidget(data_group)
         
         # Connect button
         self.connect_btn = QPushButton("Connect to Stream")
-        self.connect_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2196F3;
-                color: white;
-                border: none;
-                padding: 15px;
-                font-size: 16px;
-                border-radius: 8px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #1976D2;
-            }
-        """)
+        self.connect_btn.setStyleSheet(ButtonStyles.info("large"))
         self.connect_btn.clicked.connect(self.connect_to_stream)
         layout.addWidget(self.connect_btn)
         
         # Disconnect button
         self.disconnect_btn = QPushButton("Disconnect")
-        self.disconnect_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #FF9800;
-                color: white;
-                border: none;
-                padding: 15px;
-                font-size: 16px;
-                border-radius: 8px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #F57C00;
-            }
-        """)
+        self.disconnect_btn.setStyleSheet(ButtonStyles.warning("large"))
         self.disconnect_btn.clicked.connect(self.disconnect_from_stream)
         self.disconnect_btn.setEnabled(False)
         layout.addWidget(self.disconnect_btn)
@@ -824,6 +916,7 @@ class StreamConnectionDialog(QDialog):
         help_text.setReadOnly(True)
         help_text.setHtml("""
         <h2>Remote DAQ Connection Help</h2>
+        <p><b>Network scope:</b> Remote DAQ runs over gRPC and is designed for local networks (LAN/VPN). Direct internet use is not typical — if required, place the connection inside a secure tunnel such as VPN or SSH port forwarding.</p>
         
         <h3>Master Mode (Start Streaming)</h3>
         <p><b>Purpose:</b> Share your DAQ data and video with others in real-time.</p>
@@ -831,13 +924,15 @@ class StreamConnectionDialog(QDialog):
             <li><b>Stream Name:</b> Choose a descriptive name for your experiment (e.g., "Temperature Study Lab 3")</li>
             <li><b>Password:</b> Protect your stream with a strong password</li>
             <li><b>Description:</b> Explain what you're measuring and any important details</li>
-            <li><b>Stream Options:</b> Choose what to share (sensors, video, remote control)</li>
+            <li><b>Stream Options:</b> Choose what to share (sensors, video, audio)</li>
+            <li><b>Network:</b> Run on a local/VPN address (e.g., 192.168.x.x or 10.x.x.x). For internet access, configure a VPN or SSH tunnel first.</li>
         </ul>
         
         <h4>Master Mode Capabilities:</h4>
         <ul>
             <li><b>Real-time Sensor Data:</b> Stream live readings from all connected sensors (Arduino, LabJack, NDI, etc.)</li>
             <li><b>Live Video Feed:</b> Share camera feed with overlays, motion detection, and recording status</li>
+            <li><b>Audio Streaming:</b> Stream audio (PCM format) from your system's microphone or audio input to connected clients</li>
             <li><b>Multi-client Support:</b> Multiple people can connect to your stream simultaneously</li>
             <li><b>Secure Access:</b> Password protection for stream access</li>
         </ul>
@@ -849,12 +944,14 @@ class StreamConnectionDialog(QDialog):
             <li><b>Stream Name:</b> Name of the stream you want to connect to</li>
             <li><b>Password:</b> Password provided by the stream owner</li>
             <li><b>Your Name:</b> Your name (will be shown to the stream owner for identification)</li>
+            <li><b>Connectivity:</b> Connect on the same LAN/VPN. If you must connect over the internet, first establish a secure tunnel (VPN/SSH) to the remote network.</li>
         </ul>
         
         <h4>Client Mode Capabilities:</h4>
         <ul>
             <li><b>Live Data Monitoring:</b> View real-time sensor readings in tables and graphs</li>
             <li><b>Video Observation:</b> Watch live video feed from the experiment</li>
+            <li><b>Audio Reception:</b> Receive and play back audio stream from the master system (requires sounddevice package)</li>
             <li><b>Data Analysis:</b> Use all local analysis tools on remote sensor data</li>
             <li><b>Remote Sensors:</b> Remote sensors appear in red in the sensor list for easy identification</li>
             <li><b>Multi-stream Support:</b> Connect to multiple experiments simultaneously</li>
@@ -865,7 +962,7 @@ class StreamConnectionDialog(QDialog):
             <li><b>Password Protection:</b> All streams require authentication</li>
             <li><b>View-only Access:</b> Clients can only view data, ensuring experiment safety</li>
             <li><b>Connection Logging:</b> Master can see who is connected to their stream</li>
-            <li><b>Network Security:</b> Uses gRPC with TLS encryption for secure data transmission</li>
+            <li><b>Network Security:</b> Designed for trusted LAN/VPN use. For internet access, place the connection behind VPN/SSH tunnels and follow your firewall policies.</li>
         </ul>
         
         
@@ -885,6 +982,7 @@ class StreamConnectionDialog(QDialog):
             <li><b>No Data Received:</b> Verify stream is running, password is correct, and sensors are active</li>
             <li><b>Slow Performance:</b> Reduce video quality, disable video streaming, or check network bandwidth</li>
             <li><b>Video Issues:</b> Ensure camera is connected and working on master system</li>
+            <li><b>Audio Issues:</b> Verify sounddevice package is installed, check audio input device is available, and ensure audio streaming is enabled in stream options</li>
             <li><b>Sensor Data Missing:</b> Check if sensors are connected and streaming is enabled for those sensors</li>
         </ul>
         
@@ -893,6 +991,8 @@ class StreamConnectionDialog(QDialog):
             <li><b>Protocol:</b> Uses gRPC for efficient, bidirectional communication</li>
             <li><b>Data Format:</b> Sensor data transmitted as structured messages with timestamps</li>
             <li><b>Video Format:</b> Raw video frames transmitted for minimal latency</li>
+            <li><b>Audio Format:</b> PCM audio data streamed in real-time (default: 44100 Hz sample rate, mono/stereo)</li>
+            <li><b>Audio Requirements:</b> Master requires sounddevice package for audio capture; Client requires sounddevice for audio playback</li>
             <li><b>Port:</b> Default gRPC port 50051 (configurable)</li>
             <li><b>Compatibility:</b> Works with any DAQ system using the same protocol</li>
         </ul>
@@ -924,7 +1024,8 @@ class StreamConnectionDialog(QDialog):
             password=password,
             description=description,
             enable_sensors=self.enable_sensors_check.isChecked(),
-            enable_video=self.enable_video_check.isChecked()
+            enable_video=self.enable_video_check.isChecked(),
+            enable_audio=self.enable_audio_check.isChecked()
         )
         
         if success:
@@ -978,7 +1079,8 @@ class StreamConnectionDialog(QDialog):
             password=password,
             client_name=client_name,
             request_sensors=self.request_sensors_check.isChecked(),
-            request_video=self.request_video_check.isChecked()
+            request_video=self.request_video_check.isChecked(),
+            request_audio=self.request_audio_check.isChecked()
         )
         
         if success:
@@ -1009,7 +1111,8 @@ class StreamConnectionDialog(QDialog):
             # Add options info
             options = controller.current_stream_options
             details += f"Sensors: {'✓' if options['enable_sensors'] else '✗'}, "
-            details += f"Video: {'✓' if options['enable_video'] else '✗'}"
+            details += f"Video: {'✓' if options['enable_video'] else '✗'}, "
+            details += f"Audio: {'✓' if options.get('enable_audio', False) else '✗'}"
             
             self.stream_details_label.setText(details)
             
@@ -1025,6 +1128,7 @@ class StreamConnectionDialog(QDialog):
             # Set checkboxes
             self.enable_sensors_check.setChecked(controller.current_stream_options['enable_sensors'])
             self.enable_video_check.setChecked(controller.current_stream_options['enable_video'])
+            self.enable_audio_check.setChecked(controller.current_stream_options.get('enable_audio', False))
             
         # Check if we're connected as client
         elif controller.is_client:
@@ -1034,7 +1138,8 @@ class StreamConnectionDialog(QDialog):
             # Show connection details
             details = f"Connected to: {controller.current_master_address}\n"
             details += f"Stream: {controller.current_stream_name}\n"
-            details += f"Name: {controller.current_client_name}"
+            details += f"Name: {controller.current_client_name}\n"
+            details += f"Audio: {'Requested' if controller.current_request_audio else 'Not requested'}"
             
             self.stream_details_label.setText(details)
             
@@ -1047,6 +1152,7 @@ class StreamConnectionDialog(QDialog):
             self.client_stream_name_edit.setText(controller.current_stream_name)
             self.client_password_edit.setText(controller.current_stream_password)
             self.client_name_edit.setText(controller.current_client_name)
+            self.request_audio_check.setChecked(controller.current_request_audio)
             
         else:
             self.stream_status_label.setText("⚪ No active stream")

@@ -64,6 +64,9 @@ class LabJackDataThread(QThread):
         """Disconnects from the LabJack device."""
         print("DEBUG LabJackThread: Disconnect called.")
         self.stop() # Signal the run loop to stop
+        if self.isRunning():
+            # Wait briefly for the run loop to exit to avoid concurrent access on reconnect
+            self.wait(2000)
         if self._labjack_interface and self._connected:
             try:
                 self._labjack_interface.disconnect()
@@ -96,14 +99,31 @@ class LabJackDataThread(QThread):
         self._running = True
         self._stop_event.clear()
         
-        read_interval = 1.0 / self._sampling_rate if self._sampling_rate > 0 else 1.0 # seconds
-
         while not self._stop_event.is_set():
+            # Calculate interval inside the loop so it responds to changes
+            read_interval = 1.0 / self._sampling_rate if self._sampling_rate > 0 else 1.0 # seconds
+            
             loop_start_time = time.time()
             
-            if not self._connected or not self._labjack_interface:
-                print("DEBUG LabJackThread: Exiting run loop - not connected or no interface.") # Added exit reason
-                break # Exit loop if disconnected or interface lost
+            if not self._labjack_interface:
+                print("DEBUG LabJackThread: Exiting run loop - no interface.")
+                break
+
+            # Handle reconnection if needed
+            if not self._connected or not self._labjack_interface.is_connected():
+                if getattr(self._labjack_interface, 'auto_reconnect', False):
+                    print("DEBUG LabJackThread: Connection lost, attempting reconnect...")
+                    if self._labjack_interface.connect():
+                        self._connected = True
+                        print("DEBUG LabJackThread: Reconnected successfully.")
+                        self.connection_status_signal.emit(True, "Reconnected successfully")
+                    else:
+                        # Wait a bit before next attempt
+                        self._stop_event.wait(5.0)
+                        continue
+                else:
+                    print("DEBUG LabJackThread: Exiting run loop - not connected.")
+                    break
 
             try:
                 # --- Read Data ---
@@ -117,7 +137,7 @@ class LabJackDataThread(QThread):
                         data['timestamp'] = time.time()
                     
                     # --- ADDED: Log before emit --- 
-                    print(f"DEBUG LabJackThread: Emitting data_received_signal with keys: {list(data.keys())}")
+                    # print(f"DEBUG LabJackThread: Emitting data_received_signal with keys: {list(data.keys())}")
                     self.data_received_signal.emit(data)
                     # -----------------------------
                 # else: # Optional: Log when no data is read

@@ -7,16 +7,27 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
                            QToolButton, QAbstractItemView)
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QPixmap, QColor, QIcon, QPainter
+from PyQt6.QtMultimediaWidgets import QVideoWidget
 import pyqtgraph as pyqtgraph
 from PyQt6.QtGui import QStandardItemModel
 import cv2
 import os
 import sys
+import numpy as np
 
 # Import the collapsible box
 from app.ui.collapsible_box import CollapsibleBox
 # Import timelapse utility
 from app.utils.timelapse_utils import show_timelapse_dialog
+# Import data flow widget
+from app.ui.data_flow_widget import DataFlowWidget
+# Import theme system
+from app.ui.theme import (
+    COLORS, SidebarTheme, ButtonStyles, ConnectionStyles,
+    StatusIndicator, StatusText, GroupBoxStyles, GraphStyles,
+    TableStyles, CardStyles, TabStyles, Typography,
+    InputStyles, ScrollStyles, create_shadow_effect, get_status_color
+)
 
 # Import version from app module
 from app import __version__
@@ -31,121 +42,264 @@ def resource_path(relative_path):
 
     return os.path.join(base_path, relative_path)
 
+class DashMetricCard(QFrame):
+    """A compact card for displaying a single sensor's current value on the dashboard"""
+    def __init__(self, sensor_name, unit, color="#fff", parent=None):
+        super().__init__(parent)
+        self.sensor_name = sensor_name
+        self.unit = unit
+        self.accent_color = color
+        
+        self.setStyleSheet(CardStyles.metric_card(color))
+        self.setMinimumHeight(80)
+        self.setMaximumHeight(100)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(2)
+        
+        # Name and trend
+        name_layout = QHBoxLayout()
+        self.name_label = QLabel(sensor_name)
+        self.name_label.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 14px; font-weight: bold;")
+        name_layout.addWidget(self.name_label)
+        
+        name_layout.addStretch()
+        
+        self.trend_label = QLabel("")
+        self.trend_label.setStyleSheet("font-size: 14px;")
+        name_layout.addWidget(self.trend_label)
+        
+        layout.addLayout(name_layout)
+        
+        # Value and unit
+        value_layout = QHBoxLayout()
+        value_layout.setAlignment(Qt.AlignmentFlag.AlignBottom)
+        self.value_label = QLabel("---")
+        self.value_label.setStyleSheet(f"color: {COLORS.TEXT_PRIMARY}; font-size: 22px; font-weight: 800;")
+        value_layout.addWidget(self.value_label)
+        
+        self.unit_label = QLabel(unit)
+        self.unit_label.setStyleSheet(f"color: {COLORS.TEXT_MUTED}; font-size: 11px; margin-bottom: 4px;")
+        value_layout.addWidget(self.unit_label)
+        
+        value_layout.addStretch()
+        layout.addLayout(value_layout)
+        
+        # Min/Max summary
+        self.stats_label = QLabel("Min: -- | Max: --")
+        self.stats_label.setStyleSheet(f"color: {COLORS.TEXT_MUTED}; font-size: 9px;")
+        layout.addWidget(self.stats_label)
+        
+        self.history = [] # Buffer for smoothing trend
+        self.window_size = 5 # Default, will be updated from config
+        self.min_val = float('inf')
+        self.max_val = float('-inf')
+
+    def set_window_size(self, size):
+        self.window_size = max(1, size)
+
+    def update_value(self, value):
+        if value is None:
+            return
+            
+        try:
+            val_float = float(value)
+            if np.isnan(val_float):
+                self.value_label.setText("---")
+                self.trend_label.setText("")
+                return
+
+            # Update history for smoothing
+            self.history.append(val_float)
+            if len(self.history) > self.window_size * 2:
+                self.history.pop(0)
+            
+            # Calculate trend based on windows if we have enough data
+            if len(self.history) >= self.window_size * 2:
+                recent_avg = np.mean(self.history[-self.window_size:])
+                previous_avg = np.mean(self.history[-self.window_size*2:-self.window_size])
+                
+                if recent_avg > previous_avg + 0.0001:
+                    self.trend_label.setText("↑")
+                    self.trend_label.setStyleSheet(f"color: {COLORS.ERROR}; font-weight: bold; font-size: 16px;")
+                elif recent_avg < previous_avg - 0.0001:
+                    self.trend_label.setText("↓")
+                    self.trend_label.setStyleSheet(f"color: {COLORS.SUCCESS}; font-weight: bold; font-size: 16px;")
+                else:
+                    self.trend_label.setText("→")
+                    self.trend_label.setStyleSheet("color: #888; font-size: 16px;")
+            elif len(self.history) > 1:
+                # Initial trend if history is still filling
+                if val_float > self.history[-2] + 0.0001:
+                    self.trend_label.setText("↑")
+                    self.trend_label.setStyleSheet(f"color: {COLORS.ERROR}; font-weight: bold; font-size: 16px;")
+                elif val_float < self.history[-2] - 0.0001:
+                    self.trend_label.setText("↓")
+                    self.trend_label.setStyleSheet(f"color: {COLORS.SUCCESS}; font-weight: bold; font-size: 16px;")
+                else:
+                    self.trend_label.setText("→")
+                    self.trend_label.setStyleSheet("color: #888; font-size: 16px;")
+            
+            self.value_label.setText(f"{val_float:.3f}")
+            
+            # Update min/max
+            if val_float < self.min_val: self.min_val = val_float
+            if val_float > self.max_val: self.max_val = val_float
+            
+            self.stats_label.setText(f"Min: {self.min_val:.2f} | Max: {self.max_val:.2f}")
+            
+        except (ValueError, TypeError):
+            self.value_label.setText(str(value))
+
 def setup_ui(self):
     """Set up the main user interface"""
-    # Create central widget
+    # Create central widget with dark background
     central_widget = QWidget()
+    central_widget.setStyleSheet(f"background-color: {COLORS.BG_DARK};")
     self.setCentralWidget(central_widget)
     main_layout = QHBoxLayout(central_widget)
-    main_layout.setSpacing(10)
-    main_layout.setContentsMargins(10, 10, 10, 10)
+    main_layout.setSpacing(12)
+    main_layout.setContentsMargins(12, 12, 12, 12)
 
     # Left sidebar
     sidebar = QWidget()
-    sidebar.setFixedWidth(250)
+    sidebar.setFixedWidth(SidebarTheme.WIDTH)
+    self.sidebar = sidebar
     
-    # Create shadow effect for sidebar
-    shadow = QGraphicsDropShadowEffect()
-    shadow.setBlurRadius(15)
-    shadow.setColor(QColor(0, 0, 0, 80))
-    shadow.setOffset(3, 3)
-    sidebar.setGraphicsEffect(shadow)
+    # Note: Shadow effect removed to prevent layout jitter on hover
+    # The sidebar gradient provides enough visual separation
     
-    sidebar.setStyleSheet(f"""
-        QWidget {{
-            background: qradialgradient(cx:0.5, cy:0.3, radius:0.8, fx:0.5, fy:0.3,
-                                      stop:0 #3A0663, stop:0.6 #28043D, stop:1 #1A022A);
-            border-radius: 10px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }}
-        QLabel {{
-            border: none;
+    # Apply sidebar theme
+    sidebar.setStyleSheet(SidebarTheme.CONTAINER)
+    sidebar_layout = QVBoxLayout(sidebar)
+    sidebar_layout.setSpacing(2)
+    sidebar_layout.setContentsMargins(0, 10, 0, 20)
+
+    # Sidebar toggle button
+    self.sidebar_collapsed = False
+    toggle_container = QHBoxLayout()
+    toggle_container.setContentsMargins(5, 5, 10, 5)
+    toggle_container.addStretch()
+    self.sidebar_toggle_btn = QPushButton("«")
+    self.sidebar_toggle_btn.setFixedSize(30, 30)
+    self.sidebar_toggle_btn.setToolTip("Collapse Sidebar")
+    self.sidebar_toggle_btn.setStyleSheet(f"""
+        QPushButton {{
             background: transparent;
+            color: {COLORS.TEXT_SECONDARY};
+            border: 1px solid {COLORS.BORDER_DEFAULT};
+            border-radius: 15px;
+            font-size: 16px;
+            font-weight: bold;
+        }}
+        QPushButton:hover {{
+            background: {COLORS.BG_ELEVATED};
+            color: {COLORS.TEXT_PRIMARY};
+            border-color: {COLORS.PRIMARY};
         }}
     """)
-    sidebar_layout = QVBoxLayout(sidebar)
-    sidebar_layout.setSpacing(1)
-    sidebar_layout.setContentsMargins(0, 20, 0, 20)
+    toggle_container.addWidget(self.sidebar_toggle_btn)
+    sidebar_layout.addLayout(toggle_container)
+
+    # Compact label for collapsed state (shows "A" for Artefakt)
+    self.collapsed_title_label = QLabel("A")
+    self.collapsed_title_label.setStyleSheet(f"""
+        QLabel {{
+            color: {COLORS.TEXT_PRIMARY};
+            font-size: 24px;
+            font-weight: bold;
+            background: transparent;
+            padding: 8px 0px;
+        }}
+    """)
+    self.collapsed_title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    self.collapsed_title_label.setVisible(False)  # Hidden by default (expanded state)
+    sidebar_layout.addWidget(self.collapsed_title_label)
 
     # Program name (Artefakt)
-    program_name_text = QLabel("Artefakt")
-    program_name_text.setStyleSheet("""
-        font-size: 24px;
-        font-weight: bold;
-        color: rgba(255, 255, 255, 0.9);
-        background: transparent;
-    """)
-    program_name_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    sidebar_layout.addWidget(program_name_text)
+    self.program_name_text = QLabel("Artefakt")
+    self.program_name_text.setStyleSheet(SidebarTheme.TITLE)
+    self.program_name_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    sidebar_layout.addWidget(self.program_name_text)
     
     # Version text without logo
-    version_text = QLabel(f"DAQ <span style='font-size: 14px;'>v{__version__}</span>")
-    version_text.setStyleSheet("""
-        font-size: 18px;
-        font-weight: bold;
-        color: rgba(255, 255, 255, 0.7);
-        background: transparent;
-    """)
-    version_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    sidebar_layout.addWidget(version_text)
+    self.version_text = QLabel(f"DAQ <span style='font-size: 12px;'>v{__version__}</span>")
+    self.version_text.setStyleSheet(SidebarTheme.VERSION)
+    self.version_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    sidebar_layout.addWidget(self.version_text)
     
     # Add vertical spacing after the version text
-    vertical_spacer = QSpacerItem(20, 15, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
-    sidebar_layout.addItem(vertical_spacer)
+    self.sidebar_v_spacer1 = QSpacerItem(20, 15, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+    sidebar_layout.addItem(self.sidebar_v_spacer1)
     
     # Add separator
-    separator = QFrame()
-    separator.setFrameShape(QFrame.Shape.HLine)
-    separator.setStyleSheet("background-color: rgba(255, 255, 255, 0.1); margin: 10px 30px;")
-    sidebar_layout.addWidget(separator)
+    self.sidebar_separator1 = QFrame()
+    self.sidebar_separator1.setFrameShape(QFrame.Shape.HLine)
+    self.sidebar_separator1.setStyleSheet(SidebarTheme.SEPARATOR)
+    sidebar_layout.addWidget(self.sidebar_separator1)
     
-    # Project status section
-    project_status_container = QWidget()
-    project_status_container.setStyleSheet("background: transparent; border: none;")
-    project_status_layout = QVBoxLayout(project_status_container)
-    project_status_layout.setContentsMargins(20, 5, 20, 5)
+    # Project status section - compact, no visible box
+    self.project_status_container = QWidget()
+    self.project_status_container.setStyleSheet(SidebarTheme.STATUS_CONTAINER)
+    project_status_layout = QVBoxLayout(self.project_status_container)
+    project_status_layout.setContentsMargins(5, 0, 5, 0)
+    project_status_layout.setSpacing(1)
     
     # Project status label
     project_status_label = QLabel("Project Status")
-    project_status_label.setStyleSheet("""
-        font-size: 14px;
-        font-weight: bold;
-        color: white;
-        background: transparent;
-    """)
+    project_status_label.setStyleSheet(SidebarTheme.STATUS_LABEL)
     project_status_layout.addWidget(project_status_label)
+    
+    # Common style for labels (fixed width for alignment)
+    label_style = "color: rgba(255, 255, 255, 0.5); font-size: 11px; background: transparent;"
+    value_style_green = f"color: {COLORS.SUCCESS}; font-size: 11px; background: transparent;"
+    value_style_warning = f"color: {COLORS.WARNING}; font-size: 11px; background: transparent;"
+    label_width = 100  # Fixed width for alignment (more space for labels)
     
     # Project name
     project_name_layout = QHBoxLayout()
-    project_name_layout.addWidget(QLabel("Project:      "))
+    project_name_layout.setSpacing(4)
+    project_label = QLabel("Project:")
+    project_label.setFixedWidth(label_width)
+    project_label.setStyleSheet(label_style)
+    project_name_layout.addWidget(project_label)
     self.sidebar_project_name = QLabel("None")
-    self.sidebar_project_name.setStyleSheet("color: #4CAF50;")  # Green color
+    self.sidebar_project_name.setStyleSheet(value_style_green)
     project_name_layout.addWidget(self.sidebar_project_name, 1)
     project_status_layout.addLayout(project_name_layout)
     
     # Test series name
     test_series_layout = QHBoxLayout()
-    test_series_layout.addWidget(QLabel("Test Series:"))
+    test_series_layout.setSpacing(4)
+    series_label = QLabel("Test Series:")
+    series_label.setFixedWidth(label_width)
+    series_label.setStyleSheet(label_style)
+    test_series_layout.addWidget(series_label)
     self.sidebar_test_series = QLabel("None")
-    self.sidebar_test_series.setStyleSheet("color: #4CAF50;")  # Green color
+    self.sidebar_test_series.setStyleSheet(value_style_green)
     test_series_layout.addWidget(self.sidebar_test_series, 1)
     project_status_layout.addLayout(test_series_layout)
     
     # Ready status
     ready_layout = QHBoxLayout()
-    ready_layout.addWidget(QLabel("Run Status:"))
+    ready_layout.setSpacing(4)
+    ready_label = QLabel("Run Status:")
+    ready_label.setFixedWidth(label_width)
+    ready_label.setStyleSheet(label_style)
+    ready_layout.addWidget(ready_label)
     self.sidebar_ready_status = QLabel("Not Ready")
-    self.sidebar_ready_status.setStyleSheet("color: orange;")
+    self.sidebar_ready_status.setStyleSheet(value_style_warning)
     ready_layout.addWidget(self.sidebar_ready_status, 1)
     project_status_layout.addLayout(ready_layout)
     
-    sidebar_layout.addWidget(project_status_container)
+    sidebar_layout.addWidget(self.project_status_container)
     
     # Add separator
-    separator2 = QFrame()
-    separator2.setFrameShape(QFrame.Shape.HLine)
-    separator2.setStyleSheet("background-color: rgba(255, 255, 255, 0.1); margin: 10px 20px;")
-    sidebar_layout.addWidget(separator2)
+    self.sidebar_separator2 = QFrame()
+    self.sidebar_separator2.setFrameShape(QFrame.Shape.HLine)
+    self.sidebar_separator2.setStyleSheet(SidebarTheme.SEPARATOR)
+    sidebar_layout.addWidget(self.sidebar_separator2)
     
     # Add spacer to push controls to bottom
     sidebar_layout.addStretch()
@@ -167,35 +321,8 @@ def setup_ui(self):
     from PyQt6.QtCore import QSize
     from PyQt6.QtWidgets import QToolButton
 
-    # Create a button style specifically for tool buttons with text under icon
-    tool_button_style = """
-        QToolButton {
-            text-align: center;
-            padding: 6px 6px;
-            font-size: 13px;
-            color: white;
-            border: none;
-            border-top: 1px solid rgba(255, 255, 255, 0.05);
-            border-bottom: 1px solid rgba(0, 0, 0, 0.2);
-            background: transparent;
-            qproperty-toolButtonStyle: ToolButtonTextUnderIcon;
-        }
-        QToolButton:hover {
-            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                                      stop:0 rgba(255, 255, 255, 0.1), stop:1 rgba(255, 255, 255, 0.05));
-        }
-        QToolButton:pressed {
-            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                                      stop:0 rgba(255, 255, 255, 0.2), stop:1 rgba(255, 255, 255, 0.1));
-            border-bottom: 1px solid #60BD60;
-        }
-        QToolButton:checked {
-            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                                      stop:0 rgba(255, 255, 255, 0.15), stop:1 rgba(255, 255, 255, 0.05));
-            border-left: 3px solid #9370DB;
-            border-right: 3px solid transparent;
-        }
-    """
+    # Use navigation button style from theme
+    tool_button_style = SidebarTheme.NAV_BUTTON
 
     self.nav_buttons = []
     for button_name in nav_buttons:
@@ -206,15 +333,19 @@ def setup_ui(self):
         btn.setAutoExclusive(True)
         btn.setText(button_name)
         
+        if button_name == "Dashboard":
+            btn.setToolTip("This graph shows all active sensors that are enabled in the Sensors tab with 'Show in Graph' checked.")
+        
         # Load SVG icon and set it
         svg_path = resource_path(f"app/ui/{button_name}.svg")
         btn.setIcon(QIcon(svg_path))
-        btn.setIconSize(QSize(36, 36))
+        btn.setIconSize(QSize(32, 32))
         
         # Set the tool button style to text under icon
         btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         
-        # Ensure the button takes full width
+        # Fixed size to prevent layout recalculation on hover
+        btn.setFixedHeight(80)
         btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         
         # Add spacing between specific buttons
@@ -249,55 +380,9 @@ def setup_ui(self):
 
     self.toggle_btn = QPushButton("Start")
     
-    # Style for toggle button - start state
-    self.start_btn_style = """
-        QPushButton {
-            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                      stop:0 #A0EEA0, stop:1 #70CD70);
-            color: #003300;
-            border: none;
-            padding: 8px 15px;
-            border-radius: 5px;
-            font-weight: bold;
-            font-size: 16px;
-            border-bottom: 2px solid #60BD60;
-        }
-        QPushButton:hover {
-            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                      stop:0 #B0FFB0, stop:1 #80DD80);
-        }
-        QPushButton:pressed {
-            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                      stop:0 #80DD80, stop:1 #60BD60);
-            border-bottom: 1px solid #60BD60;
-            padding-top: 9px;
-        }
-    """
-    
-    # Style for toggle button - stop state
-    self.stop_btn_style = """
-        QPushButton {
-            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                      stop:0 #FFB6C1, stop:1 #FF8A9A);
-            color: #330000;
-            border: none;
-            padding: 8px 15px;
-            border-radius: 5px;
-            font-weight: bold;
-            font-size: 16px;
-            border-bottom: 2px solid #FF7A8A;
-        }
-        QPushButton:hover {
-            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                      stop:0 #FFC6D1, stop:1 #FF9AAA);
-        }
-        QPushButton:pressed {
-            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                      stop:0 #FF9AAA, stop:1 #FF7A8A);
-            border-bottom: 1px solid #FF7A8A;
-            padding-top: 9px;
-        }
-    """
+    # Style for toggle button - using theme system
+    self.start_btn_style = ButtonStyles.success()
+    self.stop_btn_style = ButtonStyles.danger()
     
     # Set initial style (start)
     self.toggle_btn.setStyleSheet(self.start_btn_style)
@@ -315,17 +400,125 @@ def setup_ui(self):
     sidebar_layout.addLayout(control_buttons)
     
     # Add logo image below toggle button
-    logo_label = QLabel()
+    self.logo_label = QLabel()
+    self.full_logo_pixmap = None
+    self.small_icon_pixmap = None
+    
     try:
-        logo_pixmap = QPixmap(resource_path("assets/Artefakt_logo.png"))
-        if not logo_pixmap.isNull():
-            scaled_pixmap = logo_pixmap.scaled(140, 40, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            logo_label.setPixmap(scaled_pixmap)
-            logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            logo_label.setStyleSheet("background: transparent;")
-            sidebar_layout.addWidget(logo_label)
+        # Load full logo
+        logo_paths = [
+            resource_path("assets/Evo-Labs_logo.png"),
+            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "assets", "Evo-Labs_logo.png"),
+            "assets/Evo-Labs_logo.png"
+        ]
+        for path in logo_paths:
+            if os.path.exists(path):
+                pix = QPixmap(path)
+                if not pix.isNull():
+                    self.full_logo_pixmap = pix.scaled(140, 40, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                    break
+        
+        # Load small icon
+        icon_paths = [
+            resource_path("assets/Evo-Labs_ICON.ico"),
+            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "assets", "Evo-Labs_ICON.ico"),
+            "assets/Evo-Labs_ICON.ico"
+        ]
+        for path in icon_paths:
+            if os.path.exists(path):
+                pix = QPixmap(path)
+                if not pix.isNull():
+                    self.small_icon_pixmap = pix.scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                    break
+                    
+        if self.full_logo_pixmap:
+            self.logo_label.setPixmap(self.full_logo_pixmap)
+            self.logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.logo_label.setStyleSheet("background: transparent;")
+            sidebar_layout.addWidget(self.logo_label)
     except Exception as e:
-        pass  # No fallback text - just skip the logo if it can't be loaded
+        pass
+
+    # Sidebar toggle logic
+    def toggle_sidebar():
+        self.sidebar_collapsed = not self.sidebar_collapsed
+        
+        if self.sidebar_collapsed:
+            self.sidebar.setFixedWidth(SidebarTheme.COLLAPSED_WIDTH)
+            self.sidebar_toggle_btn.setText("»")
+            self.sidebar_toggle_btn.setToolTip("Expand Sidebar")
+            self.program_name_text.setVisible(False)
+            self.version_text.setVisible(False)
+            self.sidebar_separator1.setVisible(False)
+            self.project_status_container.setVisible(False)
+            self.sidebar_separator2.setVisible(False)
+            self.collapsed_title_label.setVisible(True)  # Show compact label when collapsed
+            
+            # Switch to small icon
+            if self.small_icon_pixmap:
+                self.logo_label.setPixmap(self.small_icon_pixmap)
+                self.logo_label.setVisible(True)
+            else:
+                self.logo_label.setVisible(False)
+            
+            # Update nav buttons
+            for btn in self.nav_buttons:
+                btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+                # Adjust size for collapsed mode
+                btn.setFixedWidth(SidebarTheme.COLLAPSED_WIDTH - 10)
+                btn.setToolTip(btn.text()) # Ensure text is available as tooltip
+            
+            # Update start/stop button
+            self.toggle_btn.setToolTip(self.toggle_btn.text())
+            if self.toggle_btn.text() == "Start":
+                self.toggle_btn.setText("▶")
+            else:
+                self.toggle_btn.setText("■")
+            self.toggle_btn.setFixedWidth(SidebarTheme.COLLAPSED_WIDTH - 20)
+            # Reduce padding for collapsed mode
+            self.toggle_btn.setStyleSheet(self.toggle_btn.styleSheet() + "QPushButton { padding: 12px 2px; }")
+            
+        else:
+            self.sidebar.setFixedWidth(SidebarTheme.WIDTH)
+            self.sidebar_toggle_btn.setText("«")
+            self.sidebar_toggle_btn.setToolTip("Collapse Sidebar")
+            self.program_name_text.setVisible(True)
+            self.version_text.setVisible(True)
+            self.sidebar_separator1.setVisible(True)
+            self.project_status_container.setVisible(True)
+            self.sidebar_separator2.setVisible(True)
+            self.collapsed_title_label.setVisible(False)  # Hide compact label when expanded
+            
+            # Switch to full logo
+            if self.full_logo_pixmap:
+                self.logo_label.setPixmap(self.full_logo_pixmap)
+                self.logo_label.setVisible(True)
+            else:
+                self.logo_label.setVisible(False)
+            
+            # Update nav buttons
+            for btn in self.nav_buttons:
+                btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+                btn.setMinimumWidth(0) # Reset
+                btn.setMaximumWidth(16777215) # QWIDGETSIZE_MAX
+                btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            
+            # Update start/stop button
+            if self.toggle_btn.text() == "▶":
+                self.toggle_btn.setText("Start")
+            elif self.toggle_btn.text() == "■":
+                self.toggle_btn.setText("Stop")
+            self.toggle_btn.setMinimumWidth(0)
+            self.toggle_btn.setMaximumWidth(16777215)
+            self.toggle_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            # Reset padding by reapplying original style
+            if self.running:
+                self.toggle_btn.setStyleSheet(self.stop_btn_style)
+            else:
+                self.toggle_btn.setStyleSheet(self.start_btn_style)
+
+    self.sidebar_toggle_btn.clicked.connect(toggle_sidebar)
+    self.toggle_sidebar_func = toggle_sidebar # Store for later use if needed
 
     # Main content area
     content_area = QWidget()
@@ -338,73 +531,378 @@ def setup_ui(self):
 
     # Dashboard tab
     dashboard_tab = QWidget()
+    self.dashboard_tab = dashboard_tab
     dashboard_layout = QVBoxLayout(dashboard_tab)
+    dashboard_layout.setContentsMargins(10, 10, 10, 10)
+    dashboard_layout.setSpacing(10)
+
+    # --- NEW: Dashboard Header (Status & Project Info) ---
+    header_frame = QFrame()
+    header_frame.setStyleSheet(f"background-color: {COLORS.BG_CARD}; border-radius: 8px; border: 1px solid {COLORS.BORDER_DEFAULT};")
+    header_frame.setFixedHeight(60)
+    header_layout = QHBoxLayout(header_frame)
+    header_layout.setContentsMargins(15, 0, 15, 0)
+
+    # Status Indicators Group
+    status_layout = QHBoxLayout()
+    status_layout.setSpacing(15)
     
-    # Create a splitter to allow dragging between upper and lower parts
-    dashboard_splitter = QSplitter(Qt.Orientation.Vertical)
-    dashboard_splitter.setChildrenCollapsible(False)  # Prevent sections from being collapsed completely
+    def create_status_indicator(label_text):
+        container = QHBoxLayout()
+        led = QFrame()
+        led.setFixedSize(12, 12)
+        led.setStyleSheet(StatusIndicator.inactive(12))
+        lbl = QLabel(label_text)
+        lbl.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 11px; font-weight: bold;")
+        container.addWidget(led)
+        container.addWidget(lbl)
+        return container, led
+
+    self.status_indicators = {}
     
-    # Upper part - Dashboard graph widget
-    upper_widget = QWidget()
-    upper_layout = QVBoxLayout(upper_widget)
-    upper_layout.setContentsMargins(0, 0, 0, 0)
+    # DAQ HW Status
+    daq_cont, self.led_daq = create_status_indicator("DAQ HW")
+    tooltip_daq = "Status of Hardware Data Acquisition (Green=Active, Red=Error)"
+    daq_cont.itemAt(0).widget().setToolTip(tooltip_daq) # LED
+    daq_cont.itemAt(1).widget().setToolTip(tooltip_daq) # Text
+    status_layout.addLayout(daq_cont)
     
-    # Dashboard graph widget
-    dashboard_graph_group = QGroupBox("Sensor Overview")
-    dashboard_graph_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+    # Recording Status
+    rec_cont, self.led_recording = create_status_indicator("RECORDING")
+    tooltip_rec = "Data Recording Status (Green=Recording, Gray=Idle)"
+    rec_cont.itemAt(0).widget().setToolTip(tooltip_rec) # LED
+    rec_cont.itemAt(1).widget().setToolTip(tooltip_rec) # Text
+    status_layout.addLayout(rec_cont)
     
-    # Create a horizontal layout for the graph and controls
-    dashboard_graph_container = QHBoxLayout(dashboard_graph_group)
+    # Automation Status
+    auto_cont, self.led_automation = create_status_indicator("AUTO")
+    tooltip_auto = "Automation Sequence Status (Green=Running, Gray=Idle)"
+    auto_cont.itemAt(0).widget().setToolTip(tooltip_auto) # LED
+    auto_cont.itemAt(1).widget().setToolTip(tooltip_auto) # Text
+    status_layout.addLayout(auto_cont)
     
-    # Left side controls panel
-    dashboard_controls_panel = QVBoxLayout()
-    dashboard_controls_panel.setAlignment(Qt.AlignmentFlag.AlignTop)
-    dashboard_controls_panel.setContentsMargins(0, 10, 10, 0)
+    header_layout.addLayout(status_layout)
+    header_layout.addSpacing(30)
     
-    # Timespan label and dropdown in vertical layout
-    dashboard_controls_panel.addWidget(QLabel("Timespan:"))
+    # Project Summary info
+    project_info_layout = QHBoxLayout()
+    project_info_layout.setSpacing(20)
+    
+    def create_info_item(label, value_placeholder):
+        layout = QVBoxLayout()
+        layout.setSpacing(0)
+        lbl = QLabel(label)
+        lbl.setStyleSheet(f"color: {COLORS.TEXT_MUTED}; font-size: 10px; text-transform: uppercase;")
+        val = QLabel(value_placeholder)
+        val.setStyleSheet(f"color: {COLORS.TEXT_PRIMARY}; font-size: 13px; font-weight: bold;")
+        layout.addWidget(lbl)
+        layout.addWidget(val)
+        return layout, val
+
+    pi_layout, self.dash_project_val = create_info_item("Project", "---")
+    project_info_layout.addLayout(pi_layout)
+    
+    ts_layout, self.dash_series_val = create_info_item("Series", "---")
+    project_info_layout.addLayout(ts_layout)
+    
+    rn_layout, self.dash_run_val = create_info_item("Current Run", "---")
+    project_info_layout.addLayout(rn_layout)
+    
+    dur_layout, self.dash_duration_val = create_info_item("Duration", "00:00:00")
+    project_info_layout.addLayout(dur_layout)
+    
+    # Timespan control - formatted like duration (label above, combobox below)
+    timespan_layout = QVBoxLayout()
+    timespan_layout.setSpacing(0)
+    timespan_label = QLabel("Timespan")
+    timespan_label.setStyleSheet(f"color: {COLORS.TEXT_MUTED}; font-size: 10px; text-transform: uppercase;")
+    timespan_layout.addWidget(timespan_label)
     self.dashboard_timespan = QComboBox()
     self.dashboard_timespan.addItems(["10s", "30s", "1min", "5min", "15min", "30min", "1h", "3h", "6h", "12h", "24h", "All"])
-    self.dashboard_timespan.setCurrentText("All")  # Default to All
-    dashboard_controls_panel.addWidget(self.dashboard_timespan)
+    self.dashboard_timespan.setCurrentText("All")
+    self.dashboard_timespan.setMinimumWidth(80)
+    self.dashboard_timespan.setStyleSheet(f"color: {COLORS.TEXT_PRIMARY}; font-size: 13px; font-weight: bold;")
+    timespan_layout.addWidget(self.dashboard_timespan)
+    project_info_layout.addLayout(timespan_layout)
     
-    # Add stretch to push controls to the top
-    dashboard_controls_panel.addStretch(1)
+    header_layout.addLayout(project_info_layout)
+    header_layout.addSpacing(20)
     
-    # Add controls panel to the left side of the container
-    dashboard_graph_container.addLayout(dashboard_controls_panel)
+    # Display Options Checkboxes (arranged in two rows)
+    display_options_layout = QVBoxLayout()
+    display_options_layout.setSpacing(5)
+    display_options_layout.setContentsMargins(0, 0, 0, 0)
     
-    # Dashboard graph widget in a vertical layout
-    dashboard_graph_layout = QVBoxLayout()
+    # First row
+    first_row = QHBoxLayout()
+    first_row.setSpacing(15)
+    first_row.setContentsMargins(0, 0, 0, 0)
+    
+    self.checkbox_automation_status = QCheckBox("Automation Status\u00A0")
+    self.checkbox_automation_status.setChecked(True)
+    self.checkbox_automation_status.setStyleSheet(f"""
+        QCheckBox {{
+            color: {COLORS.TEXT_SECONDARY};
+            font-size: 11px;
+        }}
+        QCheckBox::indicator {{
+            width: 14px;
+            height: 14px;
+        }}
+    """)
+    first_row.addWidget(self.checkbox_automation_status)
+    
+    self.checkbox_recent_events = QCheckBox("Recent System Events")
+    self.checkbox_recent_events.setChecked(True)
+    self.checkbox_recent_events.setStyleSheet(f"""
+        QCheckBox {{
+            color: {COLORS.TEXT_SECONDARY};
+            font-size: 11px;
+        }}
+        QCheckBox::indicator {{
+            width: 14px;
+            height: 14px;
+        }}
+    """)
+    first_row.addWidget(self.checkbox_recent_events)
+    
+    display_options_layout.addLayout(first_row)
+    
+    # Second row
+    second_row = QHBoxLayout()
+    second_row.setSpacing(15)
+    second_row.setContentsMargins(0, 0, 0, 0)
+    
+    self.checkbox_image = QCheckBox("Image")
+    self.checkbox_image.setChecked(True)
+    self.checkbox_image.setStyleSheet(f"""
+        QCheckBox {{
+            color: {COLORS.TEXT_SECONDARY};
+            font-size: 11px;
+        }}
+        QCheckBox::indicator {{
+            width: 14px;
+            height: 14px;
+        }}
+    """)
+    # Set maximum width to constrain the checkbox text space and ensure proper alignment
+    self.checkbox_image.setMaximumWidth(70)
+    second_row.addWidget(self.checkbox_image)
+    
+    self.checkbox_camera_preview = QCheckBox("Camera Preview")
+    self.checkbox_camera_preview.setChecked(True)
+    self.checkbox_camera_preview.setStyleSheet(f"""
+        QCheckBox {{
+            color: {COLORS.TEXT_SECONDARY};
+            font-size: 11px;
+        }}
+        QCheckBox::indicator {{
+            width: 14px;
+            height: 14px;
+        }}
+    """)
+    second_row.addWidget(self.checkbox_camera_preview)
+    
+    display_options_layout.addLayout(second_row)
+    
+    # Helper function to adjust splitter when boxes are shown/hidden
+    def adjust_splitter_for_visibility():
+        if not hasattr(self, 'dashboard_splitter') or not hasattr(self, 'lower_widget'):
+            return
+        
+        # Check if any checkbox is checked (this tells us if boxes should be visible)
+        boxes_should_be_visible = (
+            (hasattr(self, 'checkbox_automation_status') and self.checkbox_automation_status.isChecked()) or
+            (hasattr(self, 'checkbox_recent_events') and self.checkbox_recent_events.isChecked()) or
+            (hasattr(self, 'checkbox_image') and self.checkbox_image.isChecked()) or
+            (hasattr(self, 'checkbox_camera_preview') and self.checkbox_camera_preview.isChecked())
+        )
+        
+        # If no boxes should be visible, hide the lower widget and expand the upper part
+        if not boxes_should_be_visible:
+            self.lower_widget.setVisible(False)
+            # Get current total height and give it all to the upper part
+            current_sizes = self.dashboard_splitter.sizes()
+            if len(current_sizes) == 2:
+                total_height = sum(current_sizes) if sum(current_sizes) > 0 else self.dashboard_splitter.height()
+                if total_height > 0:
+                    self.dashboard_splitter.setSizes([total_height, 0])
+        else:
+            # At least one box should be visible, show the lower widget
+            self.lower_widget.setVisible(True)
+            # Restore reasonable splitter sizes
+            current_sizes = self.dashboard_splitter.sizes()
+            if len(current_sizes) == 2:
+                # If lower part is collapsed (size 0), restore default sizes
+                if current_sizes[1] == 0:
+                    total_height = current_sizes[0] if current_sizes[0] > 0 else self.dashboard_splitter.height()
+                    if total_height > 0:
+                        self.dashboard_splitter.setSizes([int(total_height * 0.6), int(total_height * 0.4)])
+    
+    # Toggle functions for display options
+    def toggle_automation_status_display(checked):
+        if hasattr(self, 'dashboard_automation_group'):
+            self.dashboard_automation_group.setVisible(checked)
+        adjust_splitter_for_visibility()
+    
+    def toggle_recent_events_display(checked):
+        if hasattr(self, 'events_group'):
+            self.events_group.setVisible(checked)
+        adjust_splitter_for_visibility()
+    
+    def toggle_image_display(checked):
+        if hasattr(self, 'dashboard_snapshot_group'):
+            self.dashboard_snapshot_group.setVisible(checked)
+        adjust_splitter_for_visibility()
+    
+    def toggle_camera_preview_display(checked):
+        if hasattr(self, 'dashboard_camera_group'):
+            self.dashboard_camera_group.setVisible(checked)
+        adjust_splitter_for_visibility()
+    
+    # Connect checkboxes to toggle functions
+    self.checkbox_automation_status.toggled.connect(toggle_automation_status_display)
+    self.checkbox_recent_events.toggled.connect(toggle_recent_events_display)
+    self.checkbox_image.toggled.connect(toggle_image_display)
+    self.checkbox_camera_preview.toggled.connect(toggle_camera_preview_display)
+    
+    header_layout.addLayout(display_options_layout)
+    header_layout.addStretch()
+    
+    # Quick Action Buttons in Header
+    header_actions = QHBoxLayout()
+    header_actions.setSpacing(8)
+    
+    self.dash_snapshot_btn = QPushButton()
+    self.dash_snapshot_btn.setToolTip("Take Snapshot")
+    self.dash_snapshot_btn.setStyleSheet(ButtonStyles.secondary("small"))
+    self.dash_snapshot_btn.setFixedSize(48, 48)
+    self.dash_snapshot_btn.setIcon(QIcon(resource_path("app/ui/Camera.svg")))
+    self.dash_snapshot_btn.setIconSize(QSize(36, 36))
+    header_actions.addWidget(self.dash_snapshot_btn)
+    
+    self.dash_note_btn = QPushButton()
+    self.dash_note_btn.setToolTip("Quick Note")
+    self.dash_note_btn.setStyleSheet(ButtonStyles.secondary("small"))
+    self.dash_note_btn.setFixedSize(48, 48)
+    self.dash_note_btn.setIcon(QIcon(resource_path("app/ui/Notes.svg")))
+    self.dash_note_btn.setIconSize(QSize(36, 36))
+    header_actions.addWidget(self.dash_note_btn)
+    
+    self.dash_settings_btn = QPushButton()
+    self.dash_settings_btn.setToolTip("Dashboard Settings")
+    self.dash_settings_btn.setStyleSheet(ButtonStyles.secondary("small"))
+    self.dash_settings_btn.setFixedSize(48, 48)
+    self.dash_settings_btn.setIcon(QIcon(resource_path("app/ui/Settings.svg")))
+    self.dash_settings_btn.setIconSize(QSize(36, 36))
+    header_actions.addWidget(self.dash_settings_btn)
+    
+    header_layout.addLayout(header_actions)
+    
+    dashboard_layout.addWidget(header_frame)
+    
+    # Main content splitter
+    self.dashboard_splitter = QSplitter(Qt.Orientation.Vertical)
+    self.dashboard_splitter.setChildrenCollapsible(False)
+    self.dashboard_splitter.setStyleSheet(f"""
+        QSplitter::handle {{
+            background-color: {COLORS.BORDER_DEFAULT};
+        }}
+        QSplitter::handle:hover {{
+            background-color: {COLORS.PRIMARY};
+        }}
+    """)
+    
+    # Upper Part: Metrics + Graph (Horizontal Splitter)
+    upper_splitter = QSplitter(Qt.Orientation.Horizontal)
+    upper_splitter.setChildrenCollapsible(True) # Allow sections to be collapsed completely (hiding metrics)
+    upper_splitter.setStyleSheet(f"""
+        QSplitter::handle {{
+            background-color: {COLORS.BORDER_DEFAULT};
+            width: 2px;
+        }}
+        QSplitter::handle:hover {{
+            background-color: {COLORS.PRIMARY};
+        }}
+    """)
+    
+    # Left side: Live Metrics Grid
+    metrics_group = QGroupBox("Live Metrics")
+    metrics_group.setStyleSheet(GroupBoxStyles.tight())
+    metrics_group.setMinimumWidth(200)
+    metrics_layout = QVBoxLayout(metrics_group)
+    
+    self.metrics_scroll = QScrollArea()
+    self.metrics_scroll.setWidgetResizable(True)
+    self.metrics_scroll.setStyleSheet("background: transparent; border: none;")
+    self.metrics_container = QWidget()
+    self.metrics_container.setStyleSheet("background: transparent;")
+    self.metrics_grid = QVBoxLayout(self.metrics_container)
+    self.metrics_grid.setContentsMargins(0, 0, 0, 0)
+    self.metrics_grid.setSpacing(8)
+    self.metrics_grid.addStretch()
+    
+    self.metrics_scroll.setWidget(self.metrics_container)
+    metrics_layout.addWidget(self.metrics_scroll)
+    
+    upper_splitter.addWidget(metrics_group)
+    
+    # Right side: Graph Area
+    graph_container_widget = QWidget()
+    graph_container_layout = QVBoxLayout(graph_container_widget)
+    graph_container_layout.setContentsMargins(0, 0, 0, 0)
+    
+    # Dashboard graph widget (Existing logic but wrapped)
+    dashboard_graph_group = QGroupBox("Sensor Overview")
+    dashboard_graph_group.setStyleSheet(GroupBoxStyles.tight())
+    dashboard_graph_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+    
+    dashboard_graph_container = QHBoxLayout(dashboard_graph_group)
+    
     self.dashboard_graph_widget = pyqtgraph.PlotWidget()
-    # Apply dark theme settings
-    self.dashboard_graph_widget.setBackground('#2D2D2D')
-    self.dashboard_graph_widget.getAxis('bottom').setPen('#BBBBBB')
-    self.dashboard_graph_widget.getAxis('left').setPen('#BBBBBB')
-    self.dashboard_graph_widget.getAxis('bottom').setTextPen('#EEEEEE')
-    self.dashboard_graph_widget.getAxis('left').setTextPen('#EEEEEE')
-    self.dashboard_graph_widget.showGrid(x=True, y=True, alpha=0.2)
+    GraphStyles.apply_dark_theme(self.dashboard_graph_widget)
     self.dashboard_graph_widget.setLabel('left', 'Value')
     self.dashboard_graph_widget.setLabel('bottom', 'Sample Count')
-    self.dashboard_graph_widget.addLegend()
-    dashboard_graph_layout.addWidget(self.dashboard_graph_widget)
+    dashboard_graph_container.addWidget(self.dashboard_graph_widget, 1)
     
-    # Add graph layout to the container (takes most of the space)
-    dashboard_graph_container.addLayout(dashboard_graph_layout, 1)
+    graph_container_layout.addWidget(dashboard_graph_group, 1)
     
-    # Add dashboard graph to upper layout
-    upper_layout.addWidget(dashboard_graph_group, 1)
+    # Replay controls (Existing)
+    replay_controls = QWidget()
+    replay_controls_layout = QHBoxLayout(replay_controls)
+    replay_controls_layout.setContentsMargins(0, 2, 0, 2)
+    replay_controls_layout.setSpacing(8)
     
-    # Connect dashboard graph controls to update function
-    self.dashboard_timespan.currentIndexChanged.connect(lambda: self.on_timespan_changed(self.dashboard_graph_widget, False) if hasattr(self, 'on_timespan_changed') else self.update_dashboard_graph())
+    self.replay_play_btn = QPushButton("Play")
+    self.replay_play_btn.setCheckable(True)
+    self.replay_speed = QComboBox()
+    self.replay_speed.addItems(["0.25x", "0.5x", "1x", "2x", "4x"])
+    self.replay_speed.setCurrentText("1x")
+    self.replay_time_label = QLabel("00:00.0 / 00:00.0")
+    self.replay_coarse = QSlider(Qt.Orientation.Horizontal)
+    self.replay_coarse.setRange(0, 1000)
     
-    # Add upper widget to splitter
-    dashboard_splitter.addWidget(upper_widget)
+    replay_controls_layout.addWidget(QLabel("Replay:"))
+    replay_controls_layout.addWidget(self.replay_play_btn)
+    replay_controls_layout.addWidget(QLabel("Speed"))
+    replay_controls_layout.addWidget(self.replay_speed)
+    replay_controls_layout.addWidget(self.replay_time_label)
+    replay_controls_layout.addWidget(QLabel("Position"))
+    replay_controls_layout.addWidget(self.replay_coarse, 1)
+    
+    graph_container_layout.addWidget(replay_controls)
+    
+    upper_splitter.addWidget(graph_container_widget)
+    
+    # Set initial sizes for the horizontal splitter (e.g., 20% metrics, 80% graph)
+    upper_splitter.setSizes([280, 1000])
+    
+    self.dashboard_splitter.addWidget(upper_splitter)
     
     # Lower part - Automation Status and Camera Preview with Splitter
-    lower_widget = QWidget()
+    self.lower_widget = QWidget()
     # Use QVBoxLayout for the main lower widget container
-    lower_layout = QVBoxLayout(lower_widget) 
+    lower_layout = QVBoxLayout(self.lower_widget) 
     lower_layout.setContentsMargins(0, 0, 0, 0)
     
     # Create a horizontal splitter for the two panels
@@ -412,8 +910,9 @@ def setup_ui(self):
     lower_splitter.setChildrenCollapsible(False)
 
     # Automation Status panel (Left side)
-    dashboard_automation_group = QGroupBox("Automation Status")
-    dashboard_automation_layout = QVBoxLayout(dashboard_automation_group)
+    self.dashboard_automation_group = QGroupBox("Automation Status")
+    self.dashboard_automation_group.setStyleSheet(GroupBoxStyles.default())
+    dashboard_automation_layout = QVBoxLayout(self.dashboard_automation_group)
 
     # --- ADDED --- New table for detailed status
     self.dashboard_automation_table = QTableWidget()
@@ -421,26 +920,128 @@ def setup_ui(self):
     self.dashboard_automation_table.setHorizontalHeaderLabels(["Sequence", "Status", "Current Step", "Next Step", "Time/Trigger"])
     # Allow columns to resize, make Sequence name stretch
     header = self.dashboard_automation_table.horizontalHeader()
-    header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch) # Sequence
-    header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents) # Status
-    header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch) # Current Step
-    header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch) # Next Step
-    header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents) # Time/Trigger
+    header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+    header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch) # Sequence name initially stretches
     self.dashboard_automation_table.verticalHeader().setVisible(False) # Hide row numbers
-    # --- CORRECTED --- Use SelectionMode to disable selection
-    self.dashboard_automation_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+    self.dashboard_automation_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    self.dashboard_automation_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
     self.dashboard_automation_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers) # Make read-only
     self.dashboard_automation_table.setAlternatingRowColors(True)
     dashboard_automation_layout.addWidget(self.dashboard_automation_table)
 
-    dashboard_automation_group.setMinimumWidth(350) # Give it a slightly wider minimum width for the table
+    self.dashboard_automation_group.setMinimumWidth(350) # Give it a slightly wider minimum width for the table
 
     # Add automation group to the splitter
-    lower_splitter.addWidget(dashboard_automation_group)
+    lower_splitter.addWidget(self.dashboard_automation_group)
+
+    # --- NEW: Events Log in the middle ---
+    self.events_group = QGroupBox("Recent System Events")
+    self.events_group.setStyleSheet(GroupBoxStyles.default())
+    events_group_layout = QVBoxLayout(self.events_group)
+    
+    self.dash_events_list = QListWidget()
+    self.dash_events_list.setStyleSheet(f"""
+        QListWidget {{
+            background-color: {COLORS.BG_DARK};
+            border: none;
+            color: {COLORS.TEXT_SECONDARY};
+            font-size: 10px;
+        }}
+    """)
+    events_group_layout.addWidget(self.dash_events_list)
+    lower_splitter.addWidget(self.events_group)
+
+    # --- NEW: Last Images Box ---
+    self.dashboard_snapshot_group = QGroupBox("Last Images")
+    self.dashboard_snapshot_group.setStyleSheet(GroupBoxStyles.default())
+    dashboard_snapshot_layout = QVBoxLayout(self.dashboard_snapshot_group)
+    
+    self.dashboard_snapshot_label = QLabel("No image available")
+    self.dashboard_snapshot_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    self.dashboard_snapshot_label.setStyleSheet(f"background-color: #222; color: {COLORS.TEXT_SECONDARY}; border: 1px solid {COLORS.BORDER_DEFAULT};")
+    # Small minimum size so it doesn't block layout shrinking
+    self.dashboard_snapshot_label.setMinimumSize(80, 80)
+    # Use Ignored policy so the label's size hint (from the pixmap) doesn't force the layout to expand.
+    # The label will instead take the space provided by the layout.
+    self.dashboard_snapshot_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+    # We will scale the pixmap manually in main_window.py to maintain aspect ratio
+    self.dashboard_snapshot_label.setScaledContents(False)
+    dashboard_snapshot_layout.addWidget(self.dashboard_snapshot_label)
+    
+    # Navigation buttons for snapshots
+    snapshot_nav_layout = QHBoxLayout()
+    self.snapshot_back_btn = QPushButton("◀ Back")
+    self.snapshot_view_btn = QPushButton("👁 View")
+    self.snapshot_next_btn = QPushButton("Next ▶")
+    
+    self.snapshot_back_btn.setStyleSheet(ButtonStyles.secondary("small"))
+    self.snapshot_view_btn.setStyleSheet(ButtonStyles.secondary("small"))
+    self.snapshot_next_btn.setStyleSheet(ButtonStyles.secondary("small"))
+    
+    self.snapshot_back_btn.setToolTip("Previous Image")
+    self.snapshot_view_btn.setToolTip("View Full Size")
+    self.snapshot_next_btn.setToolTip("Next Image")
+    
+    snapshot_nav_layout.addWidget(self.snapshot_back_btn)
+    snapshot_nav_layout.addWidget(self.snapshot_view_btn)
+    snapshot_nav_layout.addWidget(self.snapshot_next_btn)
+    dashboard_snapshot_layout.addLayout(snapshot_nav_layout)
+    
+    lower_splitter.addWidget(self.dashboard_snapshot_group)
 
     # Camera preview group box (Right side)
-    dashboard_camera_group = QGroupBox("Camera Preview")
-    dashboard_camera_layout = QVBoxLayout(dashboard_camera_group)
+    self.dashboard_camera_group = QGroupBox("Camera Preview")
+    self.dashboard_camera_group.setStyleSheet(GroupBoxStyles.default())
+    dashboard_camera_layout = QVBoxLayout(self.dashboard_camera_group)
+    
+    # Camera source selection
+    camera_source_layout = QHBoxLayout()
+    camera_source_label = QLabel("Source:")
+    camera_source_label.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 11px;")
+    camera_source_layout.addWidget(camera_source_label)
+    
+    self.dashboard_camera_source = QComboBox()
+    self.dashboard_camera_source.setStyleSheet(f"""
+        QComboBox {{
+            background: {COLORS.BG_INPUT};
+            color: {COLORS.TEXT_PRIMARY};
+            border: 1px solid {COLORS.BORDER_DEFAULT};
+            border-radius: 4px;
+            padding: 4px 8px;
+            min-width: 150px;
+        }}
+    """)
+    self.dashboard_camera_source.addItem("📷 Main Camera", "main")
+    # Optical Sensors will be added dynamically when they are created
+    self.dashboard_camera_source.currentIndexChanged.connect(
+        lambda: self.switch_dashboard_camera_source() if hasattr(self, 'switch_dashboard_camera_source') else None
+    )
+    camera_source_layout.addWidget(self.dashboard_camera_source)
+    
+    self.refresh_camera_sources_btn = QPushButton("🔄")
+    self.refresh_camera_sources_btn.setToolTip("Refresh camera sources")
+    self.refresh_camera_sources_btn.setFixedSize(28, 28)
+    self.refresh_camera_sources_btn.setStyleSheet(ButtonStyles.secondary("small"))
+    self.refresh_camera_sources_btn.clicked.connect(
+        lambda: self.refresh_dashboard_camera_sources() if hasattr(self, 'refresh_dashboard_camera_sources') else None
+    )
+    camera_source_layout.addWidget(self.refresh_camera_sources_btn)
+
+    # Dashboard video audio controls
+    camera_source_layout.addSpacing(12)
+    camera_source_layout.addWidget(QLabel("Volume:"))
+    self.dashboard_volume_slider = QSlider(Qt.Orientation.Horizontal)
+    self.dashboard_volume_slider.setRange(0, 100)
+    self.dashboard_volume_slider.setValue(100)
+    self.dashboard_volume_slider.setFixedWidth(120)
+    self.dashboard_volume_slider.setEnabled(True)
+    camera_source_layout.addWidget(self.dashboard_volume_slider)
+    self.dashboard_mute_checkbox = QCheckBox("Mute")
+    self.dashboard_mute_checkbox.setEnabled(True)
+    camera_source_layout.addWidget(self.dashboard_mute_checkbox)
+    
+    camera_source_layout.addStretch()
+    dashboard_camera_layout.addLayout(camera_source_layout)
     
     # Camera preview label
     self.dashboard_camera_label = QLabel("No camera connected")
@@ -448,120 +1049,123 @@ def setup_ui(self):
     self.dashboard_camera_label.setStyleSheet("background-color: #222; color: white;")
     self.dashboard_camera_label.setMinimumHeight(150)
     dashboard_camera_layout.addWidget(self.dashboard_camera_label)
+
+    # Video playback widget for review mode (hidden by default)
+    self.dashboard_video_widget = QVideoWidget()
+    self.dashboard_video_widget.setMinimumHeight(150)
+    self.dashboard_video_widget.hide()
+    dashboard_camera_layout.addWidget(self.dashboard_video_widget)
     
     # Add camera group to the splitter
-    lower_splitter.addWidget(dashboard_camera_group)
+    lower_splitter.addWidget(self.dashboard_camera_group)
 
-    # Set initial sizes for the horizontal splitter (e.g., 30% automation, 70% camera)
-    lower_splitter.setSizes([30, 70])
+    # Set initial sizes for the horizontal splitter (e.g., 25% automation, 15% events, 20% snapshot, 40% camera)
+    lower_splitter.setSizes([300, 200, 250, 450])
 
     # Add the splitter to the lower layout
     lower_layout.addWidget(lower_splitter)
     
     # Add lower widget to the main vertical splitter
-    dashboard_splitter.addWidget(lower_widget)
+    self.dashboard_splitter.addWidget(self.lower_widget)
     
-    # Set initial sizes for the splitter (60% for graph, 40% for camera)
-    dashboard_splitter.setSizes([60, 40])
+    # Set initial sizes for the splitter (60% for graph, 40% for camera/lower area)
+    self.dashboard_splitter.setSizes([600, 400])
     
     # Add splitter to dashboard layout
-    dashboard_layout.addWidget(dashboard_splitter, 1)
-    
-    # Add a description label
-    dashboard_description = QLabel("This graph shows all active sensors that are enabled in the Sensors tab with 'Show in Graph' checked.")
-    dashboard_description.setStyleSheet("color: #666; font-style: italic;")
-    dashboard_layout.addWidget(dashboard_description)
+    dashboard_layout.addWidget(self.dashboard_splitter, 1)
     
     # Add tabs in correct order with visible text
     self.stacked_widget.addWidget(dashboard_tab)
     
     # Create Camera Tab
     camera_tab = QWidget()
+    camera_tab.setStyleSheet(f"background-color: {COLORS.BG_DARK};")
     camera_layout = QHBoxLayout(camera_tab)
+    camera_layout.setContentsMargins(15, 15, 15, 15)
+    camera_layout.setSpacing(12)
     
-    # Define common button style for camera tab buttons
+    # Define button styles using theme system
     camera_button_style = """
         QPushButton {
-            background-color: transparent;  /* Transparent background */
-            border: 2px solid #b3d9ff;  /* Blue border */
-            border-radius: 3px;
-            padding: 3px 6px;
-            font-size: 12px;
-            min-height: 22px;
-            max-height: 22px;
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #3a4a6a, stop:1 #2a3a5a);
+            color: #fff;
+            border: 1px solid #4a5a7a;
+            border-radius: 6px;
+            padding: 6px 12px;
+            font-weight: bold;
+            font-size: 11px;
         }
         QPushButton:hover {
-            background-color: rgba(179, 217, 255, 0.15);  /* Semi-transparent blue on hover */
-            border-color: #80b3ff;  /* Darker blue border on hover */
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #4a5a7a, stop:1 #3a4a6a);
+            border: 1px solid #5a6a8a;
         }
-        QPushButton:pressed {
-            background-color: rgba(179, 217, 255, 0.3);  /* More opaque blue when pressed */
-            border-color: #6699ff;  /* Even darker blue border when pressed */
-        }
+        QPushButton:pressed { background: #2a3a5a; }
+        QPushButton:disabled { background: #2a2a3a; color: #666; border: 1px solid #3a3a4a; }
     """
-    
-    # Define green button style for connect and apply buttons
     green_button_style = """
         QPushButton {
-            background-color: transparent;  /* Transparent background */
-            border: 2px solid #4CAF50;  /* Intense green border */
-            border-radius: 3px;
-            padding: 3px 6px;
-            font-size: 12px;
-            min-height: 22px;
-            max-height: 22px;
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #2a6a3a, stop:1 #1a5a2a);
+            color: #fff;
+            border: 1px solid #3a8a4a;
+            border-radius: 6px;
+            padding: 6px 12px;
+            font-weight: bold;
         }
-        QPushButton:hover {
-            background-color: rgba(76, 175, 80, 0.15);  /* Semi-transparent green on hover */
-            border-color: #3d8b40;  /* Darker green border on hover */
-        }
-        QPushButton:pressed {
-            background-color: rgba(76, 175, 80, 0.3);  /* More opaque green when pressed */
-            border-color: #2e6830;  /* Even darker green border when pressed */
-        }
+        QPushButton:hover { background: #3a8a4a; }
     """
-    
-    # Define red button style for remove overlay button
     red_button_style = """
         QPushButton {
-            background-color: transparent;  /* Transparent background */
-            border: 2px solid #F44336;  /* Intense red border */
-            border-radius: 3px;
-            padding: 3px 6px;
-            font-size: 12px;
-            min-height: 22px;
-            max-height: 22px;
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #6a2a2a, stop:1 #5a1a1a);
+            color: #fff;
+            border: 1px solid #8a3a3a;
+            border-radius: 6px;
+            padding: 6px 12px;
+            font-weight: bold;
         }
-        QPushButton:hover {
-            background-color: rgba(244, 67, 54, 0.15);  /* Semi-transparent red on hover */
-            border-color: #d32f2f;  /* Darker red border on hover */
-        }
-        QPushButton:pressed {
-            background-color: rgba(244, 67, 54, 0.3);  /* More opaque red when pressed */
-            border-color: #b71c1c;  /* Even darker red border when pressed */
-        }
+        QPushButton:hover { background: #8a3a3a; }
     """
     
     # Create a splitter for the camera tab
     camera_splitter = QSplitter(Qt.Orientation.Horizontal)
     camera_layout.addWidget(camera_splitter)
     
-    # Left side - Camera settings
+    # Left side - Camera settings (Tabbed Interface)
     camera_settings_container = QWidget()
-    camera_settings_container.setMinimumWidth(300)
-    camera_settings_container.setMaximumWidth(380)
-    camera_settings_layout = QVBoxLayout(camera_settings_container)
+    camera_settings_container.setMinimumWidth(320)
+    camera_settings_container.setMaximumWidth(400)
+    camera_settings_main_layout = QVBoxLayout(camera_settings_container)
+    camera_settings_main_layout.setContentsMargins(0, 0, 5, 0)
+    camera_settings_main_layout.setSpacing(0)
+
+    # Main Tab Widget for categorized settings
+    self.camera_side_tabs = QTabWidget()
+    self.camera_side_tabs.setStyleSheet(TabStyles.default())
+    camera_settings_main_layout.addWidget(self.camera_side_tabs)
+
+    # --- TAB 1: SOURCE & STATUS ---
+    source_tab = QWidget()
+    source_layout = QVBoxLayout(source_tab)
+    source_layout.setContentsMargins(10, 15, 10, 10)
+    source_layout.setSpacing(12)
     
-    # Camera settings button
-    self.camera_settings_btn = QPushButton("Camera Settings")
-    self.camera_settings_btn.setFixedHeight(30)
-    self.camera_settings_btn.setStyleSheet(green_button_style)
+    # Advanced settings button moved to top of source tab
+    self.camera_settings_btn = QPushButton("⚙️ Advanced Settings")
+    self.camera_settings_btn.setFixedHeight(38)
+    self.camera_settings_btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
+    self.camera_settings_btn.setFont(Typography.button())
     self.camera_settings_btn.clicked.connect(self.show_camera_settings_popup)
-    camera_settings_layout.addWidget(self.camera_settings_btn)
+    source_layout.addWidget(self.camera_settings_btn)
     
-    # Camera connection settings
-    camera_connection_group = QGroupBox("Camera Connection")
+    # Camera connection settings - modernized
+    camera_connection_group = QGroupBox("📹 Camera Connection")
+    camera_connection_group.setStyleSheet(GroupBoxStyles.tight())
     camera_connection_layout = QGridLayout(camera_connection_group)
+    camera_connection_layout.setContentsMargins(12, 25, 12, 12)
+    camera_connection_layout.setSpacing(10)
     
     # Store the reference to the group box in the main window
     self.camera_connection_group = camera_connection_group
@@ -570,25 +1174,97 @@ def setup_ui(self):
     camera_connection_layout.addWidget(QLabel("Camera:"), 0, 0)
     self.camera_id = QComboBox()
     self.camera_id.addItems(["0", "1", "2", "3"])
+    self.camera_id.setStyleSheet(InputStyles.default())
     camera_connection_layout.addWidget(self.camera_id, 0, 1)
     
     # Connect button
     self.camera_connect_btn = QPushButton("Connect")
-    self.camera_connect_btn.setFixedSize(80, 22)
-    self.camera_connect_btn.setStyleSheet(green_button_style)  # Green connect button
-    # Don't connect signal here - will be connected in setup.py
-    # self.camera_connect_btn.clicked.connect(self.connect_camera)
+    self.camera_connect_btn.setFixedSize(85, 28)
+    self.camera_connect_btn.setStyleSheet(ButtonStyles.success("small"))
     camera_connection_layout.addWidget(self.camera_connect_btn, 0, 2)
+
+    # FPS Display
+    fps_label = QLabel("Frame Rate:")
+    fps_label.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY};")
+    camera_connection_layout.addWidget(fps_label, 1, 0)
     
-    # Add camera connection group to settings layout
-    camera_settings_layout.addWidget(camera_connection_group)
+    self.camera_fps_display = QLabel("0.0 / 0.0 FPS")
+    self.camera_fps_display.setStyleSheet(f"color: {COLORS.PRIMARY_LIGHT}; font-weight: bold;")
+    self.camera_fps_display.setToolTip("Actual FPS / Target FPS")
+    camera_connection_layout.addWidget(self.camera_fps_display, 1, 1, 1, 2)
     
-    # Camera focus and exposure controls
-    camera_controls_group = QGroupBox("Camera Controls")
+    # Sync Note
+    sync_note = QLabel("Note: If actual FPS is lower than target, frames are duplicated to maintain sync with sensor data.")
+    sync_note.setWordWrap(True)
+    sync_note.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 10px; font-style: italic;")
+    camera_connection_layout.addWidget(sync_note, 2, 0, 1, 3)
+    
+    # Add camera connection group to source layout
+    source_layout.addWidget(camera_connection_group)
+    
+    # Motion indicator in camera tab - modernized
+    motion_status_group = QGroupBox("🔍 Motion Detection")
+    motion_status_group.setStyleSheet(GroupBoxStyles.tight())
+    motion_status_layout = QHBoxLayout(motion_status_group)
+    motion_status_layout.setContentsMargins(12, 22, 12, 12)
+    
+    motion_label = QLabel("Status:")
+    motion_label.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY};")
+    motion_status_layout.addWidget(motion_label)
+    self.motion_detection_indicator = QLabel()
+    self.motion_detection_indicator.setFixedSize(16, 16)
+    self.motion_detection_indicator.setStyleSheet(StatusIndicator.get("online", glow=True))
+    self.motion_detection_indicator.setToolTip("Green: No motion | Red: Motion detected")
+    motion_status_layout.addWidget(self.motion_detection_indicator)
+    motion_status_text = QLabel("Idle")
+    motion_status_text.setStyleSheet(StatusText.success())
+    motion_status_layout.addWidget(motion_status_text)
+    motion_status_layout.addStretch()
+    
+    # Add motion status group to source layout
+    source_layout.addWidget(motion_status_group)
+    source_layout.addStretch()
+    self.camera_side_tabs.addTab(source_tab, "Source")
+
+    # --- TAB 2: ADJUSTMENTS ---
+    adjust_tab = QWidget()
+    adjust_layout = QVBoxLayout(adjust_tab)
+    adjust_layout.setContentsMargins(10, 15, 10, 10)
+    adjust_layout.setSpacing(12)
+
+    # Camera focus and exposure controls - modernized
+    camera_controls_group = QGroupBox("🎛️ Camera Controls")
+    camera_controls_group.setStyleSheet(GroupBoxStyles.tight())
     camera_controls_layout = QGridLayout(camera_controls_group)
+    camera_controls_layout.setContentsMargins(12, 25, 12, 12)
+    camera_controls_layout.setSpacing(10)
+    
+    # Modern slider style
+    slider_style = f"""
+        QSlider::groove:horizontal {{
+            height: 6px;
+            background: {COLORS.BG_INPUT};
+            border-radius: 3px;
+        }}
+        QSlider::handle:horizontal {{
+            background: {COLORS.PRIMARY};
+            width: 16px;
+            height: 16px;
+            margin: -5px 0;
+            border-radius: 8px;
+        }}
+        QSlider::handle:horizontal:hover {{
+            background: {COLORS.PRIMARY_LIGHT};
+        }}
+        QSlider::sub-page:horizontal {{
+            background: {COLORS.PRIMARY};
+            border-radius: 3px;
+        }}
+    """
     
     # Manual focus controls
     self.camera_tab_manual_focus = QCheckBox("Manual Focus")
+    self.camera_tab_manual_focus.setStyleSheet(f"color: {COLORS.TEXT_PRIMARY}; font-weight: 500;")
     self.camera_tab_manual_focus.setToolTip("Enable to manually control camera focus")
     initial_manual_focus = self.settings.value("camera/manual_focus", "true").lower() == "true"
     self.camera_tab_manual_focus.setChecked(initial_manual_focus)
@@ -597,6 +1273,7 @@ def setup_ui(self):
     # Focus slider with value label
     focus_slider_layout = QHBoxLayout()
     self.camera_tab_focus_slider = QSlider(Qt.Orientation.Horizontal)
+    self.camera_tab_focus_slider.setStyleSheet(slider_style)
     self.camera_tab_focus_slider.setMinimum(0)
     self.camera_tab_focus_slider.setMaximum(255)
     self.camera_tab_focus_slider.setValue(int(self.settings.value("camera/focus_value", "0")))
@@ -607,13 +1284,14 @@ def setup_ui(self):
     
     # Value display for focus
     self.camera_tab_focus_value = QLabel(str(self.camera_tab_focus_slider.value()))
-    self.camera_tab_focus_value.setMinimumWidth(30)
+    self.camera_tab_focus_value.setStyleSheet(f"color: {COLORS.PRIMARY_LIGHT}; font-weight: bold; min-width: 30px;")
     self.camera_tab_focus_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
     focus_slider_layout.addWidget(self.camera_tab_focus_value)
     camera_controls_layout.addLayout(focus_slider_layout, 1, 0, 1, 3)
     
     # Manual exposure controls
     self.camera_tab_manual_exposure = QCheckBox("Manual Exposure")
+    self.camera_tab_manual_exposure.setStyleSheet(f"color: {COLORS.TEXT_PRIMARY}; font-weight: 500;")
     self.camera_tab_manual_exposure.setToolTip("Enable to manually control camera exposure")
     initial_manual_exposure = self.settings.value("camera/manual_exposure", "true").lower() == "true"
     self.camera_tab_manual_exposure.setChecked(initial_manual_exposure)
@@ -622,6 +1300,7 @@ def setup_ui(self):
     # Exposure slider with value label
     exposure_slider_layout = QHBoxLayout()
     self.camera_tab_exposure_slider = QSlider(Qt.Orientation.Horizontal)
+    self.camera_tab_exposure_slider.setStyleSheet(slider_style)
     self.camera_tab_exposure_slider.setMinimum(-13)  # Exposure values can be negative
     self.camera_tab_exposure_slider.setMaximum(13)
     self.camera_tab_exposure_slider.setValue(int(self.settings.value("camera/exposure_value", "0")))
@@ -632,262 +1311,203 @@ def setup_ui(self):
     
     # Value display for exposure
     self.camera_tab_exposure_value = QLabel(str(self.camera_tab_exposure_slider.value()))
-    self.camera_tab_exposure_value.setMinimumWidth(30)
+    self.camera_tab_exposure_value.setStyleSheet(f"color: {COLORS.PRIMARY_LIGHT}; font-weight: bold; min-width: 30px;")
     self.camera_tab_exposure_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
     exposure_slider_layout.addWidget(self.camera_tab_exposure_value)
     camera_controls_layout.addLayout(exposure_slider_layout, 3, 0, 1, 3)
     
-    # Add camera controls group to settings layout
-    camera_settings_layout.addWidget(camera_controls_group)
-    
-    # Motion indicator in camera tab
-    motion_status_group = QGroupBox("Motion Status")
-    motion_status_layout = QHBoxLayout(motion_status_group)
-    
-    motion_status_layout.addWidget(QLabel("Motion Detection:"))
-    self.motion_detection_indicator = QLabel()
-    self.motion_detection_indicator.setFixedSize(20, 20)
-    self.motion_detection_indicator.setStyleSheet("background-color: green; border-radius: 5px;")
-    self.motion_detection_indicator.setToolTip("Green: No motion detected | Red: Motion detected")
-    motion_status_layout.addWidget(self.motion_detection_indicator)
-    motion_status_layout.addStretch()
-    
-    # Add motion status group to settings layout
-    camera_settings_layout.addWidget(motion_status_group)
-    
-    # Overlay settings - Make it collapsible
-    overlay_collapsible = CollapsibleBox("Overlay Settings")
-    
-    # Create widget with fixed size policy to avoid stretching
-    overlay_widget = QWidget()
-    overlay_widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+    # Add camera controls group to adjust layout
+    adjust_layout.addWidget(camera_controls_group)
+    adjust_layout.addStretch()
+    self.camera_side_tabs.addTab(adjust_tab, "Adjust")
 
-    # Create layout with compact spacing
-    overlay_settings_layout = QGridLayout(overlay_widget)
-    overlay_settings_layout.setContentsMargins(5, 5, 5, 5)
-    overlay_settings_layout.setVerticalSpacing(5)
-    overlay_settings_layout.setHorizontalSpacing(10)
+    # --- TAB 3: OVERLAY ---
+    overlay_tab = QWidget()
+    overlay_main_layout = QVBoxLayout(overlay_tab)
+    overlay_main_layout.setContentsMargins(0, 0, 0, 0)
+
+    # Use a ScrollArea ONLY for the overlay tab
+    overlay_scroll = QScrollArea()
+    overlay_scroll.setWidgetResizable(True)
+    overlay_scroll.setFrameShape(QFrame.Shape.NoFrame)
+    overlay_scroll.setStyleSheet(ScrollStyles.default())
+    
+    overlay_container = QWidget()
+    overlay_layout = QVBoxLayout(overlay_container)
+    overlay_layout.setContentsMargins(10, 15, 10, 10)
+    overlay_layout.setSpacing(10)
+
+    # Use a grid for basic overlay properties
+    overlay_props_widget = QWidget()
+    overlay_props_layout = QGridLayout(overlay_props_widget)
+    overlay_props_layout.setContentsMargins(0, 0, 0, 0)
+    overlay_props_layout.setSpacing(8)
 
     # Overlay selection
-    overlay_settings_layout.addWidget(QLabel("Overlay:"), 0, 0)
+    overlay_props_layout.addWidget(QLabel("Overlay:"), 0, 0)
     self.overlay_selector = QComboBox()
-    overlay_settings_layout.addWidget(self.overlay_selector, 0, 1)
+    self.overlay_selector.setStyleSheet(InputStyles.default())
+    overlay_props_layout.addWidget(self.overlay_selector, 0, 1)
 
     # Text size (font scale)
-    overlay_settings_layout.addWidget(QLabel("Font Scale:"), 1, 0)
+    overlay_props_layout.addWidget(QLabel("Font Scale:"), 1, 0)
     self.overlay_font_scale = QDoubleSpinBox()
+    self.overlay_font_scale.setStyleSheet(InputStyles.default())
     self.overlay_font_scale.setRange(0.1, 3.0)
     self.overlay_font_scale.setSingleStep(0.1)
     self.overlay_font_scale.setValue(0.7)
-    overlay_settings_layout.addWidget(self.overlay_font_scale, 1, 1)
+    overlay_props_layout.addWidget(self.overlay_font_scale, 1, 1)
 
-    # Line thickness
-    overlay_settings_layout.addWidget(QLabel("Thickness:"), 2, 0)
+    lbl_thick = QLabel("Thickness:")
+    lbl_thick.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-weight: 500; font-size: 11px;")
+    overlay_props_layout.addWidget(lbl_thick, 2, 0)
     self.overlay_thickness = QSpinBox()
+    self.overlay_thickness.setStyleSheet(InputStyles.default())
     self.overlay_thickness.setRange(1, 5)
     self.overlay_thickness.setValue(2)
-    overlay_settings_layout.addWidget(self.overlay_thickness, 2, 1)
+    overlay_props_layout.addWidget(self.overlay_thickness, 2, 1)
     
-    # Text color (RGB components) - Make it less tall
+    overlay_layout.addWidget(overlay_props_widget)
+
+    # Text and Background color groups
     text_color_group = QGroupBox("Text Color")
-    text_color_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+    text_color_group.setStyleSheet(GroupBoxStyles.compact())
     text_color_layout = QHBoxLayout(text_color_group)
-    text_color_layout.setContentsMargins(5, 5, 5, 5)
-
-    # Color preview box - Shorter height
+    text_color_layout.setContentsMargins(8, 22, 8, 8)
     self.text_color_preview = QFrame()
-    self.text_color_preview.setFixedSize(50, 18)  # Further reduced size
-    self.text_color_preview.setStyleSheet("background-color: rgb(0, 255, 0); border: 1px solid #888;")
+    self.text_color_preview.setFixedSize(50, 18)
+    self.text_color_preview.setStyleSheet(f"background-color: rgb(0, 255, 0); border: 1px solid {COLORS.BORDER_HOVER}; border-radius: 4px;")
     text_color_layout.addWidget(self.text_color_preview)
-
-    # Color picker button
     self.text_color_picker_btn = QPushButton("Color")
-    self.text_color_picker_btn.setFixedSize(60, 20)
-    self.text_color_picker_btn.setStyleSheet(camera_button_style)
+    self.text_color_picker_btn.setFixedSize(65, 26)
+    self.text_color_picker_btn.setStyleSheet(ButtonStyles.get("secondary", "small"))
     self.text_color_picker_btn.clicked.connect(self.choose_text_color)
     text_color_layout.addWidget(self.text_color_picker_btn)
-    text_color_layout.addStretch()  # Add stretch to prevent expanding
+    text_color_layout.addStretch()
+    overlay_layout.addWidget(text_color_group)
 
-    # Store RGB values in hidden variables
-    self.overlay_text_color_r = QSpinBox()
-    self.overlay_text_color_r.setVisible(False)
-    self.overlay_text_color_r.setRange(0, 255)
-    self.overlay_text_color_r.setValue(0)
-
-    self.overlay_text_color_g = QSpinBox()
-    self.overlay_text_color_g.setVisible(False)
-    self.overlay_text_color_g.setRange(0, 255)
-    self.overlay_text_color_g.setValue(255)
-
-    self.overlay_text_color_b = QSpinBox()
-    self.overlay_text_color_b.setVisible(False)
-    self.overlay_text_color_b.setRange(0, 255)
-    self.overlay_text_color_b.setValue(0)
-
-    overlay_settings_layout.addWidget(text_color_group, 3, 0, 1, 2)
-
-    # Background color (RGB components) - Make it less tall and include opacity
     bg_color_group = QGroupBox("Background Color")
-    bg_color_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-    bg_color_layout = QHBoxLayout(bg_color_group)
-    bg_color_layout.setContentsMargins(5, 5, 5, 5)
-
-    # Color preview box - Shorter height
-    self.bg_color_preview = QFrame()
-    self.bg_color_preview.setFixedSize(50, 18)  # Further reduced size
-    self.bg_color_preview.setStyleSheet("background-color: rgba(0, 0, 0, 0.7); border: 1px solid #888;")
-    bg_color_layout.addWidget(self.bg_color_preview)
-
-    # Color picker button
-    self.bg_color_picker_btn = QPushButton("Color")
-    self.bg_color_picker_btn.setFixedSize(60, 20)
-    self.bg_color_picker_btn.setStyleSheet(camera_button_style)
-    self.bg_color_picker_btn.clicked.connect(self.choose_bg_color)
-    bg_color_layout.addWidget(self.bg_color_picker_btn)
-    bg_color_layout.addStretch()  # Add stretch to prevent expanding
-
-    # Store RGB values in hidden variables
-    self.overlay_bg_color_r = QSpinBox()
-    self.overlay_bg_color_r.setVisible(False)
-    self.overlay_bg_color_r.setRange(0, 255)
-    self.overlay_bg_color_r.setValue(0)
-
-    self.overlay_bg_color_g = QSpinBox()
-    self.overlay_bg_color_g.setVisible(False)
-    self.overlay_bg_color_g.setRange(0, 255)
-    self.overlay_bg_color_g.setValue(0)
-
-    self.overlay_bg_color_b = QSpinBox()
-    self.overlay_bg_color_b.setVisible(False)
-    self.overlay_bg_color_b.setRange(0, 255)
-    self.overlay_bg_color_b.setValue(0)
-
-    # Add opacity control
-    bg_opacity_layout = QHBoxLayout()
-    bg_opacity_layout.addWidget(QLabel("Opacity:"))
-    self.overlay_bg_alpha = QSpinBox()
-    self.overlay_bg_alpha.setRange(0, 100)
-    self.overlay_bg_alpha.setSingleStep(5)
-    self.overlay_bg_alpha.setValue(70)
-    self.overlay_bg_alpha.setMinimumWidth(60)  # Set minimum width to ensure numbers are fully visible
-    self.overlay_bg_alpha.valueChanged.connect(self.apply_overlay_settings)  # Apply settings immediately when opacity changes
-    bg_opacity_layout.addWidget(self.overlay_bg_alpha)
-    bg_opacity_layout.addStretch()  # Add stretch to prevent expanding
-    bg_color_layout.addLayout(bg_opacity_layout)
+    bg_color_group.setStyleSheet(GroupBoxStyles.compact())
+    bg_color_layout = QVBoxLayout(bg_color_group)
+    bg_color_layout.setContentsMargins(8, 22, 8, 8)
     
-    # For backward compatibility (same as overlay_bg_alpha)
+    bg_top_row = QHBoxLayout()
+    self.bg_color_preview = QFrame()
+    self.bg_color_preview.setFixedSize(50, 18)
+    self.bg_color_preview.setStyleSheet(f"background-color: rgba(0, 0, 0, 0.7); border: 1px solid {COLORS.BORDER_HOVER}; border-radius: 4px;")
+    bg_top_row.addWidget(self.bg_color_preview)
+    self.bg_color_picker_btn = QPushButton("Color")
+    self.bg_color_picker_btn.setFixedSize(65, 26)
+    self.bg_color_picker_btn.setStyleSheet(ButtonStyles.get("secondary", "small"))
+    self.bg_color_picker_btn.clicked.connect(self.choose_bg_color)
+    bg_top_row.addWidget(self.bg_color_picker_btn)
+    bg_top_row.addStretch()
+    bg_color_layout.addLayout(bg_top_row)
+
+    bg_opacity_layout = QHBoxLayout()
+    opacity_label = QLabel("Opacity:")
+    opacity_label.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 11px;")
+    bg_opacity_layout.addWidget(opacity_label)
+    self.overlay_bg_alpha = QSpinBox()
+    self.overlay_bg_alpha.setStyleSheet(InputStyles.default())
+    self.overlay_bg_alpha.setRange(0, 100)
+    self.overlay_bg_alpha.setValue(70)
+    bg_opacity_layout.addWidget(self.overlay_bg_alpha)
+    bg_color_layout.addLayout(bg_opacity_layout)
+    overlay_layout.addWidget(bg_color_group)
+
+    # Store hidden RGB values
+    self.overlay_text_color_r = QSpinBox(); self.overlay_text_color_r.setVisible(False); self.overlay_text_color_r.setRange(0, 255)
+    self.overlay_text_color_g = QSpinBox(); self.overlay_text_color_g.setVisible(False); self.overlay_text_color_g.setRange(0, 255)
+    self.overlay_text_color_b = QSpinBox(); self.overlay_text_color_b.setVisible(False); self.overlay_text_color_b.setRange(0, 255)
+    self.overlay_bg_color_r = QSpinBox(); self.overlay_bg_color_r.setVisible(False); self.overlay_bg_color_r.setRange(0, 255)
+    self.overlay_bg_color_g = QSpinBox(); self.overlay_bg_color_g.setVisible(False); self.overlay_bg_color_g.setRange(0, 255)
+    self.overlay_bg_color_b = QSpinBox(); self.overlay_bg_color_b.setVisible(False); self.overlay_bg_color_b.setRange(0, 255)
     self.overlay_bg_opacity = self.overlay_bg_alpha
 
-    overlay_settings_layout.addWidget(bg_color_group, 4, 0, 1, 2)
-
-    # Add collapsible sections for advanced settings
-    # Text content (placeholder, source, prefix, suffix)
+    # Advanced Collapsibles
+    label_style = f"color: {COLORS.TEXT_SECONDARY}; font-weight: 500; font-size: 11px;"
+    
     text_content_collapsible = CollapsibleBox("Text Content")
     text_content_layout = QGridLayout()
-    text_content_layout.setVerticalSpacing(5)
-
-    text_content_layout.addWidget(QLabel("Placeholder:"), 0, 0)
-    self.overlay_placeholder = QLineEdit("Sample text")
-    text_content_layout.addWidget(self.overlay_placeholder, 0, 1)
-
-    text_content_layout.addWidget(QLabel("Data Source:"), 1, 0)
+    text_content_layout.setContentsMargins(10, 10, 10, 10)
+    text_content_layout.addWidget(QLabel("Format:"), 0, 0)
+    self.overlay_text_content = QLineEdit("Sample text")
+    self.overlay_text_content.setStyleSheet(InputStyles.default())
+    text_content_layout.addWidget(self.overlay_text_content, 0, 1)
     self.overlay_data_source = QComboBox()
     self.overlay_data_source.addItems(["Static Text", "Date/Time", "Timestamp", "Sensor Data", "Counter", "Calculated"])
-    text_content_layout.addWidget(self.overlay_data_source, 1, 1)
-
-    text_content_layout.addWidget(QLabel("Prefix:"), 2, 0)
-    self.overlay_prefix = QLineEdit()
-    text_content_layout.addWidget(self.overlay_prefix, 2, 1)
-
-    text_content_layout.addWidget(QLabel("Suffix:"), 3, 0)
-    self.overlay_suffix = QLineEdit()
-    text_content_layout.addWidget(self.overlay_suffix, 3, 1)
-
+    text_content_layout.addWidget(QLabel("Source:"), 1, 0); text_content_layout.addWidget(self.overlay_data_source, 1, 1)
+    self.overlay_prefix = QLineEdit(); text_content_layout.addWidget(QLabel("Prefix:"), 2, 0); text_content_layout.addWidget(self.overlay_prefix, 2, 1)
+    self.overlay_suffix = QLineEdit(); text_content_layout.addWidget(QLabel("Suffix:"), 3, 0); text_content_layout.addWidget(self.overlay_suffix, 3, 1)
     text_content_collapsible.setContentLayout(text_content_layout)
-    overlay_settings_layout.addWidget(text_content_collapsible, 5, 0, 1, 2)
+    overlay_layout.addWidget(text_content_collapsible)
 
-    # Format settings (format string, precision, etc)
-    format_collapsible = CollapsibleBox("Format Settings")
+    format_collapsible = CollapsibleBox("Data Format")
     format_layout = QGridLayout()
-    format_layout.setVerticalSpacing(5)
-
-    format_layout.addWidget(QLabel("Format:"), 0, 0)
-    self.overlay_format = QLineEdit()
-    self.overlay_format.setPlaceholderText("e.g., %.2f")
-    format_layout.addWidget(self.overlay_format, 0, 1)
-
-    format_layout.addWidget(QLabel("Precision:"), 1, 0)
-    self.overlay_precision = QSpinBox()
-    self.overlay_precision.setRange(0, 10)
-    self.overlay_precision.setValue(2)
-    format_layout.addWidget(self.overlay_precision, 1, 1)
-
+    format_layout.setContentsMargins(10, 10, 10, 10)
+    self.overlay_format = QLineEdit(); self.overlay_format.setPlaceholderText("%.2f")
+    format_layout.addWidget(QLabel("Format:"), 0, 0); format_layout.addWidget(self.overlay_format, 0, 1)
+    self.overlay_precision = QSpinBox(); self.overlay_precision.setRange(0, 10)
+    format_layout.addWidget(QLabel("Prec:"), 1, 0); format_layout.addWidget(self.overlay_precision, 1, 1)
     format_collapsible.setContentLayout(format_layout)
-    overlay_settings_layout.addWidget(format_collapsible, 6, 0, 1, 2)
+    overlay_layout.addWidget(format_collapsible)
 
-    # Dimensions settings (width, height)
-    dimensions_collapsible = CollapsibleBox("Dimensions")
-    dimensions_layout = QGridLayout()
-    dimensions_layout.setVerticalSpacing(5)
+    dim_collapsible = CollapsibleBox("Dimensions")
+    dim_layout = QGridLayout(); dim_layout.setContentsMargins(10, 10, 10, 10)
+    self.overlay_width = QSpinBox(); self.overlay_width.setRange(10, 800)
+    dim_layout.addWidget(QLabel("W:"), 0, 0); dim_layout.addWidget(self.overlay_width, 0, 1)
+    self.overlay_height = QSpinBox(); self.overlay_height.setRange(10, 600)
+    dim_layout.addWidget(QLabel("H:"), 1, 0); dim_layout.addWidget(self.overlay_height, 1, 1)
+    dim_collapsible.setContentLayout(dim_layout)
+    overlay_layout.addWidget(dim_collapsible)
 
-    dimensions_layout.addWidget(QLabel("Width:"), 0, 0)
-    self.overlay_width = QSpinBox()
-    self.overlay_width.setRange(10, 800)
-    self.overlay_width.setValue(150)
-    dimensions_layout.addWidget(self.overlay_width, 0, 1)
+    # Action buttons
+    btns_layout = QHBoxLayout(); btns_layout.setSpacing(10); btns_layout.setContentsMargins(0, 10, 0, 0)
+    self.apply_overlay_settings_btn = QPushButton("Apply"); self.apply_overlay_settings_btn.setStyleSheet(ButtonStyles.success("small"))
+    self.remove_overlay_btn = QPushButton("Remove"); self.remove_overlay_btn.setStyleSheet(ButtonStyles.danger("small"))
+    btns_layout.addWidget(self.apply_overlay_settings_btn); btns_layout.addWidget(self.remove_overlay_btn)
+    overlay_layout.addLayout(btns_layout)
+    overlay_layout.addStretch()
 
-    dimensions_layout.addWidget(QLabel("Height:"), 1, 0)
-    self.overlay_height = QSpinBox()
-    self.overlay_height.setRange(10, 600)
-    self.overlay_height.setValue(80)
-    dimensions_layout.addWidget(self.overlay_height, 1, 1)
+    overlay_scroll.setWidget(overlay_container)
+    overlay_main_layout.addWidget(overlay_scroll)
+    self.camera_side_tabs.addTab(overlay_tab, "Overlay")
 
-    dimensions_collapsible.setContentLayout(dimensions_layout)
-    overlay_settings_layout.addWidget(dimensions_collapsible, 7, 0, 1, 2)
-
-    # Add action buttons in a more compact layout
-    buttons_layout = QHBoxLayout()
-    buttons_layout.setSpacing(5)
-
-    # Apply overlay settings button
-    self.apply_overlay_settings_btn = QPushButton("Apply Settings")
-    self.apply_overlay_settings_btn.setFixedSize(100, 22)
-    self.apply_overlay_settings_btn.setStyleSheet(green_button_style)
-    self.apply_overlay_settings_btn.clicked.connect(self.apply_overlay_settings)
-    buttons_layout.addWidget(self.apply_overlay_settings_btn)
-
-    # Remove overlay button
-    self.remove_overlay_btn = QPushButton("Remove Overlay")
-    self.remove_overlay_btn.setFixedSize(100, 22)
-    self.remove_overlay_btn.setStyleSheet(red_button_style)
-    self.remove_overlay_btn.clicked.connect(self.remove_overlay)
-    buttons_layout.addWidget(self.remove_overlay_btn)
-
-    overlay_settings_layout.addLayout(buttons_layout, 8, 0, 1, 2)
-
-    # Set the content layout for the overlay collapsible box
-    overlay_widget.setMinimumWidth(250)  # Set minimum width to ensure buttons are fully visible
-    overlay_collapsible.setContentLayout(overlay_settings_layout)
-
-    # Store references to the collapsible groups and content groups for controller access
+    # Store references
     self.overlay_text_content_group = text_content_collapsible
     self.overlay_format_group = format_collapsible
-    self.overlay_dimensions_group = dimensions_collapsible
+    self.overlay_dimensions_group = dim_collapsible
 
-    # Add overlay collapsible box to settings layout
-    camera_settings_layout.addWidget(overlay_collapsible)
-    
-    # Add stretch to push everything to the top
-    camera_settings_layout.addStretch()
+    # Finally add camera settings container to the splitter
+    camera_splitter.addWidget(camera_settings_container)
     
     # Right side - Camera view and controls
     camera_view_container = QWidget()
     camera_view_layout = QVBoxLayout(camera_view_container)
+    camera_view_layout.setContentsMargins(10, 0, 0, 0)
+    camera_view_layout.setSpacing(10)
     
-    # Camera view
-    self.camera_label = QLabel("No camera connected")
+    # Camera view with modern frame
+    camera_view_frame = QFrame()
+    camera_view_frame.setStyleSheet(f"""
+        QFrame {{
+            background: {COLORS.BG_CARD};
+            border: 2px solid {COLORS.BORDER_DEFAULT};
+            border-radius: 12px;
+        }}
+    """)
+    camera_frame_layout = QVBoxLayout(camera_view_frame)
+    camera_frame_layout.setContentsMargins(4, 4, 4, 4)
+    
+    self.camera_label = QLabel("📷 No camera connected")
     self.camera_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    self.camera_label.setStyleSheet("background-color: #222; color: white;")
+    self.camera_label.setStyleSheet(f"""
+        background-color: {COLORS.BG_DARK};
+        color: {COLORS.TEXT_MUTED};
+        font-size: 16px;
+        border-radius: 8px;
+    """)
     self.camera_label.setMinimumSize(640, 480)
     
     # Enable mouse tracking for overlay dragging
@@ -896,40 +1516,62 @@ def setup_ui(self):
     self.camera_label.mouseReleaseEvent = self.camera_mouse_release
     self.camera_label.mouseMoveEvent = self.camera_mouse_move
     
-    camera_view_layout.addWidget(self.camera_label)
+    camera_frame_layout.addWidget(self.camera_label)
+    camera_view_layout.addWidget(camera_view_frame)
     
-    # Camera controls
-    camera_controls = QHBoxLayout()
+    # Camera controls - modern button bar with fixed height
+    camera_controls_bar = QFrame()
+    camera_controls_bar.setFixedHeight(50)
+    camera_controls_bar.setStyleSheet("""
+        QFrame {
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #252540, stop:1 #1e1e35);
+            border: 1px solid #3a3a5a;
+            border-radius: 8px;
+        }
+    """)
+    camera_controls = QHBoxLayout(camera_controls_bar)
+    camera_controls.setContentsMargins(12, 8, 12, 8)
+    camera_controls.setSpacing(8)
     
     # Snapshot button
-    self.snapshot_btn = QPushButton("Take Snapshot")
-    self.snapshot_btn.setFixedSize(120, 22)  # Wider button
+    self.snapshot_btn = QPushButton("📸 Snapshot")
+    self.snapshot_btn.setFixedSize(110, 32)
     self.snapshot_btn.setStyleSheet(camera_button_style)
-    self.snapshot_btn.clicked.connect(self.take_snapshot)
-    self.snapshot_btn.setEnabled(False)  # Disabled at startup
+    self.snapshot_btn.setEnabled(False)
     
     # Record button
-    self.record_btn = QPushButton("Start Recording")
-    self.record_btn.setFixedSize(120, 22)  # Wider button
+    self.record_btn = QPushButton("⏺️ Record")
+    self.record_btn.setFixedSize(100, 32)
     self.record_btn.setStyleSheet(camera_button_style)
-    self.record_btn.clicked.connect(self.toggle_recording)
-    self.record_btn.setEnabled(False)  # Disabled at startup
+    self.record_btn.setEnabled(False)
     
     # Add overlay button
-    self.add_overlay_btn = QPushButton("Add Overlay")
-    self.add_overlay_btn.setFixedSize(120, 22)  # Wider button
+    self.add_overlay_btn = QPushButton("🏷️ Add Overlay")
+    self.add_overlay_btn.setFixedSize(120, 32)
     self.add_overlay_btn.setStyleSheet(camera_button_style)
-    self.add_overlay_btn.clicked.connect(self.add_overlay)
-    self.add_overlay_btn.setEnabled(False)  # Disabled at startup
+    self.add_overlay_btn.setEnabled(False)
     
-    # Add buttons to layout with less spacing
+    # Add buttons to layout
     camera_controls.addWidget(self.snapshot_btn)
     camera_controls.addWidget(self.record_btn)
     camera_controls.addWidget(self.add_overlay_btn)
-    camera_controls.addStretch()  # Push buttons to the left
-    camera_controls.setSpacing(5)  # Reduce spacing between buttons
+
+    # Audio controls for camera/replay
+    camera_controls.addWidget(QLabel("Volume:"))
+    self.camera_volume_slider = QSlider(Qt.Orientation.Horizontal)
+    self.camera_volume_slider.setRange(0, 100)
+    self.camera_volume_slider.setValue(100)
+    self.camera_volume_slider.setFixedWidth(140)
+    self.camera_volume_slider.setEnabled(True)
+    camera_controls.addWidget(self.camera_volume_slider)
+    self.camera_mute_checkbox = QCheckBox("Mute")
+    self.camera_mute_checkbox.setEnabled(True)
+    camera_controls.addWidget(self.camera_mute_checkbox)
+
+    camera_controls.addStretch()
     
-    camera_view_layout.addLayout(camera_controls)
+    camera_view_layout.addWidget(camera_controls_bar)
     
     # Add camera settings container to the splitter
     camera_splitter.addWidget(camera_settings_container)
@@ -949,13 +1591,13 @@ def setup_ui(self):
     
     # Video player section
     video_player_group = QGroupBox("Video Player")
+    video_player_group.setStyleSheet(GroupBoxStyles.section())
     video_player_layout = QVBoxLayout(video_player_group)
     
     # Video display area
-    self.video_display = QLabel("No video loaded")
-    self.video_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    self.video_display = QVideoWidget()
     self.video_display.setMinimumHeight(400)
-    self.video_display.setStyleSheet("background-color: #222; color: #888; border: 1px solid #444;")
+    self.video_display.setStyleSheet("background-color: #222; border: 1px solid #444;")
     video_player_layout.addWidget(self.video_display)
     
     # Video controls
@@ -975,6 +1617,19 @@ def setup_ui(self):
     self.stop_video_btn.setMinimumHeight(30)
     self.stop_video_btn.setEnabled(False)
     video_controls_layout.addWidget(self.stop_video_btn)
+
+    # Volume controls
+    self.video_volume_label = QLabel("Volume:")
+    video_controls_layout.addWidget(self.video_volume_label)
+    
+    self.video_volume_slider = QSlider(Qt.Orientation.Horizontal)
+    self.video_volume_slider.setRange(0, 100)
+    self.video_volume_slider.setValue(100)
+    self.video_volume_slider.setFixedWidth(140)
+    video_controls_layout.addWidget(self.video_volume_slider)
+    
+    self.video_mute_checkbox = QCheckBox("Mute")
+    video_controls_layout.addWidget(self.video_mute_checkbox)
     
     video_player_layout.addLayout(video_controls_layout)
     
@@ -999,331 +1654,426 @@ def setup_ui(self):
     
     # Create Sensors Tab
     sensors_tab = QWidget()
-    sensors_layout = QVBoxLayout(sensors_tab)
+    sensors_layout = QHBoxLayout(sensors_tab)
+    sensors_layout.setContentsMargins(20, 20, 20, 20)
+    sensors_layout.setSpacing(12)
     
-    # Create a fixed-width container for sensors content
-    sensors_container = QWidget()
-    sensors_container.setFixedWidth(1000)  # Increased width to accommodate 4 columns
-    sensors_container_layout = QVBoxLayout(sensors_container)
-    sensors_container_layout.setContentsMargins(0, 0, 0, 0)
+    # Center spacer left
+    sensors_layout.addStretch()
     
-    # Center the container in the tab
-    sensors_layout.addWidget(sensors_container, 0, Qt.AlignmentFlag.AlignCenter)
+    # Main content container (centered)
+    sensors_main_container = QFrame()
+    sensors_main_container.setFixedWidth(1020)  # Width adjusted for devices on left and table on right
+    sensors_main_container.setStyleSheet(f"""
+        QFrame#sensors_main_container {{
+            background-color: {COLORS.BG_DARK};
+            border: 1px solid {COLORS.BORDER_DEFAULT};
+            border-radius: 8px;
+        }}
+    """)
+    sensors_main_container.setObjectName("sensors_main_container")
+    sensors_main_layout = QVBoxLayout(sensors_main_container)
+    sensors_main_layout.setContentsMargins(16, 16, 16, 16)
+    sensors_main_layout.setSpacing(12)
     
-    # Add device status section with images
-    devices_status_container = QWidget()
-    devices_status_layout = QGridLayout(devices_status_container)
-    devices_status_layout.setContentsMargins(0, 0, 0, 0)
-    devices_status_layout.setHorizontalSpacing(30)  # Reduced space between columns
-    devices_status_layout.setVerticalSpacing(5)     # Space between rows
+    # Horizontal layout for devices (left) and sensor management (right)
+    sensors_content_layout = QHBoxLayout()
+    sensors_content_layout.setSpacing(12)
     
-    # Create framed containers for each device with hover and click functionality
+    # Device cards section with proper styling (matching automation tab)
+    devices_section = QGroupBox("Devices")
+    devices_section.setStyleSheet(GroupBoxStyles.elevated())
+    devices_section_layout = QVBoxLayout(devices_section)
+    devices_section_layout.setContentsMargins(12, 10, 12, 12)
+    devices_section_layout.setSpacing(8)
+    
+    # Device cards container with vertical layout for stacking cards
+    devices_cards_container = QWidget()
+    devices_cards_container.setStyleSheet("background: transparent; border: none;")
+    devices_cards_layout = QVBoxLayout(devices_cards_container)
+    devices_cards_layout.setContentsMargins(0, 0, 0, 0)
+    devices_cards_layout.setSpacing(8)
+    
+    # Modern card style for devices - matching theme system
+    device_card_style = CardStyles.device_card(connected=False)
+    
+    # Card size
+    card_width, card_height = 100, 85
+    
     # Arduino container
     arduino_container = QFrame()
-    arduino_container.setFrameShape(QFrame.Shape.Box)
-    arduino_container.setFrameShadow(QFrame.Shadow.Raised)
-    arduino_container.setLineWidth(2)
-    arduino_container.setStyleSheet("""
-        QFrame { 
-            border: 2px solid #999; 
-            border-radius: 8px; 
-            background-color: transparent; 
-        }
-        QFrame:hover { 
-            background-color: rgba(200, 200, 200, 0.3); 
-            border: 2px solid #777; 
-        }
-    """)
-    arduino_container.setCursor(Qt.CursorShape.PointingHandCursor)  # Change cursor to hand pointer
+    arduino_container.setFixedSize(card_width, card_height)
+    arduino_container.setStyleSheet(device_card_style)
+    arduino_container.setCursor(Qt.CursorShape.PointingHandCursor)
     arduino_layout = QVBoxLayout(arduino_container)
-    arduino_layout.setContentsMargins(5, 5, 5, 5)  # Reduce padding
-    arduino_layout.setSpacing(2)  # Reduce spacing between elements
+    arduino_layout.setContentsMargins(6, 6, 6, 6)
+    arduino_layout.setSpacing(2)
 
     # Labjack container
     labjack_container = QFrame()
-    labjack_container.setFrameShape(QFrame.Shape.Box)
-    labjack_container.setFrameShadow(QFrame.Shadow.Raised)
-    labjack_container.setLineWidth(2)
-    labjack_container.setStyleSheet("""
-        QFrame { 
-            border: 2px solid #999; 
-            border-radius: 8px; 
-            background-color: transparent; 
-        }
-        QFrame:hover { 
-            background-color: rgba(200, 200, 200, 0.3); 
-            border: 2px solid #777; 
-        }
-    """)
-    labjack_container.setCursor(Qt.CursorShape.PointingHandCursor)  # Change cursor to hand pointer
+    labjack_container.setFixedSize(card_width, card_height)
+    labjack_container.setStyleSheet(device_card_style)
+    labjack_container.setCursor(Qt.CursorShape.PointingHandCursor)
     labjack_layout = QVBoxLayout(labjack_container)
-    labjack_layout.setContentsMargins(5, 5, 5, 5)  # Reduce padding
-    labjack_layout.setSpacing(2)  # Reduce spacing between elements
+    labjack_layout.setContentsMargins(6, 6, 6, 6)
+    labjack_layout.setSpacing(2)
 
-    # Other sensors container
+    # Optical Sensor container
+    optical_container = QFrame()
+    optical_container.setFixedSize(card_width, card_height)
+    optical_container.setStyleSheet(device_card_style)
+    optical_container.setCursor(Qt.CursorShape.PointingHandCursor)
+    optical_layout = QVBoxLayout(optical_container)
+    optical_layout.setContentsMargins(6, 6, 6, 6)
+    optical_layout.setSpacing(2)
+
+    # Audio Sensor container
+    audio_container = QFrame()
+    audio_container.setFixedSize(card_width, card_height)
+    audio_container.setStyleSheet(device_card_style)
+    audio_container.setCursor(Qt.CursorShape.PointingHandCursor)
+    audio_layout = QVBoxLayout(audio_container)
+    audio_layout.setContentsMargins(6, 6, 6, 6)
+    audio_layout.setSpacing(2)
+
+    # MQTT container
+    mqtt_container = QFrame()
+    mqtt_container.setFixedSize(card_width, card_height)
+    mqtt_container.setStyleSheet(device_card_style)
+    mqtt_container.setCursor(Qt.CursorShape.PointingHandCursor)
+    mqtt_layout = QVBoxLayout(mqtt_container)
+    mqtt_layout.setContentsMargins(6, 6, 6, 6)
+    mqtt_layout.setSpacing(2)
+
+    # Other sensors container (last position)
     other_container = QFrame()
-    other_container.setFrameShape(QFrame.Shape.Box)
-    other_container.setFrameShadow(QFrame.Shadow.Raised)
-    other_container.setLineWidth(2)
-    other_container.setStyleSheet("""
-        QFrame { 
-            border: 2px solid #999; 
-            border-radius: 8px; 
-            background-color: transparent; 
-        }
-        QFrame:hover { 
-            background-color: rgba(200, 200, 200, 0.3); 
-            border: 2px solid #777; 
-        }
-    """)
-    other_container.setCursor(Qt.CursorShape.PointingHandCursor)  # Change cursor to hand pointer
+    other_container.setFixedSize(card_width, card_height)
+    other_container.setStyleSheet(device_card_style)
+    other_container.setCursor(Qt.CursorShape.PointingHandCursor)
     other_layout = QVBoxLayout(other_container)
-    other_layout.setContentsMargins(5, 5, 5, 5)  # Reduce padding
-    other_layout.setSpacing(2)  # Reduce spacing between elements
+    other_layout.setContentsMargins(6, 6, 6, 6)
+    other_layout.setSpacing(2)
 
-    # Add containers to the grid
-    devices_status_layout.addWidget(arduino_container, 0, 0)
-    devices_status_layout.addWidget(labjack_container, 0, 1)
-    devices_status_layout.addWidget(other_container, 0, 2)
+    # Add cards to vertical layout - stacked from top to bottom, Arduino first
+    devices_cards_layout.addWidget(arduino_container)
+    devices_cards_layout.addWidget(labjack_container)
+    devices_cards_layout.addWidget(other_container)
+    devices_cards_layout.addWidget(optical_container)
+    devices_cards_layout.addWidget(audio_container)
+    devices_cards_layout.addWidget(mqtt_container)
+    # Note: Remote DAQ will be added by StreamController at the end
+    
+    # Add stretch to push cards to top
+    devices_cards_layout.addStretch()
+    
+    # Store reference for StreamController to add Remote DAQ button
+    self.devices_cards_layout = devices_cards_layout
+    self.device_card_style = device_card_style
+    self.device_card_size = (card_width, card_height)
+    
+    devices_section_layout.addWidget(devices_cards_container)
+    
+    # Set maximum width for devices section to prevent it from taking too much space
+    devices_section.setMaximumWidth(200)
+    
+    # Add devices section to horizontal layout (left side)
+    sensors_content_layout.addWidget(devices_section, 0)  # No stretch, fixed size
 
-    # Arduino content
+    # Card content styles (smaller for compact cards)
+    card_label_style = "font-size: 10px; font-weight: bold; color: #fff; border: none; background-color: transparent;"
+    card_status_style = "font-size: 9px; color: #888; border: none; background-color: transparent;"
+    card_icon_style = "font-size: 28px; background-color: transparent; border: none;"
+    
+    # Slightly larger image icons for Arduino/LabJack/Other without resizing cards
+    device_icon_height = 36
+    device_image_icon_size = 34
+    
+    # Get paths to image files
+    ui_dir = os.path.dirname(os.path.abspath(__file__))
+    arduino_img_path = os.path.join(ui_dir, "Arduino.png")
+    labjack_img_path = os.path.join(ui_dir, "Labjack.png")
+    other_img_path = os.path.join(ui_dir, "Other.png")
+    
+    # Arduino content - use image if available
+    arduino_icon = QLabel()
+    arduino_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    arduino_icon.setFixedHeight(device_icon_height)  # Fixed height for consistent label alignment
+    arduino_icon.setStyleSheet("background-color: transparent; border: none;")
+    if os.path.exists(arduino_img_path):
+        pixmap = QPixmap(arduino_img_path)
+        # Scale to fit the small card while appearing larger than default
+        scaled_pixmap = pixmap.scaled(device_image_icon_size, device_image_icon_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        arduino_icon.setPixmap(scaled_pixmap)
+    else:
+        arduino_icon.setText("🔌")
+        arduino_icon.setStyleSheet(card_icon_style)
+    arduino_layout.addWidget(arduino_icon)
+    
     arduino_label = QLabel("Arduino")
     arduino_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    arduino_label.setStyleSheet("font-size: 14px; font-weight: bold; border: none; background-color: transparent; margin: 0; padding: 0;")
+    arduino_label.setStyleSheet(card_label_style)
     arduino_layout.addWidget(arduino_label)
-
-    # Create the arduino image with rounded corners
-    arduino_image = QLabel()
-    arduino_pixmap = QPixmap(resource_path("app/ui/Arduino.png"))
-    arduino_pixmap = arduino_pixmap.scaledToWidth(130, Qt.TransformationMode.SmoothTransformation)
-
-    # Create a mask for rounded corners
-    rounded_pixmap = QPixmap(arduino_pixmap.size())
-    rounded_pixmap.fill(Qt.GlobalColor.transparent)
-    mask_painter = QPainter(rounded_pixmap)
-    mask_painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    mask_painter.setBrush(Qt.GlobalColor.white)
-    mask_painter.setPen(Qt.PenStyle.NoPen)
-    mask_painter.drawRoundedRect(rounded_pixmap.rect(), 15, 15)
-    mask_painter.end()
-
-    # Apply the mask
-    masked_pixmap = QPixmap(arduino_pixmap.size())
-    masked_pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(masked_pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.drawPixmap(0, 0, rounded_pixmap)
-    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
-    painter.drawPixmap(0, 0, arduino_pixmap)
-    painter.end()
-
-    arduino_image.setPixmap(masked_pixmap)
-    arduino_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    arduino_image.setStyleSheet("background-color: transparent; border: none;")
-    arduino_layout.addWidget(arduino_image)
 
     self.arduino_status = QLabel("Not connected")
     self.arduino_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    self.arduino_status.setStyleSheet("color: grey; font-weight: bold; font-size: 13px; background-color: transparent; border: none; margin: 0; padding: 0;")
+    self.arduino_status.setStyleSheet(card_status_style)
     self.arduino_status.setObjectName("arduino_status_label")
     arduino_layout.addWidget(self.arduino_status)
 
-    # Labjack content
-    labjack_label = QLabel("Labjack")
+    # Labjack content - use image if available
+    labjack_icon = QLabel()
+    labjack_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    labjack_icon.setFixedHeight(device_icon_height)  # Fixed height for consistent label alignment
+    labjack_icon.setStyleSheet("background-color: transparent; border: none;")
+    if os.path.exists(labjack_img_path):
+        pixmap = QPixmap(labjack_img_path)
+        # Scale to fit the small card while appearing larger than default
+        scaled_pixmap = pixmap.scaled(device_image_icon_size, device_image_icon_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        labjack_icon.setPixmap(scaled_pixmap)
+    else:
+        labjack_icon.setText("📊")
+        labjack_icon.setStyleSheet(card_icon_style)
+    labjack_layout.addWidget(labjack_icon)
+    
+    labjack_label = QLabel("LabJack")
     labjack_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    labjack_label.setStyleSheet("font-size: 14px; font-weight: bold; border: none; background-color: transparent; margin: 0; padding: 0;")
+    labjack_label.setStyleSheet(card_label_style)
     labjack_layout.addWidget(labjack_label)
-
-    # Create the labjack image with rounded corners
-    labjack_image = QLabel()
-    labjack_pixmap = QPixmap(resource_path("app/ui/Labjack.png"))
-    labjack_pixmap = labjack_pixmap.scaledToWidth(130, Qt.TransformationMode.SmoothTransformation)
-
-    # Create and apply the mask for rounded corners (same process as arduino)
-    rounded_pixmap = QPixmap(labjack_pixmap.size())
-    rounded_pixmap.fill(Qt.GlobalColor.transparent)
-    mask_painter = QPainter(rounded_pixmap)
-    mask_painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    mask_painter.setBrush(Qt.GlobalColor.white)
-    mask_painter.setPen(Qt.PenStyle.NoPen)
-    mask_painter.drawRoundedRect(rounded_pixmap.rect(), 15, 15)
-    mask_painter.end()
-
-    masked_pixmap = QPixmap(labjack_pixmap.size())
-    masked_pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(masked_pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.drawPixmap(0, 0, rounded_pixmap)
-    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
-    painter.drawPixmap(0, 0, labjack_pixmap)
-    painter.end()
-
-    labjack_image.setPixmap(masked_pixmap)
-    labjack_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    labjack_image.setStyleSheet("background-color: transparent; border: none;")
-    labjack_layout.addWidget(labjack_image)
 
     self.labjack_status = QLabel("Not connected")
     self.labjack_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    self.labjack_status.setStyleSheet("color: grey; font-weight: bold; font-size: 13px; background-color: transparent; border: none; margin: 0; padding: 0;")
+    self.labjack_status.setStyleSheet(card_status_style)
     self.labjack_status.setObjectName("labjack_status_label")
     labjack_layout.addWidget(self.labjack_status)
 
-    # Other sensors content
-    other_label = QLabel("Other sensors")
+    # Optical Sensor content
+    optical_icon = QLabel("🎥")
+    optical_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    optical_icon.setFixedHeight(30)  # Fixed height for consistent label alignment
+    optical_icon.setStyleSheet(card_icon_style)
+    optical_layout.addWidget(optical_icon)
+    
+    optical_label = QLabel("Optical")
+    optical_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    optical_label.setStyleSheet(card_label_style)
+    optical_layout.addWidget(optical_label)
+
+    self.optical_status = QLabel("Not configured")
+    self.optical_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    self.optical_status.setStyleSheet(card_status_style)
+    self.optical_status.setObjectName("optical_status_label")
+    optical_layout.addWidget(self.optical_status)
+
+    # Audio Sensor content
+    audio_icon = QLabel("🎤")
+    audio_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    audio_icon.setFixedHeight(30)  # Fixed height for consistent label alignment
+    audio_icon.setStyleSheet(card_icon_style)
+    audio_layout.addWidget(audio_icon)
+    
+    audio_label = QLabel("Audio")
+    audio_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    audio_label.setStyleSheet(card_label_style)
+    audio_layout.addWidget(audio_label)
+
+    self.audio_status = QLabel("Not configured")
+    self.audio_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    self.audio_status.setStyleSheet(card_status_style)
+    self.audio_status.setObjectName("audio_status_label")
+    audio_layout.addWidget(self.audio_status)
+
+    # MQTT content
+    mqtt_icon = QLabel("☁️")
+    mqtt_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    mqtt_icon.setFixedHeight(30)
+    mqtt_icon.setStyleSheet(card_icon_style)
+    mqtt_layout.addWidget(mqtt_icon)
+    
+    mqtt_label = QLabel("MQTT")
+    mqtt_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    mqtt_label.setStyleSheet(card_label_style)
+    mqtt_layout.addWidget(mqtt_label)
+
+    self.mqtt_status = QLabel("Not connected")
+    self.mqtt_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    self.mqtt_status.setStyleSheet(card_status_style)
+    self.mqtt_status.setObjectName("mqtt_status_label")
+    mqtt_layout.addWidget(self.mqtt_status)
+
+    # Other sensors content (last position) - use image if available
+    other_icon = QLabel()
+    other_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    other_icon.setFixedHeight(device_icon_height)  # Fixed height for consistent label alignment
+    other_icon.setStyleSheet("background-color: transparent; border: none;")
+    if os.path.exists(other_img_path):
+        pixmap = QPixmap(other_img_path)
+        # Scale to fit the small card while appearing larger than default
+        scaled_pixmap = pixmap.scaled(device_image_icon_size, device_image_icon_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        other_icon.setPixmap(scaled_pixmap)
+    else:
+        other_icon.setText("🔧")
+        other_icon.setStyleSheet(card_icon_style)
+    other_layout.addWidget(other_icon)
+    
+    other_label = QLabel("Serial")
     other_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    other_label.setStyleSheet("font-size: 14px; font-weight: bold; border: none; background-color: transparent; margin: 0; padding: 0;")
+    other_label.setStyleSheet(card_label_style)
     other_layout.addWidget(other_label)
-
-    # Create the other sensors image with rounded corners
-    other_image = QLabel()
-    other_pixmap = QPixmap(resource_path("app/ui/Other.png"))
-    other_pixmap = other_pixmap.scaledToWidth(130, Qt.TransformationMode.SmoothTransformation)
-
-    # Create and apply the mask for rounded corners (same process as arduino)
-    rounded_pixmap = QPixmap(other_pixmap.size())
-    rounded_pixmap.fill(Qt.GlobalColor.transparent)
-    mask_painter = QPainter(rounded_pixmap)
-    mask_painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    mask_painter.setBrush(Qt.GlobalColor.white)
-    mask_painter.setPen(Qt.PenStyle.NoPen)
-    mask_painter.drawRoundedRect(rounded_pixmap.rect(), 15, 15)
-    mask_painter.end()
-
-    masked_pixmap = QPixmap(other_pixmap.size())
-    masked_pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(masked_pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.drawPixmap(0, 0, rounded_pixmap)
-    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
-    painter.drawPixmap(0, 0, other_pixmap)
-    painter.end()
-
-    other_image.setPixmap(masked_pixmap)
-    other_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    other_image.setStyleSheet("background-color: transparent; border: none;")
-    other_layout.addWidget(other_image)
 
     self.other_status = QLabel("Not connected")
     self.other_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    self.other_status.setStyleSheet("color: grey; font-weight: bold; font-size: 13px; background-color: transparent; border: none; margin: 0; padding: 0;")
+    self.other_status.setStyleSheet(card_status_style)
     self.other_status.setObjectName("other_status_label")
     other_layout.addWidget(self.other_status)
 
-    # Add click events to open settings tab when clicked
-    def open_settings_tab():
-        # Find the settings tab index (typically 1)
-        settings_tab_index = 1
-        self.stacked_widget.setCurrentIndex(settings_tab_index)
-
-    # Open Arduino settings in a popup when Arduino container is clicked
+    # Add click events to open settings when clicked
     arduino_container.mousePressEvent = lambda event: self.show_arduino_settings_popup()
-    
-    # Open LabJack settings in a popup when LabJack container is clicked
     labjack_container.mousePressEvent = lambda event: self.show_labjack_settings_popup()
-    
-    # Open Other Sensors settings in a popup when Other container is clicked
     other_container.mousePressEvent = lambda event: self.show_other_settings_popup()
-
-    # Set size constraints for the container
-    devices_status_container.setFixedHeight(155)  # Further reduced height for the frames
-
-    # Add the device status container to the main layout
-    sensors_container_layout.addWidget(devices_status_container, alignment=Qt.AlignmentFlag.AlignHCenter)
+    mqtt_container.mousePressEvent = lambda event: self.show_mqtt_settings_popup()
+    optical_container.mousePressEvent = lambda event: self.show_optical_sensor_popup()
+    audio_container.mousePressEvent = lambda event: self.show_audio_sensor_popup()
     
-    # Reduce spacing - use a smaller spacer instead of the larger stretch
-    sensors_container_layout.addSpacing(20)  # Increased spacing between device boxes and sensor management
-    
-    # Create a container widget for the sensor table and controls
-    sensor_container = QGroupBox("Sensor Management")
+    # Sensor Management section - modernized (matching theme)
+    sensor_container = QGroupBox("📊 Sensor Management")
+    sensor_container.setStyleSheet(GroupBoxStyles.elevated())
     sensor_container_layout = QVBoxLayout(sensor_container)
-    sensor_container.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+    sensor_container_layout.setContentsMargins(12, 18, 12, 12)
+    sensor_container_layout.setSpacing(10)
     
-    # Sensor data table (create this first to calculate width)
-    self.data_table = QTableWidget(0, 6)  # Reduced to 6 columns - removed the conversion and port columns
-    self.data_table.setHorizontalHeaderLabels(["Show in Graph", "Sensor", "Value", "Interface", "Offset/Unit", "Color"])
-    self.data_table.horizontalHeader().setStretchLastSection(True)
-    self.data_table.setColumnWidth(0, 100)  # Width for checkbox column
-    self.data_table.setColumnWidth(1, 120)  # Sensor name
-    self.data_table.setColumnWidth(2, 100)  # Value
-    self.data_table.setColumnWidth(3, 80)   # Interface
-    self.data_table.setColumnWidth(4, 100)  # Offset/Unit
-    self.data_table.setColumnWidth(5, 80)   # Color
+    # Sensor data table with modern styling
+    self.data_table = QTableWidget(0, 7)
+    self.data_table.setHorizontalHeaderLabels(["Use", "Sensor", "Value", "Interface", "Offset/Unit", "Color", "Cal."])
+    self.data_table.horizontalHeader().setStretchLastSection(False)
+    self.data_table.setColumnWidth(0, 45)
+    self.data_table.setColumnWidth(1, 130)
+    self.data_table.setColumnWidth(2, 90)
+    self.data_table.setColumnWidth(3, 80)
+    self.data_table.setColumnWidth(4, 90)
+    self.data_table.setColumnWidth(5, 60)
+    self.data_table.setColumnWidth(6, 45)
     
-    # Set a fixed width for the table based on the sum of column widths plus some margin
-    table_width = sum([self.data_table.columnWidth(i) for i in range(6)]) + 30  # Add margin for scrollbar
-    self.data_table.setMinimumWidth(table_width)
-    self.data_table.setMaximumWidth(table_width)
+    # Modern table styling from theme
+    self.data_table.setStyleSheet(TableStyles.default())
     
-    # Set a minimum height for the table to show about 15 rows
-    row_height = self.data_table.verticalHeader().defaultSectionSize()
-    header_height = self.data_table.horizontalHeader().height()
-    self.data_table.setMinimumHeight(row_height * 15 + header_height)
-    self.data_table.setObjectName("data_table")  # Set object name for findChild
-    
-    # Add row selection behavior to enable edit/remove buttons when a row is selected
+    # Allow table to fit within its container and scroll horizontally if needed
+    self.data_table.setMinimumHeight(200)
+    self.data_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    self.data_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    self.data_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    self.data_table.setObjectName("data_table")
     self.data_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     self.data_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
     
-    # Sensor management - buttons with width matching the table
+    # Sensor buttons with modern styling from theme
     sensor_controls = QHBoxLayout()
-    self.add_sensor_btn = QPushButton("Add Sensor")
-    self.add_sensor_btn.setObjectName("add_sensor_btn")  # Set object name for findChild
-    self.edit_sensor_btn = QPushButton("Edit Sensor")
-    self.edit_sensor_btn.setObjectName("edit_sensor_btn")  # Set object name for findChild
-    self.remove_sensor_btn = QPushButton("Remove Sensor")
-    self.remove_sensor_btn.setObjectName("remove_sensor_btn")  # Set object name for findChild
+    sensor_controls.setSpacing(8)
     
-    # Set fixed width for buttons to make them equal and fit within table width
-    button_width = (table_width - 20) // 3  # Divide table width by 3 with small gaps
-    self.add_sensor_btn.setFixedWidth(button_width)
-    self.add_sensor_btn.setStyleSheet(green_button_style)
-    self.edit_sensor_btn.setFixedWidth(button_width)
-    # Don't disable the edit button initially
-    self.remove_sensor_btn.setFixedWidth(button_width)
-    # Don't disable the remove button initially
+    sensor_btn_style = ButtonStyles.get("secondary", size="small")
+    add_btn_style = ButtonStyles.get("success", size="small")
+    remove_btn_style = ButtonStyles.get("danger", size="small")
     
-    # Remove these connections - they will be handled by the controller
-    # self.add_sensor_btn.clicked.connect(self.add_sensor)
-    # self.edit_sensor_btn.clicked.connect(self.edit_sensor)
-    # self.remove_sensor_btn.clicked.connect(self.remove_sensor)
+    self.add_sensor_btn = QPushButton("➕ Add Sensor")
+    self.add_sensor_btn.setObjectName("add_sensor_btn")
+    self.add_sensor_btn.setStyleSheet(add_btn_style)
+    self.add_sensor_btn.setFixedHeight(32)
+    
+    self.edit_sensor_btn = QPushButton("✏️ Edit")
+    self.edit_sensor_btn.setObjectName("edit_sensor_btn")
+    self.edit_sensor_btn.setStyleSheet(sensor_btn_style)
+    self.edit_sensor_btn.setFixedHeight(32)
+    
+    self.remove_sensor_btn = QPushButton("🗑️ Remove")
+    self.remove_sensor_btn.setObjectName("remove_sensor_btn")
+    self.remove_sensor_btn.setStyleSheet(remove_btn_style)
+    self.remove_sensor_btn.setFixedHeight(32)
+    
     sensor_controls.addWidget(self.add_sensor_btn)
     sensor_controls.addWidget(self.edit_sensor_btn)
     sensor_controls.addWidget(self.remove_sensor_btn)
-    sensor_controls.setSpacing(10)  # Add spacing between buttons
-    sensor_controls.addStretch()  # Add stretch to keep buttons aligned left
+    sensor_controls.addStretch()
     
-    # Add controls and table to the container
     sensor_container_layout.addLayout(sensor_controls)
     sensor_container_layout.addWidget(self.data_table)
     
-    # Connect table selection to enable buttons
+    # Connect table events
     self.data_table.cellClicked.connect(self.select_sensor)
+    self.data_table.cellDoubleClicked.connect(lambda row, col: self.sensor_controller.edit_sensor() if hasattr(self, 'sensor_controller') else None)
     
-    # Add the sensor container to the main layout with horizontal centering
-    sensors_container_layout.addWidget(sensor_container, alignment=Qt.AlignmentFlag.AlignHCenter)
+    # Add sensor container to horizontal layout (right side) with stretch to allow expansion
+    sensors_content_layout.addWidget(sensor_container, 1)  # Stretch factor 1 to allow expansion
     
-    # Add a small spacing after the group box
-    sensors_container_layout.addSpacing(5)
+    # Add horizontal content layout to main vertical layout
+    sensors_main_layout.addLayout(sensors_content_layout)
     
-    # Add explanation text about "Show in Graph" checkbox - below the Sensor Management group box
-    explanation_label = QLabel("Note: The 'Show in Graph' checkbox only controls whether a sensor appears in graph visualizations. All enabled sensors have their data recorded regardless of this setting.")
-    explanation_label.setStyleSheet("color: #666; font-style: italic;")
-    explanation_label.setWordWrap(True)
-    explanation_label.setMinimumWidth(table_width)  # Set minimum width to match table
-    explanation_label.setMaximumWidth(table_width)  # Set maximum width to match table
-    explanation_label.setMinimumHeight(40)  # Set minimum height to ensure two lines are visible
-    explanation_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    sensors_container_layout.addWidget(explanation_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+    # Bottom row with help button
+    sensors_bottom_layout = QHBoxLayout()
     
-    # Add stretch to push everything up
-    sensors_container_layout.addStretch(1)  # Add stretch after the container with equal weight
+    # Explanation text
+    explanation_label = QLabel("💡 'Show in Graph' only controls visualization. All enabled sensors are recorded.")
+    explanation_label.setStyleSheet("color: #666; font-size: 10px;")
+    sensors_bottom_layout.addWidget(explanation_label)
+    
+    sensors_bottom_layout.addStretch()
+    
+    # Help button
+    self.sensors_help_btn = QPushButton("❓ Help")
+    self.sensors_help_btn.setCheckable(True)
+    self.sensors_help_btn.setFixedSize(80, 32)
+    self.sensors_help_btn.setStyleSheet(ButtonStyles.get("secondary", size="small"))
+    sensors_bottom_layout.addWidget(self.sensors_help_btn)
+    
+    sensors_main_layout.addLayout(sensors_bottom_layout)
+    
+    # Add main container to layout
+    sensors_layout.addWidget(sensors_main_container)
+    
+    # Right side: Help panel
+    from app.ui.tools.help_panel import HelpPanel, get_help_content
+    
+    self.sensors_help_container = QWidget()
+    self.sensors_help_container.setVisible(False)
+    self.sensors_help_container.setFixedWidth(320)
+    sensors_help_container_layout = QVBoxLayout(self.sensors_help_container)
+    sensors_help_container_layout.setContentsMargins(0, 0, 0, 0)
+    
+    self.sensors_help_panel = HelpPanel("Sensors Help")
+    sensors_help_container_layout.addWidget(self.sensors_help_panel)
+    
+    # Load sensors help content
+    sensors_help_content = get_help_content("sensors")
+    self.sensors_help_panel.clear_sections()
+    for section in sensors_help_content.get("sections", []):
+        self.sensors_help_panel.add_section(
+            section.get("title", ""),
+            section.get("content", ""),
+            section.get("icon", "📖")
+        )
+    if self.sensors_help_panel.sections:
+        self.sensors_help_panel.sections[0].expand()
+    
+    sensors_layout.addWidget(self.sensors_help_container)
+    
+    # Connect help button
+    self.sensors_help_visible = False
+    
+    def toggle_sensors_help():
+        self.sensors_help_visible = not self.sensors_help_visible
+        self.sensors_help_container.setVisible(self.sensors_help_visible)
+        self.sensors_help_btn.setChecked(self.sensors_help_visible)
+    
+    self.sensors_help_btn.clicked.connect(toggle_sensors_help)
+    self.sensors_help_panel.close_requested.connect(toggle_sensors_help)
+    
+    # Center spacer right
+    sensors_layout.addStretch()
     
     # Add sensors tab
     self.stacked_widget.addWidget(sensors_tab)
     
     # Create Graphs Tab
     graphs_tab = QWidget()
+    self.graphs_tab = graphs_tab  # Store reference to avoid hardcoded indexing
     graphs_layout = QVBoxLayout(graphs_tab)
     
     # Create a splitter for the graphs tab
@@ -1338,6 +2088,7 @@ def setup_ui(self):
     
     # Graph type selection
     graph_type_group = QGroupBox("Graph Type")
+    graph_type_group.setStyleSheet(GroupBoxStyles.default())
     graph_type_layout = QVBoxLayout(graph_type_group)
     
     graph_type_layout.addWidget(QLabel("Graph Type:"))
@@ -1361,96 +2112,35 @@ def setup_ui(self):
         self.update_graph()
     ])
     
-    # Graph info area
-    graph_info_text = QTextEdit()
-    graph_info_text.setReadOnly(True)
-    graph_info_text.setMinimumHeight(200)
-    graph_info_text.setStyleSheet("background-color: #f0f0f0; color: #333333; border-radius: 5px; padding: 10px;")
-    graph_info_text.setHtml("""
-    <h3>Graph Types</h3>
-    <p><b>Standard Time Series:</b> Shows raw sensor values over time. Basic visualization for all experiments. You can select multiple sensors to compare their behavior simultaneously.</p>
-    <p><b>Temperature Difference:</b> Shows the difference between two measurement points over time. Useful for identifying heat transfer or temperature gradients.</p>
-    <p><b>Rate of Change (dT/dt):</b> Shows the rate of temperature change. Helps identify thermal response times or sudden changes (e.g., exothermic or endothermic processes).</p>
-    <p><b>Moving Average:</b> Shows the moving average over a specific time period. Reduces noise and helps identify trends more clearly.</p>
-    <p><b>Fourier Analysis:</b> Shows periodic components in the temperature data. Can help discover oscillations or cyclical patterns.</p>
-    <p><b>Histogram:</b> Shows the distribution of measured values - how often each value or range of values occurs.</p>
-    <p><b>Box Plot:</b> Shows the distribution of measured values using quartiles.</p>
-    <p><b>Correlation Analysis:</b> If you have multiple sensors, a correlation graph shows whether and how strongly different measurement points are related. Important for experiments with spatial temperature distribution.</p>
-    """)
+    # Graph info area - compact description for selected type only
+    graph_info_text = QLabel()
+    graph_info_text.setWordWrap(True)
+    graph_info_text.setMinimumHeight(40)
+    graph_info_text.setMaximumHeight(60)
+    graph_info_text.setStyleSheet(f"background-color: {COLORS.BG_CARD}; color: {COLORS.TEXT_SECONDARY}; border-radius: 5px; padding: 8px; font-size: 11px;")
+    graph_info_text.setText("📊 Standard Time Series: Shows raw sensor values over time. Select multiple sensors to compare.")
     graph_type_layout.addWidget(graph_info_text)
     
     # Connect graph type combo to update info text
     def update_graph_info():
         graph_type = self.graph_type_combo.currentText()
-        if graph_type == "Standard Time Series":
-            graph_info_text.setHtml("""
-            <h3>Standard Time Series</h3>
-            <p>The most basic and versatile graph type showing raw sensor values plotted against time.</p>
-            <p><b>When to use:</b> This is the default visualization for most experiments. Use it to get a quick overview of your data and to identify general trends, peaks, and valleys.</p>
-            <p><b>Interpretation:</b> The x-axis represents time, while the y-axis shows the measured values. Rising lines indicate increasing values, falling lines indicate decreasing values.</p>
-            <p><b>Tip:</b> You can select multiple sensors to compare their behavior over time. Use the primary sensor dropdown to select the main sensor, and the additional sensors list below to select multiple sensors to display simultaneously.</p>
-            """)
-        elif graph_type == "Temperature Difference":
-            graph_info_text.setHtml("""
-            <h3>Temperature Difference Graph</h3>
-            <p>Shows the difference between two measurement points or locations over time.</p>
-            <p><b>When to use:</b> When you want to analyze heat transfer, temperature gradients, or the relative behavior of two sensors.</p>
-            <p><b>Interpretation:</b> The y-axis shows the temperature difference (T₁-T₂). Positive values mean the first sensor is warmer, negative values mean the second sensor is warmer.</p>
-            <p><b>Tip:</b> This is particularly useful for experiments involving heat flow or thermal conductivity.</p>
-            """)
-        elif graph_type == "Rate of Change (dT/dt)":
-            graph_info_text.setHtml("""
-            <h3>Rate of Change (dT/dt)</h3>
-            <p>Shows how quickly the measured value is changing at each point in time.</p>
-            <p><b>When to use:</b> When you're interested in the speed of changes rather than absolute values. Useful for identifying reaction rates, thermal response times, or sudden events.</p>
-            <p><b>Interpretation:</b> The y-axis shows the rate of change. Positive values indicate rising temperatures, negative values indicate falling temperatures. Steeper slopes mean faster changes.</p>
-            <p><b>Tip:</b> Look for sudden spikes that might indicate exothermic or endothermic reactions.</p>
-            """)
-        elif graph_type == "Moving Average":
-            graph_info_text.setHtml("""
-            <h3>Moving Average</h3>
-            <p>Shows the average value over a sliding window of time, smoothing out short-term fluctuations.</p>
-            <p><b>When to use:</b> When your data contains noise or rapid fluctuations that make it difficult to see the underlying trend.</p>
-            <p><b>Interpretation:</b> The smoother line represents the average trend, filtering out random variations and noise.</p>
-            <p><b>Tip:</b> You can adjust the window size to control the amount of smoothing. Larger windows give smoother lines but might miss important short-term changes.</p>
-            """)
-        elif graph_type == "Fourier Analysis":
-            graph_info_text.setHtml("""
-            <h3>Fourier Analysis (Spectral Analysis)</h3>
-            <p>Transforms time-domain data into the frequency domain to reveal periodic components.</p>
-            <p><b>When to use:</b> When you suspect your data contains cyclical patterns or oscillations that might not be obvious in the time domain.</p>
-            <p><b>Interpretation:</b> The x-axis shows frequency, while the y-axis shows the strength of each frequency component. Peaks indicate strong periodic behavior at that frequency.</p>
-            <p><b>Tip:</b> This is an advanced analysis technique particularly useful for identifying hidden patterns or resonances in your experimental system.</p>
-            """)
-        elif graph_type == "Histogram":
-            graph_info_text.setHtml("""
-            <h3>Histogram</h3>
-            <p>Shows the distribution of measured values - how often each value or range of values occurs.</p>
-            <p><b>When to use:</b> When you want to understand the statistical distribution of your data or identify the most common values.</p>
-            <p><b>Interpretation:</b> The x-axis shows the value ranges (bins), while the y-axis shows how many measurements fall into each bin. Tall bars indicate commonly occurring values.</p>
-            <p><b>Tip:</b> Look for multiple peaks that might indicate different stable states in your system.</p>
-            """)
-        elif graph_type == "Box Plot":
-            graph_info_text.setHtml("""
-            <h3>Box Plot (Box-and-Whisker)</h3>
-            <p>Shows the distribution of measured values using quartiles.</p>
-            <p><b>When to use:</b> When you want a statistical summary of your data, including median, spread (interquartile range), and potential outliers.</p>
-            <p><b>Interpretation:</b> The box spans the interquartile range (IQR: 25th to 75th percentile). The line inside is the median (50th percentile). Whiskers typically extend to 1.5 times the IQR from the box, or to the data extremes if closer. Points outside the whiskers are potential outliers.</p>
-            <p><b>Tip:</b> Useful for comparing distributions across different sensors or time periods (if implemented) or identifying skewed data.</p>
-            """)
-        elif graph_type == "Correlation Analysis":
-            graph_info_text.setHtml("""
-            <h3>Correlation Analysis</h3>
-            <p>Shows how strongly two variables are related to each other.</p>
-            <p><b>When to use:</b> When you have multiple sensors and want to understand how they influence each other or respond to the same stimuli.</p>
-            <p><b>Interpretation:</b> Points forming a diagonal line indicate strong correlation. Scattered points indicate weak or no correlation. The correlation coefficient (r) quantifies this relationship.</p>
-            <p><b>Tip:</b> This can help identify cause-and-effect relationships or dependencies between different parts of your experimental setup.</p>
-            """)
+        info_texts = {
+            "Standard Time Series": "📊 Standard Time Series: Shows raw sensor values over time. Select multiple sensors to compare.",
+            "Temperature Difference": "🔀 Temperature Difference: Shows T₁-T₂ over time. Useful for heat transfer analysis.",
+            "Rate of Change (dT/dt)": "📈 Rate of Change: Shows how quickly values change. Identifies thermal response times.",
+            "Moving Average": "〰️ Moving Average: Smooths fluctuations to reveal underlying trends.",
+            "Fourier Analysis": "🎵 Fourier Analysis: Reveals periodic components and oscillations in frequency domain.",
+            "Histogram": "📊 Histogram: Shows value distribution - how often each value occurs.",
+            "Box Plot": "📦 Box Plot: Statistical summary with median, quartiles, and outliers.",
+            "Correlation Analysis": "🔗 Correlation: Shows relationship strength between two sensors."
+        }
+        graph_info_text.setText(info_texts.get(graph_type, "Select a graph type for description."))
     
     self.graph_type_combo.currentIndexChanged.connect(update_graph_info)
     
     # Sensor selection
     sensor_selection_group = QGroupBox("Sensor Selection")
+    sensor_selection_group.setStyleSheet(GroupBoxStyles.default())
     sensor_selection_layout = QVBoxLayout(sensor_selection_group)
     
     # Primary sensor
@@ -1463,6 +2153,7 @@ def setup_ui(self):
     
     # Multi-sensor selection for Standard Time Series
     self.multi_sensor_group = QGroupBox("Additional Sensors (for Standard Time Series)")
+    self.multi_sensor_group.setStyleSheet(GroupBoxStyles.subtle())
     multi_sensor_layout = QVBoxLayout(self.multi_sensor_group)
     self.multi_sensor_list = QListWidget()
     self.multi_sensor_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
@@ -1482,6 +2173,7 @@ def setup_ui(self):
     
     # Graph parameters
     graph_params_group = QGroupBox("Graph Parameters")
+    graph_params_group.setStyleSheet(GroupBoxStyles.default())
     graph_params_layout = QGridLayout(graph_params_group)
     
     # Timespan
@@ -1551,9 +2243,17 @@ def setup_ui(self):
     self.show_control_run_checkbox.stateChanged.connect(self.on_show_control_run_changed)
     # Add checkbox to layout, spanning 2 columns for better spacing
     graph_params_layout.addWidget(self.show_control_run_checkbox, 6, 0, 1, 2)
+
+    # Show automation markers checkbox
+    self.show_automation_events_checkbox = QCheckBox("Show Automation Events")
+    self.show_automation_events_checkbox.setToolTip("Toggle automation trigger/action markers on graphs")
+    self.show_automation_events_checkbox.setChecked(True)
+    self.show_automation_events_checkbox.stateChanged.connect(self.on_show_automation_markers_changed)
+    graph_params_layout.addWidget(self.show_automation_events_checkbox, 7, 0, 1, 2)
     
     # Plot Format Settings
     plot_format_group = QGroupBox("Plot Format")
+    plot_format_group.setStyleSheet(GroupBoxStyles.default())
     plot_format_layout = QGridLayout(plot_format_group)
     
     # Style presets
@@ -1567,8 +2267,33 @@ def setup_ui(self):
         "Pastel",
         "Colorful"
     ])
-    # Set Dark as the default preset
-    self.plot_style_preset.setCurrentIndex(2)  # "Dark" is at index 2
+    # Style preset will be set by load_settings method
+    self.plot_style_preset.setCurrentIndex(3)  # Default to "High Contrast" (index 3)
+    
+    # Graph Simplification (Downsampling)
+    self.graph_downsampling_checkbox = QCheckBox("Enable Graph Simplification")
+    self.graph_downsampling_checkbox.setToolTip("Reduces data points displayed on graphs for better performance. Disable to see every detail.")
+    
+    # Use SettingsModel for safer boolean retrieval if available
+    is_downsampling_enabled = True
+    if hasattr(self, 'settings_model'):
+        is_downsampling_enabled = self.settings_model.get_bool("graph_downsampling", True)
+    else:
+        is_downsampling_enabled = self.settings.value("graph_downsampling", "true") == "true"
+        
+    self.graph_downsampling_checkbox.setChecked(is_downsampling_enabled)
+    
+    # Connect to save setting and then update graph
+    def on_downsampling_toggled(state):
+        enabled = (state == Qt.CheckState.Checked.value)
+        if hasattr(self, 'settings_model'):
+            self.settings_model.set_value("graph_downsampling", enabled)
+        else:
+            self.settings.setValue("graph_downsampling", "true" if enabled else "false")
+        self.apply_plot_formatting()
+        self.update_graph()
+    self.graph_downsampling_checkbox.stateChanged.connect(on_downsampling_toggled)
+    plot_format_layout.addWidget(self.graph_downsampling_checkbox, 1, 0, 1, 2)
     
     # Connect to the apply_plot_formatting function and then update graphs
     self.plot_style_preset.currentIndexChanged.connect(lambda: [
@@ -1580,7 +2305,7 @@ def setup_ui(self):
     plot_format_layout.addWidget(self.plot_style_preset, 0, 1)
     
     # Font size
-    plot_format_layout.addWidget(QLabel("Font Size:"), 1, 0)
+    plot_format_layout.addWidget(QLabel("Font Size:"), 2, 0)
     self.plot_font_size = QSpinBox()
     self.plot_font_size.setRange(8, 24)
     self.plot_font_size.setValue(10)
@@ -1593,13 +2318,13 @@ def setup_ui(self):
         self.update_dashboard_graph() if hasattr(self, 'dashboard_graph_widget') else None
     ])
     
-    plot_format_layout.addWidget(self.plot_font_size, 1, 1)
+    plot_format_layout.addWidget(self.plot_font_size, 2, 1)
     
     # Line size
-    plot_format_layout.addWidget(QLabel("Line Width:"), 2, 0)
+    plot_format_layout.addWidget(QLabel("Line Width:"), 3, 0)
     self.plot_line_width = QSpinBox()
     self.plot_line_width.setRange(1, 10)
-    self.plot_line_width.setValue(2)
+    self.plot_line_width.setValue(2)  # Will be overridden by load_settings
     self.plot_line_width.setSuffix(" px")
     
     # Connect to the apply_plot_formatting function and then update graphs
@@ -1609,7 +2334,7 @@ def setup_ui(self):
         self.update_dashboard_graph() if hasattr(self, 'dashboard_graph_widget') else None
     ])
     
-    plot_format_layout.addWidget(self.plot_line_width, 2, 1)
+    plot_format_layout.addWidget(self.plot_line_width, 3, 1)
     
     # Add all controls to the layout
     graph_controls_layout.addWidget(graph_type_group)
@@ -1628,12 +2353,8 @@ def setup_ui(self):
     # Main graph
     self.graph_widget = pyqtgraph.PlotWidget()
     # Apply dark theme settings
-    self.graph_widget.setBackground('#2D2D2D')
-    self.graph_widget.getAxis('bottom').setPen('#BBBBBB')
-    self.graph_widget.getAxis('left').setPen('#BBBBBB')
-    self.graph_widget.getAxis('bottom').setTextPen('#EEEEEE')
-    self.graph_widget.getAxis('left').setTextPen('#EEEEEE')
-    self.graph_widget.showGrid(x=True, y=True, alpha=0.2)
+    # Apply dark theme to main graph
+    GraphStyles.apply_dark_theme(self.graph_widget)
     self.graph_widget.setLabel('left', 'Value')
     self.graph_widget.setLabel('bottom', 'Sample Count')
     self.graph_widget.addLegend()
@@ -1649,26 +2370,30 @@ def setup_ui(self):
     
     # Create Automation Tab
     automation_tab = QWidget()
-    automation_layout = QVBoxLayout(automation_tab)
+    automation_layout = QHBoxLayout(automation_tab)
+    automation_layout.setContentsMargins(20, 20, 20, 20)
+    automation_layout.setSpacing(12)
     
-    # Create a fixed-width container for automation content
-    automation_container = QWidget()
-    automation_container.setFixedWidth(800)  # Set a reasonable fixed width
-    automation_container_layout = QVBoxLayout(automation_container)
-    automation_container_layout.setContentsMargins(0, 0, 0, 0)
+    # Center spacer left
+    automation_layout.addStretch()
     
-    # Center the container in the tab
-    automation_layout.addWidget(automation_container, 0, Qt.AlignmentFlag.AlignCenter)
-    
-    # Description label
-    automation_description = QLabel("Automate your experiment by defining triggers and actions. "
-                                    "Triggers can be time-based, sensor-based, or event-based. "
-                                    "Actions can include sending commands to Arduino, LabJack, or other connected devices.")
-    automation_description.setWordWrap(True)
-    automation_container_layout.addWidget(automation_description)
+    # Main content container (centered, fixed width)
+    automation_main_container = QFrame()
+    automation_main_container.setFixedWidth(700)
+    automation_main_container.setStyleSheet(f"""
+        QFrame {{
+            background-color: {COLORS.BG_DARK};
+            border: 1px solid {COLORS.BORDER_DEFAULT};
+            border-radius: 8px;
+        }}
+    """)
+    automation_main_layout = QVBoxLayout(automation_main_container)
+    automation_main_layout.setContentsMargins(16, 16, 16, 16)
+    automation_main_layout.setSpacing(12)
     
     # Automation sequences section
     automation_sequences_group = QGroupBox("Automation Sequences")
+    automation_sequences_group.setStyleSheet(GroupBoxStyles.elevated())
     automation_sequences_layout = QVBoxLayout(automation_sequences_group)
     
     # Table to display defined automation sequences
@@ -1679,6 +2404,7 @@ def setup_ui(self):
     self.sequences_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
     self.sequences_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
     self.sequences_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    self.sequences_table.setMinimumHeight(200)
     automation_sequences_layout.addWidget(self.sequences_table)
     
     # Sequence control buttons
@@ -1698,55 +2424,29 @@ def setup_ui(self):
     sequence_buttons_layout.addWidget(self.stop_sequence_btn)
     
     automation_sequences_layout.addLayout(sequence_buttons_layout)
-    automation_container_layout.addWidget(automation_sequences_group)
     
-    # Help section
-    automation_help_group = QGroupBox("Automation Help & Documentation")
-    automation_help_layout = QVBoxLayout(automation_help_group)
+    # Error notification label (hidden by default)
+    self.automation_error_label = QLabel("")
+    self.automation_error_label.setWordWrap(True)
+    self.automation_error_label.setStyleSheet("""
+        QLabel {
+            color: #ff4444;
+            background-color: rgba(255, 68, 68, 0.15);
+            border: 1px solid #ff4444;
+            border-radius: 4px;
+            padding: 8px 12px;
+            font-weight: bold;
+            font-size: 12px;
+        }
+    """)
+    self.automation_error_label.setVisible(False)
+    automation_sequences_layout.addWidget(self.automation_error_label)
     
-    automation_help_text = QTextEdit()
-    automation_help_text.setReadOnly(True)
-    # Reduced height to give more space to the sequences table
-    automation_help_text.setMinimumHeight(200)
-    
-    # Set documentation text
-    help_text = """
-    <h2>Automation Help</h2>
-    <p>This tab allows you to create automation sequences that trigger actions when specific conditions are met.</p>
-    
-    <h3>Creating Sequences</h3>
-    <ol>
-        <li>Click "New Sequence" to create a new automation sequence</li>
-        <li>Give your sequence a descriptive name</li>
-        <li>Add steps to your sequence using the Add Step button</li>
-        <li>Configure the trigger conditions and actions for each step</li>
-        <li>Save your sequence</li>
-    </ol>
-    
-    <h3>Types of Triggers</h3>
-    <ul>
-        <li><strong>Time-based:</strong> Trigger after a specific time interval or at a specific time</li>
-        <li><strong>Sensor-based:</strong> Trigger when a sensor value crosses a threshold</li>
-        <li><strong>Event-based:</strong> Trigger when a specific event occurs (button press, recording start/stop)</li>
-    </ul>
-    
-    <h3>Available Actions</h3>
-    <ul>
-        <li><strong>Arduino commands:</strong> Send commands to connected Arduino devices</li>
-        <li><strong>LabJack operations:</strong> Control LabJack outputs or read inputs</li>
-        <li><strong>Camera operations:</strong> Take snapshots, start/stop recording</li>
-        <li><strong>System actions:</strong> Play sounds, show alerts, log messages</li>
-    </ul>
-    
-    <h3>Running Sequences</h3>
-    <p>Select a sequence in the table and click "Run Sequence" to start it. The sequence will run until stopped manually or until it completes all steps.</p>
-    """
-    automation_help_text.setHtml(help_text)
-    automation_help_layout.addWidget(automation_help_text)
-    automation_container_layout.addWidget(automation_help_group)
+    automation_main_layout.addWidget(automation_sequences_group)
     
     # Time-lapse Video Creation section
     timelapse_group = QGroupBox("Time-lapse Video Creation")
+    timelapse_group.setStyleSheet(GroupBoxStyles.default())
     timelapse_layout = QVBoxLayout(timelapse_group)
     
     # Description
@@ -1773,8 +2473,67 @@ def setup_ui(self):
     self.create_timelapse_btn.setMinimumHeight(40)
     timelapse_layout.addWidget(self.create_timelapse_btn)
     
-    # Add timelapse group to the automation container
-    automation_container_layout.addWidget(timelapse_group)
+    # Add timelapse group to the automation content
+    automation_main_layout.addWidget(timelapse_group)
+    
+    # Bottom row with help button
+    automation_bottom_layout = QHBoxLayout()
+    automation_bottom_layout.addStretch()
+    
+    # Help button
+    self.automation_help_btn = QPushButton("❓ Help")
+    self.automation_help_btn.setCheckable(True)
+    self.automation_help_btn.setFixedSize(80, 32)
+    self.automation_help_btn.setStyleSheet(ButtonStyles.get("secondary", size="small"))
+    automation_bottom_layout.addWidget(self.automation_help_btn)
+    
+    automation_main_layout.addLayout(automation_bottom_layout)
+    
+    # Add main container to layout
+    automation_layout.addWidget(automation_main_container)
+    
+    # Right side: Help panel (import HelpPanel and get_help_content)
+    from app.ui.tools.help_panel import HelpPanel, get_help_content
+    
+    # Create a container for the help panel to match height
+    self.automation_help_container = QWidget()
+    self.automation_help_container.setVisible(False)
+    self.automation_help_container.setFixedWidth(320)
+    automation_help_container_layout = QVBoxLayout(self.automation_help_container)
+    automation_help_container_layout.setContentsMargins(0, 0, 0, 0)
+    
+    self.automation_help_panel = HelpPanel("Automation Help")
+    automation_help_container_layout.addWidget(self.automation_help_panel)
+    
+    # Load automation help content
+    automation_help_content = get_help_content("automation")
+    self.automation_help_panel.clear_sections()
+    for section in automation_help_content.get("sections", []):
+        self.automation_help_panel.add_section(
+            section.get("title", ""),
+            section.get("content", ""),
+            section.get("icon", "📖")
+        )
+    # Expand first section by default
+    if self.automation_help_panel.sections:
+        self.automation_help_panel.sections[0].expand()
+    
+    # Add help container to layout
+    automation_layout.addWidget(self.automation_help_container)
+    
+    # Connect help button and panel close
+    self.automation_help_visible = False
+    
+    def toggle_automation_help():
+        self.automation_help_visible = not self.automation_help_visible
+        self.automation_help_container.setVisible(self.automation_help_visible)
+        self.automation_help_btn.setChecked(self.automation_help_visible)
+    
+    self.automation_help_btn.clicked.connect(toggle_automation_help)
+    self.automation_help_panel.close_requested.connect(toggle_automation_help)
+    
+    # Center spacer right
+    automation_layout.addStretch()
     
     # Add automation tab to stacked widget
     self.stacked_widget.addWidget(automation_tab)
@@ -1938,17 +2697,52 @@ def setup_ui(self):
     project_container.setMinimumWidth(1200)  # Use minimum width instead of fixed to allow expansion
     project_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)  # Allow expansion
     project_container_layout = QVBoxLayout(project_container)
-    project_container_layout.setContentsMargins(10, 20, 20, 20)  # Increased right margin to ensure full visibility
-    project_container_layout.setSpacing(15)  # Increase spacing between elements
+    project_container_layout.setContentsMargins(10, 15, 20, 15)  # Slightly reduced margins
+    project_container_layout.setSpacing(12)  # Slightly reduced spacing
     
     # Center the container in the tab
     projects_layout.addWidget(project_container, 0, Qt.AlignmentFlag.AlignCenter)
     
-    # Description label
-    project_description = QLabel("Manage your data collection projects, test series, and runs. "
-                                "Each run will be saved with a timestamp and all relevant settings.")
-    project_description.setWordWrap(True)
-    project_container_layout.addWidget(project_description)
+    # Modern hero section at the top
+    hero_section = QFrame()
+    hero_section.setStyleSheet("""
+        QFrame {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                stop:0 #1a1a3a, stop:0.5 #2a2a5a, stop:1 #1a1a3a);
+            border-radius: 12px;
+            border: 1px solid #3a3a6a;
+        }
+    """)
+    hero_layout = QHBoxLayout(hero_section)
+    hero_layout.setContentsMargins(20, 15, 20, 15)
+    hero_layout.setSpacing(15)
+    
+    # Icon/logo area
+    hero_icon = QLabel("📁")
+    hero_icon.setStyleSheet("font-size: 36px; background: transparent; border: none;")
+    hero_layout.addWidget(hero_icon)
+    
+    # Text area
+    hero_text_layout = QVBoxLayout()
+    hero_text_layout.setSpacing(4)
+    hero_title = QLabel("Project Management")
+    hero_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #fff; background: transparent; border: none;")
+    hero_text_layout.addWidget(hero_title)
+    hero_subtitle = QLabel("Create and organize your experiments • Each run saves data, settings & timestamps")
+    hero_subtitle.setStyleSheet("font-size: 12px; color: #aaa; background: transparent; border: none;")
+    hero_text_layout.addWidget(hero_subtitle)
+    hero_layout.addLayout(hero_text_layout)
+    
+    hero_layout.addStretch()
+    
+    # Help button in hero section
+    self.project_help_btn = QPushButton("❓ Help")
+    self.project_help_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    self.project_help_btn.setStyleSheet(ButtonStyles.get("secondary", "small"))
+    self.project_help_btn.setFixedWidth(80)
+    hero_layout.addWidget(self.project_help_btn)
+    
+    project_container_layout.addWidget(hero_section)
     
     # Create a horizontal layout for the main content
     main_content_layout = QHBoxLayout()
@@ -1959,9 +2753,10 @@ def setup_ui(self):
     left_column_layout.setSpacing(15)  # Increased spacing
     
     # Project section (directly in left column, no outer groupbox)
-    project_group = QGroupBox("Project")
+    project_group = QGroupBox("📁 Project")
     project_group_layout = QVBoxLayout(project_group)
-    project_group_layout.setSpacing(10)
+    project_group_layout.setSpacing(8)
+    project_group_layout.setContentsMargins(12, 15, 12, 12)
     
     # Store reference to the group box in the main window
     self.project_group = project_group
@@ -1972,8 +2767,8 @@ def setup_ui(self):
     sub_font.setBold(True)
     project_group.setFont(sub_font)
     
-    # Set custom border style
-    project_group.setStyleSheet("QGroupBox { border: 2px solid #FFA500; border-radius: 5px; padding-top: 15px; margin-top: 10px; }")
+    # Apply modern theme style (dynamic status will be set via controller)
+    project_group.setStyleSheet(GroupBoxStyles.with_status("warning"))
     
     # Project base directory
     base_dir_layout = QHBoxLayout()
@@ -2017,9 +2812,10 @@ def setup_ui(self):
     left_column_layout.addWidget(project_group)
     
     # Test Series section
-    test_series_group = QGroupBox("Test Series")
+    test_series_group = QGroupBox("📋 Test Series")
     test_series_group_layout = QVBoxLayout(test_series_group)
-    test_series_group_layout.setSpacing(10)
+    test_series_group_layout.setSpacing(8)
+    test_series_group_layout.setContentsMargins(12, 15, 12, 12)
     
     # Store reference to the group box in the main window
     self.test_series_group = test_series_group
@@ -2027,8 +2823,8 @@ def setup_ui(self):
     # Set slightly larger font for groups
     test_series_group.setFont(sub_font)  # Reuse the same font
     
-    # Set custom border style
-    test_series_group.setStyleSheet("QGroupBox { border: 2px solid #FFA500; border-radius: 5px; padding-top: 15px; margin-top: 10px; }")
+    # Apply modern theme style (dynamic status will be set via controller)
+    test_series_group.setStyleSheet(GroupBoxStyles.with_status("warning"))
     
     # Test series selection
     test_series_layout = QHBoxLayout()
@@ -2059,9 +2855,10 @@ def setup_ui(self):
     left_column_layout.addWidget(test_series_group)
     
     # Run section
-    run_group = QGroupBox("Run")
+    run_group = QGroupBox("▶️ Run")
     run_group_layout = QVBoxLayout(run_group)
-    run_group_layout.setSpacing(10)
+    run_group_layout.setSpacing(8)
+    run_group_layout.setContentsMargins(12, 15, 12, 12)
     
     # Store reference to the group box in the main window
     self.run_group = run_group
@@ -2069,25 +2866,25 @@ def setup_ui(self):
     # Set slightly larger font for groups
     run_group.setFont(sub_font)  # Reuse the same font
     
-    # Set custom border style
-    run_group.setStyleSheet("QGroupBox { border: 2px solid #FFA500; border-radius: 5px; padding-top: 15px; margin-top: 10px; }")
+    # Apply modern theme style (dynamic status will be set via controller)
+    run_group.setStyleSheet(GroupBoxStyles.with_status("warning"))
     
     # Sampling rate setting
     sampling_rate_layout = QHBoxLayout()
     sampling_rate_layout.setSpacing(8)
-    sampling_rate_label = QLabel("Sampling Interval:")
+    sampling_rate_label = QLabel("Sampling Rate:")
     sampling_rate_label.setMinimumWidth(100)
     sampling_rate_layout.addWidget(sampling_rate_label)
     
     self.sampling_rate_spinbox = QDoubleSpinBox()
-    self.sampling_rate_spinbox.setRange(0.001, 9999)
-    self.sampling_rate_spinbox.setValue(1.0)  # Default 1 second
-    self.sampling_rate_spinbox.setDecimals(3)  # Allow millisecond precision
-    self.sampling_rate_spinbox.setSingleStep(0.1)  # Step by 0.1 seconds
-    self.sampling_rate_spinbox.setToolTip("Global sampling interval for all sensors (seconds)")
+    self.sampling_rate_spinbox.setRange(0.1, 1000)
+    self.sampling_rate_spinbox.setValue(1.0)  # Default 1.0 Hz
+    self.sampling_rate_spinbox.setDecimals(2)
+    self.sampling_rate_spinbox.setSingleStep(0.5)
+    self.sampling_rate_spinbox.setToolTip("Global sampling rate for all sensors (Hz)")
     sampling_rate_layout.addWidget(self.sampling_rate_spinbox)
     
-    sampling_rate_unit = QLabel("seconds")
+    sampling_rate_unit = QLabel("Hz")
     sampling_rate_layout.addWidget(sampling_rate_unit)
     sampling_rate_layout.addStretch(1)  # Add stretch to push controls to the left
     
@@ -2120,37 +2917,92 @@ def setup_ui(self):
     # Add run group directly to left column
     left_column_layout.addWidget(run_group)
     
-    # Project actions section
-    project_actions_group = QGroupBox("Actions")
+    # Project actions section with modern button styles
+    project_actions_group = QGroupBox("⚡ Quick Actions")
+    project_actions_group.setStyleSheet("""
+        QGroupBox {
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #2a2a50, stop:1 #1e1e40);
+            border: 1px solid #4a4a7a;
+            border-radius: 8px;
+            margin-top: 10px;
+            padding-top: 8px;
+            font-size: 11px;
+            font-weight: bold;
+            color: #fff;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            left: 12px;
+            padding: 0 6px;
+            color: #fff;
+        }
+    """)
     project_actions_layout = QHBoxLayout(project_actions_group)
-    project_actions_layout.setSpacing(10)
-    project_actions_layout.setContentsMargins(15, 15, 15, 15)
+    project_actions_layout.setSpacing(8)
+    project_actions_layout.setContentsMargins(12, 15, 12, 12)
     project_actions_group.setFont(sub_font)  # Reuse the same font
     
-    # Save project button
-    self.save_project_btn = QPushButton("Save Project")
-    self.save_project_btn.setIcon(QIcon.fromTheme("document-save"))
-    self.save_project_btn.setMinimumWidth(120)
-    project_actions_layout.addWidget(self.save_project_btn)
+    # Modern button style
+    action_btn_style = """
+        QPushButton {
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #3a3a6a, stop:1 #2a2a5a);
+            color: #fff;
+            border: 1px solid #5a5a9a;
+            border-radius: 6px;
+            padding: 8px 12px;
+            font-weight: bold;
+            font-size: 11px;
+        }
+        QPushButton:hover {
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #4a4a7a, stop:1 #3a3a6a);
+            border: 1px solid #6a6aaa;
+        }
+        QPushButton:pressed {
+            background: #2a2a5a;
+        }
+    """
+    
+    # Import project button
+    self.import_project_btn = QPushButton("📥 Import")
+    self.import_project_btn.setStyleSheet(action_btn_style)
+    self.import_project_btn.setMinimumWidth(90)
+    self.import_project_btn.setToolTip("Import a project from a zip archive")
+    project_actions_layout.addWidget(self.import_project_btn)
     
     # Export project button
-    self.export_project_btn = QPushButton("Export Data")
-    self.export_project_btn.setIcon(QIcon.fromTheme("document-export"))
-    self.export_project_btn.setMinimumWidth(120)
+    self.export_project_btn = QPushButton("📤 Export")
+    self.export_project_btn.setStyleSheet(action_btn_style)
+    self.export_project_btn.setMinimumWidth(90)
+    self.export_project_btn.setToolTip("Export the selected project / series / run to a zip archive")
     project_actions_layout.addWidget(self.export_project_btn)
     
     # Load project button
-    self.load_project_btn = QPushButton("Load Run")
-    self.load_project_btn.setIcon(QIcon.fromTheme("document-open"))
-    self.load_project_btn.setMinimumWidth(120)
+    self.load_project_btn = QPushButton("📂 Load Run")
+    self.load_project_btn.setStyleSheet(action_btn_style)
+    self.load_project_btn.setMinimumWidth(100)
+    self.load_project_btn.setToolTip("Load the selected run so data appears in Graphs, Dashboard, and Notes")
     project_actions_layout.addWidget(self.load_project_btn)
     
+    # Delete run button
+    self.delete_run_btn = QPushButton("🗑️ Delete Run")
+    self.delete_run_btn.setStyleSheet(action_btn_style)
+    self.delete_run_btn.setMinimumWidth(110)
+    self.delete_run_btn.setToolTip("Delete the selected run folder after showing its file list for confirmation")
+    project_actions_layout.addWidget(self.delete_run_btn)
+    
     # Apply Settings Button for interface settings
-    self.apply_settings_btn = QPushButton("Apply Interface Settings")
-    self.apply_settings_btn.setIcon(QIcon.fromTheme("preferences-system"))
-    self.apply_settings_btn.setMinimumWidth(120)
+    self.apply_settings_btn = QPushButton("⚙️ Apply Settings")
+    self.apply_settings_btn.setStyleSheet(action_btn_style)
+    self.apply_settings_btn.setMinimumWidth(110)
+    self.apply_settings_btn.setToolTip("Apply current interface/settings changes (sampling, devices, etc.)")
     self.apply_settings_btn.clicked.connect(self.apply_settings)
     project_actions_layout.addWidget(self.apply_settings_btn)
+    
+    project_actions_layout.addStretch()
     
     # Add left column to main content layout
     main_content_layout.addLayout(left_column_layout)
@@ -2160,11 +3012,31 @@ def setup_ui(self):
     right_column_layout.setContentsMargins(0, 0, 0, 0)  # Remove extra margins to move left
     
     # Project browser section
-    project_browser_group = QGroupBox("Project Browser")
-    project_browser_group.setMinimumWidth(750)  # Further increased minimum width to ensure all buttons are visible
-    project_browser_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)  # Allow expansion
+    project_browser_group = QGroupBox("📂 Project Browser")
+    project_browser_group.setStyleSheet("""
+        QGroupBox {
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #252550, stop:1 #1e1e40);
+            border: 1px solid #3a3a6a;
+            border-radius: 10px;
+            margin-top: 12px;
+            padding-top: 10px;
+            font-size: 13px;
+            font-weight: bold;
+            color: #fff;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            left: 15px;
+            padding: 0 8px;
+            color: #fff;
+        }
+    """)
+    project_browser_group.setMinimumWidth(750)
+    project_browser_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
     project_browser_layout = QVBoxLayout(project_browser_group)
-    project_browser_layout.setContentsMargins(5, 15, 5, 15)  # Further reduced left/right margins for more space
+    project_browser_layout.setContentsMargins(10, 18, 10, 10)
     
     # Set larger font for the title
     browser_font = project_browser_group.font()
@@ -2172,9 +3044,54 @@ def setup_ui(self):
     browser_font.setBold(True)
     project_browser_group.setFont(browser_font)
     
-    # Project tree view
+    # Project tree view with improved styling
     self.project_tree = QTreeView()
-    self.project_tree.setMinimumHeight(400)  # Increased height to match left column
+    self.project_tree.setMinimumHeight(350)
+    
+    # Get paths for branch arrows
+    arrow_right = resource_path("app/ui/arrow_right.svg").replace("\\", "/")
+    arrow_down = resource_path("app/ui/arrow_down.svg").replace("\\", "/")
+    
+    self.project_tree.setStyleSheet(f"""
+        QTreeView {{
+            background-color: #1a1a35;
+            border: 1px solid #3a3a6a;
+            border-radius: 6px;
+            padding: 5px;
+            color: #ddd;
+            font-size: 12px;
+        }}
+        QTreeView::item {{
+            padding: 6px 4px;
+            border-radius: 4px;
+            background-color: transparent;
+        }}
+        QTreeView::item:hover {{
+            background-color: #2a2a55;
+        }}
+        QTreeView::item:selected {{
+            background-color: #4a4a8a;
+            color: #fff;
+        }}
+        QTreeView::branch:has-children:closed {{
+            image: url({arrow_right});
+        }}
+        QTreeView::branch:has-children:open {{
+            image: url({arrow_down});
+        }}
+        QTreeView::branch:has-children:closed:hover {{
+            image: url({arrow_right});
+        }}
+        QHeaderView::section {{
+            background-color: #252550;
+            color: #aaa;
+            padding: 6px;
+            border: none;
+            border-bottom: 1px solid #3a3a6a;
+            font-weight: bold;
+            font-size: 11px;
+        }}
+    """)
     # Make the tree view read-only by disabling edit triggers
     self.project_tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
     # Ensure selection remains visible and active even when focus is lost
@@ -2184,13 +3101,24 @@ def setup_ui(self):
     self.project_tree.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
     # Keep selection highlight even when the tree loses focus
     self.project_tree.setAttribute(Qt.WidgetAttribute.WA_MacShowFocusRect, False)
+    self.project_tree.setAllColumnsShowFocus(True)
     self.project_model = QStandardItemModel()
-    self.project_model.setHorizontalHeaderLabels(["Name", "Description", "Date"])
+    self.project_model.setHorizontalHeaderLabels(["Name", "Description", "Duration", "Sensors", "Video", "Images"])
     self.project_tree.setModel(self.project_model)
-    self.project_tree.setColumnWidth(0, 200)
-    self.project_tree.setColumnWidth(1, 320)  # Increased Description column width
-    self.project_tree.setColumnWidth(2, 120)  # Date column width
-    self.project_tree.setAlternatingRowColors(True)
+    
+    # Configure header to auto-adjust columns
+    project_header = self.project_tree.header()
+    project_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)  # Name: User can adjust
+    project_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)      # Description: Fills space
+    project_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents) # Duration
+    project_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents) # Sensors
+    project_header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents) # Video
+    project_header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents) # Images
+    
+    # Set initial widths as fallback/minimums
+    self.project_tree.setColumnWidth(0, 220)
+    # Column 1 (Description) will stretch automatically
+    
     project_browser_layout.addWidget(self.project_tree)
     
     # Add the Actions group at the bottom of the Project Browser
@@ -2264,7 +3192,6 @@ def setup_ui(self):
     set_large_font_for_groupbox(graph_params_group)
     set_large_font_for_groupbox(plot_format_group)
     set_large_font_for_groupbox(automation_sequences_group)
-    set_large_font_for_groupbox(automation_help_group)
     set_large_font_for_groupbox(timelapse_group)
     
     # These already have fonts set (but we'll add them here for completeness)
@@ -2298,22 +3225,51 @@ def setup_ui(self):
 
     # --- Add Notes Tab after Graphs ---
     notes_tab = QWidget()
+    self.notes_tab = notes_tab  # Store reference to avoid hardcoded indexing
+    notes_tab.setStyleSheet(f"""
+        QWidget {{
+            background-color: {COLORS.BG_DARK};
+        }}
+    """)
     notes_layout = QVBoxLayout(notes_tab)
-    notes_layout.setContentsMargins(10, 10, 10, 10)
-    notes_layout.setSpacing(0)  # Reduce spacing between elements
+    notes_layout.setContentsMargins(15, 15, 15, 15)
+    notes_layout.setSpacing(10)
     
-    # HTML editor with improved styling
+    # HTML editor with modern theme styling
     notes_text_edit = QTextEdit()
     notes_text_edit.setAcceptRichText(True)
-    notes_text_edit.setStyleSheet("""
-        QTextEdit {
+    notes_text_edit.setStyleSheet(f"""
+        QTextEdit {{
+            font-family: 'Segoe UI', sans-serif;
             font-size: 14px; 
-            background: #222; 
-            color: #eee; 
-            border-radius: 6px; 
-            padding: 8px;
-            border: 1px solid #444;
-        }
+            background: {COLORS.BG_CARD};
+            color: {COLORS.TEXT_PRIMARY}; 
+            border-radius: 10px; 
+            padding: 12px;
+            border: 1px solid {COLORS.BORDER_DEFAULT};
+            selection-background-color: rgba(108, 92, 231, 0.45);
+            selection-color: {COLORS.TEXT_PRIMARY};
+        }}
+        QTextEdit:focus {{
+            border: 1px solid {COLORS.PRIMARY};
+        }}
+        QScrollBar:vertical {{
+            background-color: {COLORS.BG_CARD};
+            width: 10px;
+            border-radius: 5px;
+            margin: 0;
+        }}
+        QScrollBar::handle:vertical {{
+            background-color: {COLORS.TEXT_MUTED};
+            border-radius: 5px;
+            min-height: 30px;
+        }}
+        QScrollBar::handle:vertical:hover {{
+            background-color: {COLORS.TEXT_SECONDARY};
+        }}
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+            height: 0px;
+        }}
     """)
     notes_layout.addWidget(notes_text_edit, 1)
     self.notes_text_edit = notes_text_edit  # For access if needed
@@ -2334,6 +3290,11 @@ def setup_ui(self):
     # Connect navigation buttons to switch stacked widget pages (fix index mapping)
     for i, btn in enumerate(self.nav_buttons):
         btn.clicked.connect(lambda checked, index=i: self.stacked_widget.setCurrentIndex(index))
+    
+    # Create Data Flow Monitor page (hidden from navigation, accessed via status bar or Ctrl+Shift+D)
+    self.data_flow_widget = DataFlowWidget()
+    self.stacked_widget.addWidget(self.data_flow_widget)
+    self.data_flow_page_index = self.stacked_widget.count() - 1  # Store index for access
 
 def update_focus_value_label(self):
     """Update the focus value label when the slider changes"""
@@ -2411,30 +3372,8 @@ def update_device_connection_status(self, device_type, is_connected):
     status_color = "green" if is_connected else "grey"
     label_style = f"color: {status_color}; font-weight: bold; font-size: 13px; background-color: transparent; border: none; margin: 0; padding: 0;"
     
-    # Define frame styles
-    connected_frame_style = """
-        QFrame { 
-            border: 2px solid #009900; 
-            border-radius: 8px; 
-            background-color: rgba(0, 153, 0, 0.1); 
-        }
-        QFrame:hover { 
-            background-color: rgba(0, 153, 0, 0.2); 
-            border: 2px solid #00bb00; 
-        }
-    """
-    
-    disconnected_frame_style = """
-        QFrame { 
-            border: 2px solid #999; 
-            border-radius: 8px; 
-            background-color: transparent; 
-        }
-        QFrame:hover { 
-            background-color: rgba(200, 200, 200, 0.3); 
-            border: 2px solid #777; 
-        }
-    """
+    # Define label styles
+    label_style = f"color: {status_color}; font-weight: bold; font-size: 13px; background-color: transparent; border: none; margin: 0; padding: 0;"
     
     try:
         if device_type.lower() == 'arduino':
@@ -2447,8 +3386,7 @@ def update_device_connection_status(self, device_type, is_connected):
                 # Update the frame style if the container exists
                 arduino_container = self.arduino_status.parent()
                 if arduino_container and hasattr(arduino_container, 'setStyleSheet'):
-                    frame_style = connected_frame_style if is_connected else disconnected_frame_style
-                    arduino_container.setStyleSheet(frame_style)
+                    arduino_container.setStyleSheet(CardStyles.device_card(is_connected))
                     print(f"Updated Arduino container style for connection status: {is_connected}")
                 
                 # Force immediate update
@@ -2466,8 +3404,7 @@ def update_device_connection_status(self, device_type, is_connected):
                 # Update the frame style
                 labjack_container = self.labjack_status.parent()
                 if labjack_container and hasattr(labjack_container, 'setStyleSheet'):
-                    frame_style = connected_frame_style if is_connected else disconnected_frame_style
-                    labjack_container.setStyleSheet(frame_style)
+                    labjack_container.setStyleSheet(CardStyles.device_card(is_connected))
                     print(f"Updated LabJack container style for connection status: {is_connected}")
                 
                 # Force updates
@@ -2484,8 +3421,7 @@ def update_device_connection_status(self, device_type, is_connected):
                 # Update the frame style
                 other_container = self.other_status.parent()
                 if other_container and hasattr(other_container, 'setStyleSheet'):
-                    frame_style = connected_frame_style if is_connected else disconnected_frame_style
-                    other_container.setStyleSheet(frame_style)
+                    other_container.setStyleSheet(CardStyles.device_card(is_connected))
                     
                 # Force updates
                 self.other_status.update()

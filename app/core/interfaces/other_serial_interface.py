@@ -653,6 +653,9 @@ class OtherSerialThread(QThread):
         self.output_directory = None  # Directory for saving data
         self.last_response = ""  # Store the last response from the device
         self.last_poll_time = 0  # Time of last poll
+        self.auto_reconnect = True  # Enable auto-reconnect by default
+        self._last_reconnect_attempt = 0
+        self._reconnect_interval = 5.0  # seconds
         
     def run(self):
         """Main thread method"""
@@ -660,6 +663,25 @@ class OtherSerialThread(QThread):
         
         while self.running:
             try:
+                # Handle reconnection if needed
+                if not self.paused and self.interface and not self.interface.is_connected():
+                    if self.auto_reconnect:
+                        current_time = time.time()
+                        if current_time - self._last_reconnect_attempt >= self._reconnect_interval:
+                            self._last_reconnect_attempt = current_time
+                            print(f"OtherSerialThread: Connection lost, attempting reconnect to {self.interface.port}...")
+                            if self.interface.connect():
+                                print("OtherSerialThread: Reconnected successfully")
+                                self.connection_status_signal.emit(True, f"Reconnected to serial device on {self.interface.port}")
+                            else:
+                                print("OtherSerialThread: Reconnect failed")
+                        
+                        time.sleep(1.0)
+                        continue
+                    else:
+                        print("OtherSerialThread: Connection lost, and auto-reconnect disabled")
+                        # We don't break here to allow the interface to be set again or paused/unpaused
+                
                 if not self.paused and self.interface and self.interface.is_connected():
                     # Check if it's time to poll based on the poll interval
                     current_time = time.time()

@@ -1,16 +1,26 @@
+# Core dependencies (all platforms)
 PyQt6>=6.7.0
 pyserial>=3.5
 numpy>=1.23.0
-opencv-python>=4.7.0
+opencv-python-headless>=4.7.0  # Headless version - smaller, no GUI (we use PyQt6 for display)
 pyqtdarktheme>=2.1.0
 pyqtgraph>=0.13.1
 pandas>=1.5.0,<2.0.0
 scipy>=1.9.0
-matplotlib>=3.6.0
-LabJackPython>=2.1.0  # For LabJack U3, U6, UE9 devices
-labjack-ljm>=1.22.0 # For LabJack T-series devices (T4, T7)
 ffmpeg-python>=0.2.0  # For reliable video encoding
-ndi-python>=5.1.0  # For NDI video streaming (requires NDI SDK installed separately)
 grpcio>=1.60.0  # For gRPC communication
 grpcio-tools>=1.60.0  # For protobuf compilation
-protobuf>=4.25.0  # For protocol buffer support 
+protobuf>=4.25.0  # For protocol buffer support
+
+# LabJack - Windows only (requires LabJack drivers from https://labjack.com)
+LabJackPython>=2.1.0; sys_platform == 'win32'  # For LabJack U3, U6, UE9 devices
+labjack-ljm>=1.22.0; sys_platform == 'win32'  # For LabJack T-series devices (T4, T7)
+
+# NDI - all platforms (requires NDI SDK installed separately from https://ndi.tv/sdk/)
+ndi-python>=5.1.0
+
+# Audio - for microphone/audio sensor support
+sounddevice>=0.4.6  # For microphone input and audio analysis
+
+# MQTT Support
+paho-mqtt>=2.1.0

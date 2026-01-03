@@ -41,12 +41,17 @@ class SettingsModel:
             "record_with_overlays": "true",
             "recording_output_dir": "recordings",
             "recording_format": "AVI (MJPG)",
+            "record_audio": "true",
+            "record_audio_device": "-1",
+            "media_volume": "100",
+            "media_muted": "false",
             "ffmpeg_binary": "ffmpeg",  # Default FFmpeg executable path
             
             # Graph settings
-            "plot_style_preset": "Dark",
+            "plot_style_preset": "High Contrast",
             "plot_font_size": "10",
             "plot_line_width": "2",
+            "graph_downsampling": "true",  # Enable/disable pyqtgraph automatic downsampling
             
             # Motion detection settings
             "motion_detection_enabled": "false",
@@ -54,7 +59,8 @@ class SettingsModel:
             "motion_detection_min_area": "500",
             
             # LabJack settings
-            "labjack_type": "U3",
+            "labjack_type": "T7",
+            "labjack_internal_rate": "100.0",  # High-speed internal polling rate in Hz
             
             # NDI settings
             "enable_ndi": "false",

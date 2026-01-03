@@ -11,13 +11,21 @@ import html
 import re
 import json
 import copy
-from PyQt6.QtCore import QObject, Qt, QTimer, QByteArray, QBuffer, QIODevice
-from PyQt6.QtGui import QFont, QColor, QTextCharFormat, QTextListFormat, QPixmap, QIcon, QImage, QAction, QTextImageFormat, QTextCursor, QGuiApplication
+import hashlib
+from pathlib import Path
+
+from PyQt6.QtCore import QObject, Qt, QTimer, QByteArray, QBuffer, QIODevice, QUrl
+from PyQt6.QtGui import (QFont, QColor, QTextCharFormat, QTextListFormat, 
+                         QPixmap, QIcon, QImage, QAction, QTextImageFormat, 
+                         QTextCursor, QGuiApplication)
 from PyQt6.QtWidgets import (QColorDialog, QFontDialog, QMenu, QPushButton, 
-                           QToolBar, QToolButton, QComboBox, QDialog, QWidget,
-                           QVBoxLayout, QHBoxLayout, QLabel, QDialogButtonBox, QFileDialog,
-                           QFormLayout, QSpinBox, QCheckBox, QGroupBox, QApplication,
-                           QStyle, QProxyStyle, QStyleOptionComboBox)
+                             QToolBar, QToolButton, QComboBox, QDialog, QWidget,
+                             QVBoxLayout, QHBoxLayout, QLabel, QDialogButtonBox, 
+                             QFileDialog, QFormLayout, QSpinBox, QCheckBox, 
+                             QGroupBox, QApplication, QStyle, QProxyStyle, 
+                             QStyleOptionComboBox, QMessageBox)
+
+from app.ui.theme import COLORS
 
 class NarrowScrollBarStyle(QProxyStyle):
     """Custom style to provide narrow scrollbars for combo boxes"""
@@ -80,18 +88,46 @@ class NotesController(QObject):
         # Flag to track if document is loaded - prevents deletion before load
         self.document_loaded = False
         
+        # Flag to track if template has been populated to avoid overwriting user edits
+        self.template_populated = False
+        
         # Connect to tab selection change to update template when notes tab is selected
         if hasattr(self.main_window, 'stacked_widget'):
             self.main_window.stacked_widget.currentChanged.connect(self.on_tab_changed)
         
+    def append_to_note(self, html_content):
+        """Append HTML content to the end of the current note"""
+        if not self.notes_editor:
+            return
+            
+        # Move cursor to absolute end of document
+        cursor = self.notes_editor.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.notes_editor.setTextCursor(cursor)
+        
+        # Insert the content at the end
+        self.notes_editor.insertHtml(html_content)
+        
+        # Move cursor to the new end to ensure proper positioning
+        cursor = self.notes_editor.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.notes_editor.setTextCursor(cursor)
+        
+        # Ensure it's saved
+        self.trigger_autosave()
+
     def on_tab_changed(self, index):
         """Called when the tab selection changes in the stacked widget"""
-        # Find the notes tab index
+        # Find the notes tab index dynamically
         notes_tab_index = -1
-        for i in range(self.main_window.stacked_widget.count()):
-            if i == 7:  # Notes tab is at index 7 (after Graphs)
-                notes_tab_index = i
-                break
+        if hasattr(self.main_window, 'notes_tab'):
+            notes_tab_index = self.main_window.stacked_widget.indexOf(self.main_window.notes_tab)
+        else:
+            # Fallback to hardcoded index if reference is missing
+            for i in range(self.main_window.stacked_widget.count()):
+                if i == 7:  # Notes tab is typically at index 7
+                    notes_tab_index = i
+                    break
                 
         # If we've switched to the notes tab, refresh the template data
         if index == notes_tab_index:
@@ -99,9 +135,8 @@ class NotesController(QObject):
             
     def refresh_template(self):
         """Refresh the template data if notes are based on the template"""
-        # Check if the document is already loaded (we don't want to overwrite user content)
+        # Check if the document is already loaded
         if not self.document_loaded:
-            # If document isn't loaded yet, load it fresh
             self.load_note()
             return
             
@@ -117,9 +152,10 @@ class NotesController(QObject):
                 is_template_based = True
                 break
                 
+        # Only refresh if it's template-based and hasn't been fully populated yet
+        # OR if it's explicit (we could add a button for this)
         if is_template_based:
             # It contains template markers, so we should refresh the data
-            # Get current cursor position (to restore later)
             cursor = self.notes_editor.textCursor()
             cursor_pos = cursor.position()
             
@@ -135,8 +171,8 @@ class NotesController(QObject):
                 if cursor_pos < self.notes_editor.document().characterCount():
                     cursor.setPosition(cursor_pos)
                     self.notes_editor.setTextCursor(cursor)
-                    
-            self.main_window.logger.log("Notes template refreshed with latest data", "DEBUG") 
+                
+                self.main_window.logger.log("Notes template refreshed with latest data", "DEBUG") 
 
     def update_selected_image(self):
         """Update the currently selected image when cursor changes"""
@@ -150,72 +186,87 @@ class NotesController(QObject):
             
     def setup_enhanced_toolbar(self):
         """Setup enhanced formatting toolbar with more options"""
+        
         # Create a proper toolbar above the existing buttons
         toolbar = QToolBar()
         
-        toolbar.setStyleSheet("""
-            QToolBar { 
-                background: #333; 
-                border: none; 
-                spacing: 5px; 
-                padding: 6px; 
-                border-radius: 4px;
-                margin-bottom: 8px;
-                min-height: 36px;
-            }
-            QToolButton {
-                background: #2a2a2a;
-                color: #fff;
-                border: 1px solid #444;
-                border-radius: 3px;
-                padding: 4px;
+        toolbar.setStyleSheet(f"""
+            QToolBar {{ 
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 {COLORS.BG_ELEVATED}, stop:1 {COLORS.BG_CARD});
+                border: 1px solid {COLORS.BORDER_DEFAULT}; 
+                spacing: 6px; 
+                padding: 8px 12px; 
+                border-radius: 10px;
+                margin-bottom: 10px;
+                min-height: 40px;
+            }}
+            QToolButton {{
+                background: {COLORS.BG_INPUT};
+                color: {COLORS.TEXT_PRIMARY};
+                border: 1px solid {COLORS.BORDER_DEFAULT};
+                border-radius: 6px;
+                padding: 5px 8px;
                 margin: 1px;
-                min-width: 24px;
-                min-height: 24px;
-            }
-            QToolButton:hover {
-                background: #3a3a3a;
-                border-color: #555;
-            }
-            QComboBox {
-                background: #2a2a2a;
-                color: #fff;
-                border: 1px solid #444;
-                border-radius: 3px;
-                padding: 2px 4px;
-                min-height: 24px;
-            }
-            QComboBox::drop-down {
+                min-width: 28px;
+                min-height: 28px;
+                font-weight: 500;
+            }}
+            QToolButton:hover {{
+                background: {COLORS.BG_ELEVATED};
+                border-color: {COLORS.PRIMARY};
+                color: {COLORS.TEXT_PRIMARY};
+            }}
+            QToolButton:pressed {{
+                background: {COLORS.PRIMARY_SUBTLE};
+            }}
+            QComboBox {{
+                background: {COLORS.BG_INPUT};
+                color: {COLORS.TEXT_PRIMARY};
+                border: 1px solid {COLORS.BORDER_DEFAULT};
+                border-radius: 6px;
+                padding: 4px 8px;
+                min-height: 28px;
+            }}
+            QComboBox:hover {{
+                border-color: {COLORS.PRIMARY};
+            }}
+            QComboBox::drop-down {{
                 subcontrol-origin: padding;
                 subcontrol-position: top right;
-                width: 15px;
-                border-left: 1px solid #444;
-            }
-            QComboBox QAbstractItemView {
-                background: #2a2a2a;
-                color: #fff;
-                selection-background-color: #444;
-                /* Add scrollbar styling for the dropdown view */
-                QScrollBar:vertical {
-                    width: 8px;
-                    background: #2a2a2a;
-                    margin: 0px;
-                    border: none;
-                }
-                QScrollBar::handle:vertical {
-                    background: #555;
-                    min-height: 20px;
-                    border-radius: 4px;
-                }
-                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                    height: 0px;
-                    background: none;
-                    border: none;
-                }
-                QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-                    background: none;
-                }
-            }
+                width: 18px;
+                border-left: 1px solid {COLORS.BORDER_DEFAULT};
+                border-top-right-radius: 6px;
+                border-bottom-right-radius: 6px;
+            }}
+            QComboBox QAbstractItemView {{
+                background: {COLORS.BG_ELEVATED};
+                color: {COLORS.TEXT_PRIMARY};
+                selection-background-color: rgba(108, 92, 231, 0.45);
+                selection-color: {COLORS.TEXT_PRIMARY};
+                border: 1px solid {COLORS.BORDER_DEFAULT};
+                border-radius: 6px;
+                padding: 4px;
+            }}
+            QSpinBox {{
+                background: {COLORS.BG_INPUT};
+                color: {COLORS.TEXT_PRIMARY};
+                border: 1px solid {COLORS.BORDER_DEFAULT};
+                border-radius: 6px;
+                padding: 4px 8px;
+                min-height: 28px;
+            }}
+            QSpinBox:hover {{
+                border-color: {COLORS.PRIMARY};
+            }}
+            QSpinBox::up-button, QSpinBox::down-button {{
+                background: {COLORS.BG_ELEVATED};
+                border: none;
+                width: 16px;
+            }}
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
+                background: {COLORS.PRIMARY_SUBTLE};
+            }}
         """)
         
         # Add font family selector
@@ -351,17 +402,25 @@ class NotesController(QObject):
         clear_format_btn.clicked.connect(self.clear_formatting)
         toolbar.addWidget(clear_format_btn)
         
-        # Find the notes tab in the stacked widget
-        for i in range(self.main_window.stacked_widget.count()):
-            if i == 7:  # Notes tab is index 7
-                notes_tab = self.main_window.stacked_widget.widget(i)
-                notes_layout = notes_tab.layout()
-                
-                # Insert the toolbar at the beginning of the layout
-                if notes_layout:
-                    notes_layout.insertWidget(0, toolbar)
-                    self.main_window.logger.log("Added advanced formatting toolbar to notes tab", "DEBUG")
-                break
+        # Find the notes tab dynamically
+        notes_tab = getattr(self.main_window, 'notes_tab', None)
+        if notes_tab:
+            notes_layout = notes_tab.layout()
+            if notes_layout:
+                notes_layout.insertWidget(0, toolbar)
+                self.main_window.logger.log("Added advanced formatting toolbar to notes tab", "DEBUG")
+        else:
+            # Fallback to hardcoded index if reference is missing
+            for i in range(self.main_window.stacked_widget.count()):
+                if i == 7:  # Notes tab is typically at index 7
+                    notes_tab = self.main_window.stacked_widget.widget(i)
+                    notes_layout = notes_tab.layout()
+                    
+                    # Insert the toolbar at the beginning of the layout
+                    if notes_layout:
+                        notes_layout.insertWidget(0, toolbar)
+                        self.main_window.logger.log("Added advanced formatting toolbar to notes tab (fallback)", "DEBUG")
+                    break
             
     def connect_basic_formatting(self):
         """Connect basic formatting buttons to text editor"""
@@ -474,15 +533,17 @@ class NotesController(QObject):
                 current_tab_index = -1
                 graph_tab_index = -1
                 
-                # Find the graphs and notes tab indices
+                # Find the graphs tab dynamically
                 if hasattr(self.main_window, 'stacked_widget'):
                     current_tab_index = self.main_window.stacked_widget.currentIndex()
-                    # Scan for the graphs tab (typically index 6)
-                    for i in range(self.main_window.stacked_widget.count()):
-                        # In this app, the graph tab is typically at index 6
-                        if i == 6:  # Graph tab is index 6
-                            graph_tab_index = i
-                            break
+                    if hasattr(self.main_window, 'graphs_tab'):
+                        graph_tab_index = self.main_window.stacked_widget.indexOf(self.main_window.graphs_tab)
+                    else:
+                        # Fallback to typical index
+                        for i in range(self.main_window.stacked_widget.count()):
+                            if i == 6:  # Graph tab is typically index 6
+                                graph_tab_index = i
+                                break
                 
                 # Temporarily switch to graph tab to ensure it's fully rendered
                 if graph_tab_index != -1 and current_tab_index != graph_tab_index:
@@ -525,7 +586,6 @@ class NotesController(QObject):
                     self.main_window.logger.log("Inserted graph image into notes", "INFO")
             else:
                 # No graph widget available
-                from PyQt6.QtWidgets import QMessageBox
                 QMessageBox.information(self.notes_editor, 
                                       "Insert Graph", 
                                       "No graph found. Please make sure you have a graph displayed in the Graphs tab.")
@@ -548,7 +608,6 @@ class NotesController(QObject):
                 # Check if camera is connected
                 if not camera_controller.is_connected:
                     # Show error message
-                    from PyQt6.QtWidgets import QMessageBox
                     QMessageBox.information(self.notes_editor, 
                                         "Insert Camera Image", 
                                         "No active camera found. Please make sure the camera is connected in the Camera tab.")
@@ -597,7 +656,6 @@ class NotesController(QObject):
                         pixmap = camera_label.pixmap().copy()
                     else:
                         self.main_window.logger.log("Cannot capture camera image: No camera display available", "WARN")
-                        from PyQt6.QtWidgets import QMessageBox
                         QMessageBox.information(self.notes_editor, 
                                             "Insert Camera Image", 
                                             "Could not capture camera image. Please make sure the camera is connected and working properly.")
@@ -622,9 +680,7 @@ class NotesController(QObject):
                     return
                 
                 # Create a unique filename with timestamp
-                import datetime
-                timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-                file_name = f"camera_{timestamp}.png"
+                file_name = f"camera_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}.png"
                 dest_path = os.path.join(dest_dir, file_name)
                 
                 # Save the pixmap
@@ -632,15 +688,14 @@ class NotesController(QObject):
                     self.main_window.logger.log(f"Saved camera image to {dest_path}", "INFO")
                     
                     # Create relative path
-                    rel_path = os.path.join("images", file_name)
+                    rel_path = os.path.join("images", file_name).replace('\\', '/')
                     
-                    # Insert with tracking attributes
+                    # Insert with tracking attributes - use relative path for src since we have baseUrl set
                     cursor = self.notes_editor.textCursor()
-                    cursor.insertHtml(f'<img src="{dest_path}" alt="Camera Image" class="evo-image" data-rel-path="{rel_path}" width="{pixmap.width()}" height="{pixmap.height()}">')
+                    cursor.insertHtml(f'<img src="{rel_path}" alt="Camera Image" class="evo-image" data-rel-path="{rel_path}" width="{pixmap.width()}" height="{pixmap.height()}">')
                     return
             
             # If we got here, something went wrong
-            from PyQt6.QtWidgets import QMessageBox
             QMessageBox.information(self.notes_editor, 
                                   "Insert Camera Image", 
                                   "Could not capture camera image. Please make sure the camera is connected and working properly.")
@@ -658,8 +713,8 @@ class NotesController(QObject):
         format = QTextCharFormat()
         font = QFont("Segoe UI", 14)
         format.setFont(font)
-        format.setForeground(QColor("#eeeeee"))
-        format.setBackground(QColor("#222222"))
+        format.setForeground(QColor(COLORS.TEXT_PRIMARY))
+        format.setBackground(QColor(COLORS.BG_CARD))
         cursor.mergeCharFormat(format)
         self.notes_editor.mergeCurrentCharFormat(format)
         
@@ -755,11 +810,11 @@ class NotesController(QObject):
             return
             
         # Create relative path for the image
-        rel_path = os.path.join("images", file_name)
+        rel_path = os.path.join("images", file_name).replace('\\', '/')
         
-        # Insert the image with tracking attributes
+        # Insert the image with tracking attributes - use relative path for src since we have baseUrl set
         cursor = self.notes_editor.textCursor()
-        cursor.insertHtml(f'<img src="{dest_path}" alt="Inserted Image" class="evo-image" data-rel-path="{rel_path}" width="{pixmap.width()}" height="{pixmap.height()}">')
+        cursor.insertHtml(f'<img src="{rel_path}" alt="Inserted Image" class="evo-image" data-rel-path="{rel_path}" width="{pixmap.width()}" height="{pixmap.height()}">')
         
     def insert_image_from_pixmap(self, pixmap):
         """Insert a pixmap image into the notes
@@ -771,22 +826,32 @@ class NotesController(QObject):
         dest_dir = self.get_images_directory()
         if dest_dir:
             # Create a unique filename based on timestamp
-            import datetime
-            timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-            file_name = f"snapshot_{timestamp}.png"
+            file_name = f"snapshot_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}.png"
             dest_path = os.path.join(dest_dir, file_name)
             
-            # Save the pixmap
-            if pixmap.save(dest_path, "PNG"):
-                self.main_window.logger.log(f"Saved pixmap to {dest_path}", "DEBUG")
-                
-                # Create relative path
-                rel_path = os.path.join("images", file_name)
-                
-                # Insert with tracking attributes
-                cursor = self.notes_editor.textCursor()
-                cursor.insertHtml(f'<img src="{dest_path}" alt="Inserted Image" class="evo-image" data-rel-path="{rel_path}" width="{pixmap.width()}" height="{pixmap.height()}">')
-                return
+            # Save the pixmap in a background thread to avoid blocking
+            import threading
+            pixmap_copy = pixmap.copy()
+            
+            def save_async(p, path):
+                try:
+                    p.save(path, "PNG")
+                    if hasattr(self.main_window, 'logger'):
+                        self.main_window.logger.log(f"Saved pixmap to {path}", "DEBUG")
+                except Exception as e:
+                    if hasattr(self.main_window, 'logger'):
+                        self.main_window.logger.log(f"Error saving pixmap: {e}", "ERROR")
+
+            # Start the save thread
+            threading.Thread(target=save_async, args=(pixmap_copy, dest_path), daemon=True).start()
+            
+            # Continue with UI insertion immediately using the path we know will be created
+            rel_path = os.path.join("images", file_name).replace('\\', '/')
+            
+            # Insert with tracking attributes - use relative path for src since we have baseUrl set
+            cursor = self.notes_editor.textCursor()
+            cursor.insertHtml(f'<img src="{rel_path}" alt="Inserted Image" class="evo-image" data-rel-path="{rel_path}" width="{pixmap.width()}" height="{pixmap.height()}">')
+            return
         
         # Fallback to base64 if we can't save to file
         cursor = self.notes_editor.textCursor()
@@ -877,7 +942,6 @@ class NotesController(QObject):
                     for run_file in run_files:
                         if os.path.exists(run_file):
                             with open(run_file, 'r') as f:
-                                import json
                                 run_data = json.load(f)
                                 # Extract data based on format
                                 if "timestamp" in run_data and "description" in run_data:
@@ -921,14 +985,14 @@ class NotesController(QObject):
         
         return updated_html
 
-    def save_note(self, html_content=None):
+    def save_note(self, html_content=None, is_autosave=False):
         """Save the current note to the run directory
         
         Args:
             html_content: Optional HTML content to save. If None, will use the current editor content.
+            is_autosave: Whether this is an automatic save or manual.
         """
         if not self.document_loaded:
-            # No need to save if the document hasn't been loaded yet
             return
             
         # Get the run directory from the project controller
@@ -941,7 +1005,8 @@ class NotesController(QObject):
         if (not hasattr(project_controller, 'current_project') or not project_controller.current_project or
             not hasattr(project_controller, 'current_test_series') or not project_controller.current_test_series or
             not hasattr(project_controller, 'current_run') or not project_controller.current_run):
-            self.main_window.logger.log("Cannot save note - no active run", "WARN")
+            if not is_autosave:
+                self.main_window.logger.log("Cannot save note - no active run", "WARN")
             return
             
         base_dir = self.main_window.project_base_dir.text()
@@ -959,12 +1024,10 @@ class NotesController(QObject):
             html_content = self.notes_editor.toHtml()
         
         # Calculate a hash of the content to avoid unnecessary saves
-        import hashlib
         content_hash = hashlib.md5(html_content.encode()).hexdigest()
         
         # Check if content has changed since last save
         if self.last_saved_content_hash == content_hash:
-            self.main_window.logger.log("Note content unchanged - skipping save", "DEBUG")
             return
             
         # Save the note to the run directory
@@ -972,12 +1035,23 @@ class NotesController(QObject):
         try:
             with open(note_path, 'w', encoding='utf-8') as f:
                 f.write(html_content)
-            self.main_window.logger.log(f"Saved note to {note_path}", "DEBUG")
             
             # Update the hash
             self.last_saved_content_hash = content_hash
+            
+            # Show feedback in status bar
+            status_msg = f"Notes saved ({datetime.datetime.now().strftime('%H:%M:%S')})"
+            if is_autosave:
+                status_msg = f"Notes autosaved ({datetime.datetime.now().strftime('%H:%M:%S')})"
+            
+            if hasattr(self.main_window, 'statusBar'):
+                self.main_window.statusBar().showMessage(status_msg, 3000)
+            
+            self.main_window.logger.log(f"Saved note to {note_path}", "DEBUG")
         except Exception as e:
             self.main_window.logger.log(f"Error saving note: {str(e)}", "ERROR")
+            if not is_autosave:
+                QMessageBox.warning(self.main_window, "Save Error", f"Could not save note: {str(e)}")
             
     def load_note(self):
         """Load the note from the run directory or template"""
@@ -999,7 +1073,6 @@ class NotesController(QObject):
                 self.notes_editor.setHtml(template_html)
                 self.document_loaded = True
                 # Calculate hash for the loaded content
-                import hashlib
                 self.last_saved_content_hash = hashlib.md5(template_html.encode()).hexdigest()
             return
             
@@ -1016,16 +1089,23 @@ class NotesController(QObject):
         # Look for notes.html in the run directory
         note_path = os.path.join(run_dir, "notes.html")
         
+        # Set the base URL for the document so it can find relative images
+        self.notes_editor.document().setBaseUrl(QUrl.fromLocalFile(run_dir + os.sep))
+        
         if os.path.exists(note_path):
             # Load existing note
             try:
                 with open(note_path, 'r', encoding='utf-8') as f:
                     note_html = f.read()
+                
+                # Update absolute paths to relative if they match our run directory
+                # This helps with portability if the project was moved
+                note_html = self.convert_absolute_to_relative(note_html, run_dir)
+                
                 self.notes_editor.setHtml(note_html)
                 self.main_window.logger.log(f"Loaded note from {note_path}", "DEBUG")
                 
                 # Calculate hash for the loaded content
-                import hashlib
                 self.last_saved_content_hash = hashlib.md5(note_html.encode()).hexdigest()
                 self.document_loaded = True
             except Exception as e:
@@ -1044,7 +1124,6 @@ class NotesController(QObject):
                 self.notes_editor.setHtml(template_html)
                 
                 # Calculate hash for the new content
-                import hashlib
                 self.last_saved_content_hash = hashlib.md5(template_html.encode()).hexdigest()
                 
                 # Save the new note
@@ -1056,6 +1135,25 @@ class NotesController(QObject):
                     self.main_window.logger.log(f"Error creating note from template: {str(e)}", "ERROR")
                     
                 self.document_loaded = True
+                
+    def convert_absolute_to_relative(self, html_content, run_dir):
+        """Convert absolute paths in HTML to relative paths based on run_dir"""
+        # Normalize run_dir for comparison
+        run_dir_norm = os.path.normpath(run_dir).replace('\\', '/')
+        if not run_dir_norm.endswith('/'):
+            run_dir_norm += '/'
+            
+        # Pattern to find src="C:/path/to/run/images/..."
+        # We look for paths that start with our run directory
+        def replace_path(match):
+            full_path = match.group(1)
+            norm_full_path = os.path.normpath(full_path).replace('\\', '/')
+            if norm_full_path.startswith(run_dir_norm):
+                rel_path = norm_full_path[len(run_dir_norm):]
+                return f'src="{rel_path}"'
+            return match.group(0)
+            
+        return re.sub(r'src="([^"]+)"', replace_path, html_content)
                 
     def show_context_menu(self, position):
         """Show context menu for the editor"""
@@ -1099,12 +1197,6 @@ class NotesController(QObject):
         if not self.selected_image:
             return
             
-        # Import modules needed for this function
-        import re
-        import os
-        import datetime
-        from pathlib import Path
-        
         # Get the current cursor
         current_cursor = self.notes_editor.textCursor()
         current_position = current_cursor.position()
@@ -1112,7 +1204,6 @@ class NotesController(QObject):
         
         # If we're not on an image, check if we have a stored selected image
         if not char_format.isImageFormat() and not self.selected_image:
-            from PyQt6.QtWidgets import QMessageBox
             QMessageBox.information(self.main_window, "Resize Image", 
                                    "Please select an image first by clicking on it.")
             return
@@ -1161,7 +1252,7 @@ class NotesController(QObject):
             data_prefix = "data:image/png;base64,"
             if img_path.startswith(data_prefix):
                 # We'll need to use the current image as source since we don't have a file
-                data_embedded = True
+                # data_embedded = True # Not used
                 # For embedded images, we'll need to save them to a file first
                 
                 # Get the destination directory
@@ -1173,7 +1264,6 @@ class NotesController(QObject):
                     
                     # Save the base64 data to a file
                     try:
-                        import base64
                         base64_data = img_path[len(data_prefix):]
                         with open(actual_path, 'wb') as f:
                             f.write(base64.b64decode(base64_data))
@@ -1182,7 +1272,7 @@ class NotesController(QObject):
                         self.main_window.logger.log(f"Error saving embedded image: {e}", "ERROR")
         
         # If it's a relative path from our custom HTML, try to construct the full path
-        if actual_path.startswith("images/"):
+        if not os.path.isabs(actual_path) and not actual_path.startswith("data:"):
             # Try to find the full path based on current project/run
             project_controller = getattr(self.main_window, 'project_controller', None)
             if project_controller and hasattr(project_controller, 'current_project') and project_controller.current_project:
@@ -1196,9 +1286,9 @@ class NotesController(QObject):
                     # If we have a run
                     if hasattr(project_controller, 'current_run') and project_controller.current_run:
                         run_dir = os.path.join(series_dir, project_controller.current_run)
-                        actual_path = os.path.join(run_dir, actual_path)
-                        if original_path and original_path.startswith("images/"):
-                            original_path = os.path.join(run_dir, original_path)
+                        actual_path = os.path.normpath(os.path.join(run_dir, actual_path))
+                        if original_path and not os.path.isabs(original_path):
+                            original_path = os.path.normpath(os.path.join(run_dir, original_path))
         
         # Try to find the original image path if we have a resized image
         if is_resized and not original_path:
@@ -1246,6 +1336,10 @@ class NotesController(QObject):
         
         # Create form layout for inputs
         form_layout = QFormLayout()
+        
+        # Ensure dimensions are integers
+        current_width = int(current_width)
+        current_height = int(current_height)
         
         # Width input
         width_input = QSpinBox()
@@ -1394,19 +1488,19 @@ class NotesController(QObject):
                 if dest_dir:
                     # Save to the destination directory
                     saved_path = os.path.join(dest_dir, new_filename)
-                    rel_path = os.path.join("images", new_filename)
+                    rel_path = os.path.join("images", new_filename).replace('\\', '/')
                     
                     # Track the original path for future resizes
                     if original_path and os.path.exists(original_path):
                         # Check if original is in the images dir
-                        images_dir = os.path.join(os.path.dirname(dest_dir))
+                        images_dir = os.path.dirname(dest_dir)
                         if original_path.startswith(images_dir):
                             # Create a relative path from run dir to original
-                            original_rel_path = os.path.relpath(original_path, images_dir)
+                            original_rel_path = os.path.relpath(original_path, images_dir).replace('\\', '/')
                     elif source_path != actual_path:  # If we have a separate source path
-                        images_dir = os.path.join(os.path.dirname(dest_dir))
+                        images_dir = os.path.dirname(dest_dir)
                         if source_path.startswith(images_dir):
-                            original_rel_path = os.path.relpath(source_path, images_dir)
+                            original_rel_path = os.path.relpath(source_path, images_dir).replace('\\', '/')
                     
                     # If we don't have an original relative path yet, use the current source
                     if not original_rel_path and source_path:
@@ -1426,11 +1520,10 @@ class NotesController(QObject):
                             try:
                                 from PIL import Image
                                 img = Image.open(source_path)
-                                img = img.resize((new_width, new_height), Image.LANCZOS)
+                                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
                                 img.save(saved_path)
                             except ImportError:
                                 # Fallback to simple copy and other methods
-                                import shutil
                                 shutil.copy2(source_path, saved_path)
                     
                     # If this is a resized version of an already resized image, try to clean up the old one
@@ -1453,44 +1546,36 @@ class NotesController(QObject):
                     cursor_idx = current_cursor_pos
                     
                     # First look for an img tag with the specific path or name
-                    escaped_path = re.escape(actual_path)
-                    img_tag_pattern = rf'<img[^>]*?src="{escaped_path}"[^>]*?>'
-                    img_tag_match = re.search(img_tag_pattern, html_content)
+                    # escaped_path = re.escape(actual_path) # Too specific if paths changed
+                    img_tags_pattern = r'<img[^>]*?>'
+                    img_tags = list(re.finditer(img_tags_pattern, html_content))
                     
-                    if not img_tag_match:
-                        # Try looking for any img tag near our cursor position
-                        img_tags_pattern = r'<img[^>]*?>'
-                        img_tags = list(re.finditer(img_tags_pattern, html_content))
+                    # Find the closest img tag to our cursor position
+                    img_tag_match = None
+                    closest_distance = float('inf')
+                    
+                    for match in img_tags:
+                        start_pos = match.start()
+                        end_pos = match.end()
                         
-                        # Find the closest img tag to our cursor position
-                        closest_match = None
-                        closest_distance = float('inf')
-                        
-                        for match in img_tags:
-                            start_pos = match.start()
-                            end_pos = match.end()
+                        # Check if cursor is within this tag
+                        if start_pos <= cursor_idx <= end_pos:
+                            img_tag_match = match
+                            break
                             
-                            # Check if cursor is within this tag
-                            if start_pos <= cursor_idx <= end_pos:
-                                closest_match = match
-                                break
-                                
-                            # Otherwise find the closest
-                            distance = min(abs(start_pos - cursor_idx), abs(end_pos - cursor_idx))
-                            if distance < closest_distance:
-                                closest_distance = distance
-                                closest_match = match
-                        
-                        if closest_match:
-                            img_tag_match = closest_match
+                        # Otherwise find the closest
+                        distance = min(abs(start_pos - cursor_idx), abs(end_pos - cursor_idx))
+                        if distance < closest_distance:
+                            closest_distance = distance
+                            img_tag_match = match
                     
                     if img_tag_match:
                         # Replace this img tag with our new one
-                        orig_tag = img_tag_match.group(0)
+                        # orig_tag = img_tag_match.group(0) # Not used
                         
                         # Create new tag with original path information for future resizes
                         data_original = f' data-original="{original_rel_path}"' if original_rel_path else ''
-                        new_tag = f'<img src="{saved_path}" alt="Resized Image" class="evo-image" data-rel-path="{rel_path}"{data_original} width="{new_width}" height="{new_height}">'
+                        new_tag = f'<img src="{rel_path}" alt="Resized Image" class="evo-image" data-rel-path="{rel_path}"{data_original} width="{new_width}" height="{new_height}">'
                         
                         # Create new HTML by replacing just this tag
                         modified_html = html_content[:img_tag_match.start()] + new_tag + html_content[img_tag_match.end():]
@@ -1510,7 +1595,7 @@ class NotesController(QObject):
                         # Fallback: just insert a new image at the current cursor position
                         cursor = self.notes_editor.textCursor()
                         data_original = f' data-original="{original_rel_path}"' if original_rel_path else ''
-                        html = f'<img src="{saved_path}" alt="Resized Image" class="evo-image" data-rel-path="{rel_path}"{data_original} width="{new_width}" height="{new_height}">'
+                        html = f'<img src="{rel_path}" alt="Resized Image" class="evo-image" data-rel-path="{rel_path}"{data_original} width="{new_width}" height="{new_height}">'
                         cursor.insertHtml(html)
                 else:
                     # Fallback for when we can't save a new image
@@ -1520,7 +1605,6 @@ class NotesController(QObject):
                 
             except Exception as e:
                 # Show error message
-                from PyQt6.QtWidgets import QMessageBox
                 QMessageBox.warning(self.main_window, "Resize Image Error", 
                                    f"Error resizing image: {str(e)}")
                 self.main_window.logger.log(f"Error resizing image: {e}", "ERROR")
@@ -1541,16 +1625,7 @@ class NotesController(QObject):
             # Get current content
             html_content = self.notes_editor.toHtml()
             
-            # Calculate a hash of the content to avoid unnecessary saves
-            import hashlib
-            current_hash = hashlib.md5(html_content.encode()).hexdigest()
-            
-            # If content hasn't changed since last save, skip
-            if current_hash == self.last_saved_content_hash:
-                return
-                
             # Replace absolute image paths with relative paths for storage
-            import re
             # Find all images with our special class and replace their src with the relative path
             # while preserving width, height and other attributes
             html_content = re.sub(r'<img([^>]*?)class="evo-image"([^>]*?)data-rel-path="([^"]*)"([^>]*?)src="[^"]*"([^>]*?)>', 
@@ -1558,10 +1633,7 @@ class NotesController(QObject):
                                 html_content)
             
             # Call the regular save method with the modified HTML
-            self.save_note(html_content)
-            
-            # Store the content hash
-            self.last_saved_content_hash = current_hash
+            self.save_note(html_content, is_autosave=True)
             
         except Exception as e:
             self.main_window.logger.log(f"Error in autosave: {str(e)}", "ERROR")
@@ -1611,7 +1683,6 @@ class NotesController(QObject):
         Returns:
             tuple: (used_images, original_images) sets containing filenames
         """
-        import re
         used_images = set()
         original_images = set()
             
@@ -1635,11 +1706,11 @@ class NotesController(QObject):
                 if '_resized_' in img_name:
                     try:
                         # Extract base name from resized image
-                        base_name = re.search(r'(.+?)_resized_[0-9]+\.', img_name)
-                        if base_name:
+                        base_name_match = re.search(r'(.+?)_resized_[0-9]+\.', img_name)
+                        if base_name_match:
                             extension = img_name.split('.')[-1]
                             # Add potential original filename patterns
-                            original_name = f"{base_name.group(1)}.{extension}"
+                            original_name = f"{base_name_match.group(1)}.{extension}"
                             original_images.add(original_name)
                     except:
                         pass
@@ -1657,11 +1728,11 @@ class NotesController(QObject):
                 if '_resized_' in filename:
                     try:
                         # Extract base name from resized image
-                        base_name = re.search(r'(.+?)_resized_[0-9]+\.', filename)
-                        if base_name:
+                        base_name_match = re.search(r'(.+?)_resized_[0-9]+\.', filename)
+                        if base_name_match:
                             extension = filename.split('.')[-1]
                             # Add potential original filename patterns
-                            original_name = f"{base_name.group(1)}.{extension}"
+                            original_name = f"{base_name_match.group(1)}.{extension}"
                             original_images.add(original_name)
                     except:
                         pass
@@ -1678,7 +1749,6 @@ class NotesController(QObject):
             # Get the images directory
             images_dir = self.get_images_directory()
             if not images_dir or not os.path.exists(images_dir):
-                from PyQt6.QtWidgets import QMessageBox
                 QMessageBox.information(self.main_window, "Image Stats", 
                                        "No images directory found.")
                 return
@@ -1723,7 +1793,6 @@ class NotesController(QObject):
                 else:
                     return f"{size_bytes / (1024 * 1024):.1f} MB"
             
-            from PyQt6.QtWidgets import QMessageBox
             QMessageBox.information(self.main_window, "Image Stats", 
                                    f"Total images: {len(all_images)} ({format_size(total_size)})\n"
                                    f"Used directly: {len(used_images)} images\n"
@@ -1731,7 +1800,6 @@ class NotesController(QObject):
                                    f"Unused: {len(unused_images)} ({format_size(unused_size)}){unused_list}{original_list}")
         except Exception as e:
             self.main_window.logger.log(f"Error showing unused images stats: {str(e)}", "ERROR")
-            from PyQt6.QtWidgets import QMessageBox
             QMessageBox.warning(self.main_window, "Image Stats", 
                                f"Error checking unused images: {str(e)}")
     
@@ -1745,7 +1813,6 @@ class NotesController(QObject):
             # Get the images directory
             images_dir = self.get_images_directory()
             if not images_dir or not os.path.exists(images_dir):
-                from PyQt6.QtWidgets import QMessageBox
                 QMessageBox.information(self.main_window, "Clean Up Images", 
                                        "No images directory found.")
                 return
@@ -1763,7 +1830,6 @@ class NotesController(QObject):
             unused_images = all_images - used_images - original_images
             
             if not unused_images:
-                from PyQt6.QtWidgets import QMessageBox
                 QMessageBox.information(self.main_window, "Clean Up Images", 
                                        "No unused images found. Original images for resized versions are preserved.")
                 return
@@ -1774,7 +1840,6 @@ class NotesController(QObject):
                 unused_list = "\n\n" + "\n".join(sorted(unused_images))
                 
             # Get confirmation from user
-            from PyQt6.QtWidgets import QMessageBox
             reply = QMessageBox.question(self.main_window, "Clean Up Images", 
                                         f"Found {len(unused_images)} unused images. Delete them?\nOriginal images for resized versions ({len(original_images)}) will be preserved.{unused_list}",
                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -1792,12 +1857,10 @@ class NotesController(QObject):
                     except Exception as e:
                         self.main_window.logger.log(f"Error removing unused image {filename}: {str(e)}", "ERROR")
                 
-                from PyQt6.QtWidgets import QMessageBox
                 QMessageBox.information(self.main_window, "Clean Up Images", 
                                        f"Successfully deleted {deleted_count} unused images.\nOriginal images for resized versions were preserved.")
         except Exception as e:
             self.main_window.logger.log(f"Error cleaning up unused images: {str(e)}", "ERROR")
-            from PyQt6.QtWidgets import QMessageBox
             QMessageBox.warning(self.main_window, "Clean Up Images", 
                                f"Error cleaning up unused images: {str(e)}")
     

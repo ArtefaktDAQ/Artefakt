@@ -7,15 +7,20 @@ A comprehensive Data Acquisition (DAQ) system built with Python and PyQt6, desig
 - **Multi-device Support**: Compatible with Arduino, LabJack U3 and T-series devices (T4, T7) and other serial devices by a configurable interface
 - **Real-time Data Visualization**: Live plotting and monitoring capabilities
 - **Video Integration**: NDI video streaming and FFmpeg-based video processing
+- **Webcam + Microphone Devices**: Treat built-in webcam and microphone as sensors with optical modes for Light Events, Brightness, Color Tracking, Position Tracking, Particle Counter, and Fill Level
+- **Remote DAQ (gRPC)**: Stream live sensor data and video feeds between Artefakt instances over LAN/VPN for distributed acquisition and remote monitoring
+- **Control Run Overlay**: Load previous runs as control data, time-align them, and overlay control signals on live graphs for side-by-side comparison
+- **Replay with Video Sync**: Play back recorded runs with time-synchronized video/audio and sensor data using a replay playhead and speed controls
 - **Data Export**: Export data in various formats (CSV, JSON, etc.)
 - **Modern UI**: Dark-themed interface with intuitive controls
 - **Configurable Settings**: Customizable acquisition parameters and device settings
 - **Automation Capabilities**: Comprehensive automation framework with time-based triggers (specific times, duration intervals), sensor value thresholds, event-driven sequences, and multi-step programmable control workflows for unattended operation
+- **On-Demand Tools Window (Ctrl+Shift+T)**: FFT analyzer, sensor calibration, stats dashboard, diagnostics, calculator
 
 ## Requirements
 
 ### System Requirements
-- Windows 10/11 (primary support)
+- Windows 10/11 (primary)
 - Python 3.8 or higher
 - Minimum 4GB RAM
 - USB ports for device connections
@@ -33,15 +38,12 @@ You can use Artefakt DAQ in two ways: as a standalone executable or by running f
 ### Option 1: Standalone Executable (Recommended for End Users)
 
 #### Download and Setup
-**Note: Releases are coming soon! For now, please use Option 2 below to run from source code.**
-
-Once releases are available:
-1. Download the latest `Artefakt_DAQ_vX.X.X.exe` from the [releases section](https://github.com/ArtefaktDAQ/Artefakt/releases)
+1. Download the latest `Artefakt_DAQ_v0.3.0.exe` from the [releases section](https://github.com/ArtefaktDAQ/Artefakt/releases)
 2. Create a folder for the application (e.g., `C:\Artefakt_DAQ\`)
 3. Place the executable in this folder
-4. Double-click `Artefakt_DAQ_vX.X.X.exe` to launch
+4. Double-click `Artefakt_DAQ_v0.3.0.exe` to launch
 
-### Option 2: Running from Source Code (Currently Required)
+### Option 2: Running from Source Code
 
 #### 1. Clone the Repository
 ```bash
@@ -84,6 +86,12 @@ python main.py
 - **Dashboard**: Overview of all connected devices and current status
 - **Sensors**: Configure and monitor sensor inputs
 - **Camera**: Video capture and recording with overlay support
+- **Microphone**: Capture audio as a first-class sensor for analysis and synchronized recording
+- **Webcam as Device**: Record webcam video with sensor overlays and optional microphone audio; optical sensor modes include Light Events, Brightness, Color Tracking, Position Tracking, Particle Counter, and Fill Level
+- **Remote DAQ (gRPC)**: Connect to another Artefakt instance on the network to stream data and video in real time
+- **Control Runs**: Load a prior experiment as a control, shift its start time, and overlay its signals on live plots
+- **Replay**: Time-synced playback of recorded data with linked video/audio and adjustable speed
+- **Tools Window**: Popup toolbox (Ctrl+Shift+T) for diagnostics, calibration, and analysis aids
 - **Automation**: Set up sequences to automate things
 - **Projects**: Organize and manage different experimental setups
 - **Settings**: Configure devices, file paths, and application preferences
@@ -173,8 +181,6 @@ For commercial use or redistribution, please review FFmpeg's licensing requireme
 
 While this software is licensed under the GPL v3.0, all logos, trademarks, and brand assets used in this application remain the property of their respective owners. The GPL license applies only to the source code and does not grant any rights to use company logos, trademarks, or brand assets.
 
-- **Artefakt Logo**: All rights reserved
-- **Company Branding**: All rights reserved
 - **Usage**: You may modify and redistribute the source code under GPL terms, but must remove or replace any proprietary logos and branding elements
 
 If you fork or redistribute this software, please ensure you remove or replace all proprietary visual assets and branding elements.
@@ -184,7 +190,7 @@ If you fork or redistribute this software, please ensure you remove or replace a
 GNU GENERAL PUBLIC LICENSE
 Version 3, 29 June 2007
 
-Copyright (C) 2025 evo-labs.io
+Copyright (C) 2026 evo-labs.io
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by

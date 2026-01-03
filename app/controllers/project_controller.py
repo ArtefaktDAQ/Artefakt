@@ -6,9 +6,10 @@ Manages project data and operations.
 import os
 import json
 import datetime
-from PyQt6.QtCore import QObject, pyqtSignal, Qt
+import shutil
+from PyQt6.QtCore import QObject, pyqtSignal, Qt, QItemSelectionModel
 from PyQt6.QtGui import QStandardItem
-from PyQt6.QtWidgets import QFileDialog, QMessageBox, QCheckBox, QDialog, QVBoxLayout, QLabel, QPushButton, QProgressDialog
+from PyQt6.QtWidgets import QFileDialog, QMessageBox, QCheckBox, QDialog, QVBoxLayout, QLabel, QPushButton, QProgressDialog, QTextEdit, QHBoxLayout
 from PyQt6.QtWidgets import QApplication
 from app.utils.common_types import StatusState
 
@@ -48,15 +49,17 @@ class ProjectController(QObject):
         self.ui_status_label = None
         if hasattr(self.main_window, 'project_status') and hasattr(self.main_window.project_status, 'setText'):
             self.ui_status_label = self.main_window.project_status
-            
+
+    def startup_load(self):
+        """Load the last used project and test series on startup"""
         # Load base directory from config
         if hasattr(self.main_window, 'config') and hasattr(self.main_window, 'project_base_dir'):
             base_dir = self.main_window.config.get("default_project_dir", "")
             if base_dir and os.path.exists(base_dir):
                 self.main_window.project_base_dir.setText(base_dir)
                 self.main_window.logger.log(f"Loaded base directory from config: {base_dir}")
-                # Update the project tree with the loaded directory
-                self.update_project_tree()
+                # Update the project tree with the loaded directory and expand everything
+                self.update_project_tree(expand_all=True)
                 
                 # Load the last used project and test series if available
                 last_project = self.main_window.config.get("last_project", "")
@@ -84,8 +87,24 @@ class ProjectController(QObject):
                             # Load test series metadata
                             self.load_test_series_metadata()
                             
-                            # Find and load the newest run
-                            self.load_newest_run()
+                            # Load the last used run if available, otherwise find the newest
+                            last_run = self.main_window.config.get("last_run", "")
+                            run_path = os.path.join(base_dir, last_project, last_test_series, last_run) if last_run else None
+                            
+                            if last_run and run_path and os.path.exists(run_path):
+                                self.main_window.logger.log(f"Loading last used run: {last_run}", "INFO")
+                                self.load_run(
+                                    project_name=last_project,
+                                    series_name=last_test_series,
+                                    run_name=last_run,
+                                    is_startup_load=True
+                                )
+                            else:
+                                # Find and load the newest run
+                                self.load_newest_run(is_startup_load=True)
+                            
+                            # Update the project tree again to show highlighting for the loaded run
+                            self.update_project_tree(expand_all=True)
         
         # Make sure sidebar is updated with current project and test series
         if self.current_project:
@@ -161,6 +180,8 @@ class ProjectController(QObject):
                     self.main_window.config["last_project"] = self.current_project
                 if self.current_test_series:
                     self.main_window.config["last_test_series"] = self.current_test_series
+                if self.current_run:
+                    self.main_window.config["last_run"] = self.current_run
                 
                 # Save testers field value
                 if hasattr(self.main_window, 'run_testers'):
@@ -211,11 +232,141 @@ class ProjectController(QObject):
         # Start or restart the timer to save after a delay (1 second)
         self.save_timer.start(1000)
             
-    def update_project_tree(self):
-        """Update the project tree view with existing projects"""
+    def _format_duration(self, seconds):
+        """Format seconds into H:MM:SS or M:SS"""
+        if seconds is None or seconds == "":
+            return "—"
+        try:
+            seconds = float(seconds)
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            secs = int(seconds % 60)
+            if hours > 0:
+                return f"{hours}:{minutes:02d}:{secs:02d}"
+            else:
+                return f"{minutes:02d}:{secs:02d}"
+        except:
+            return str(seconds)
+
+    def _count_sensors(self, run_dir):
+        """Count active sensors from sensors.json in run directory"""
+        sensors_file = os.path.join(run_dir, "sensors.json")
+        if os.path.exists(sensors_file):
+            try:
+                with open(sensors_file, 'r') as f:
+                    sensors = json.load(f)
+                    return len(sensors)
+            except:
+                pass
+        return 0
+
+    def _has_video(self, metadata, run_dir):
+        """Check if a video was recorded for this run"""
+        if metadata.get("videos") or metadata.get("video_path"):
+            return "🎥 Yes"
+        
+        # Check filesystem as fallback
+        try:
+            for file in os.listdir(run_dir):
+                if file.endswith(('.mp4', '.avi', '.mkv', '.mov')):
+                    return "🎥 Yes"
+        except:
+            pass
+        return "No"
+
+    def _count_images(self, run_dir):
+        """Count image files in the run directory and Snapshots subfolder"""
+        image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.gif', '.webp')
+        count = 0
+        
+        # Count images in the run directory
+        try:
+            for file in os.listdir(run_dir):
+                if file.lower().endswith(image_extensions):
+                    count += 1
+        except:
+            pass
+        
+        # Count images in the Snapshots subfolder
+        snapshots_dir = os.path.join(run_dir, "Snapshots")
+        try:
+            if os.path.exists(snapshots_dir) and os.path.isdir(snapshots_dir):
+                for file in os.listdir(snapshots_dir):
+                    if file.lower().endswith(image_extensions):
+                        count += 1
+        except:
+            pass
+        
+        return count
+
+    def _get_run_duration(self, metadata, run_dir):
+        """Get run duration from metadata or filesystem fallback"""
+        # 1. Try explicit duration fields
+        duration_sec = metadata.get("video_duration_sec")
+        if duration_sec is None:
+            duration_sec = metadata.get("duration_sec")
+        
+        # 2. Try start/end epoch difference
+        if duration_sec is None:
+            start = metadata.get("run_start_epoch")
+            end = metadata.get("run_end_epoch")
+            if start and end:
+                try:
+                    duration_sec = float(end) - float(start)
+                except:
+                    pass
+        
+        # 3. Try CSV file modification time fallback
+        if duration_sec is None:
+            try:
+                # Find all rundata files
+                csv_files = [f for f in os.listdir(run_dir) if f.startswith('rundata_') and f.endswith('.csv')]
+                if csv_files:
+                    # Get the latest one
+                    latest_csv = max([os.path.join(run_dir, f) for f in csv_files], key=os.path.getmtime)
+                    mtime = os.path.getmtime(latest_csv)
+                    
+                    # Get start time from metadata or file creation
+                    start_epoch = metadata.get("run_start_epoch")
+                    if not start_epoch:
+                        # Fallback to earliest CSV's mtime or directory creation
+                        earliest_csv = min([os.path.join(run_dir, f) for f in csv_files], key=os.path.getmtime)
+                        start_epoch = os.path.getmtime(earliest_csv)
+                    
+                    if start_epoch and mtime > start_epoch:
+                        duration_sec = mtime - start_epoch
+            except:
+                pass
+                
+        return duration_sec
+
+    def update_project_tree(self, expand_all=False):
+        """
+        Update the project tree view with existing projects
+        
+        Args:
+            expand_all: If True, expands all items after loading.
+        """
+        tree = getattr(self.main_window, "project_tree", None)
+        model = getattr(self.main_window, "project_model", None)
+        
+        # Save expansion state: store paths like "ProjectName/SeriesName"
+        expanded_paths = []
+        if tree and model and not expand_all:
+            for i in range(model.rowCount()):
+                project_item = model.item(i, 0)
+                if project_item and tree.isExpanded(project_item.index()):
+                    project_name = project_item.text()
+                    expanded_paths.append(project_name)
+                    for j in range(project_item.rowCount()):
+                        series_item = project_item.child(j, 0)
+                        if series_item and tree.isExpanded(series_item.index()):
+                            series_name = series_item.text()
+                            expanded_paths.append(f"{project_name}/{series_name}")
+
         # Clear the model
         self.main_window.project_model.clear()
-        self.main_window.project_model.setHorizontalHeaderLabels(["Name", "Description", "Date"])
+        self.main_window.project_model.setHorizontalHeaderLabels(["Name", "Description", "Duration", "Sensors", "Video", "Images"])
         
         # Get base directory
         base_dir = self.main_window.project_base_dir.text()
@@ -240,7 +391,6 @@ class ProjectController(QObject):
                     
                 # Load metadata if exists
                 project_desc = ""
-                project_date = ""
                 metadata_file = os.path.join(project_dir, "project_metadata.json")
                 
                 if os.path.exists(metadata_file):
@@ -248,17 +398,19 @@ class ProjectController(QObject):
                         with open(metadata_file, 'r') as f:
                             metadata = json.load(f)
                             project_desc = metadata.get("description", "")
-                            project_date = metadata.get("created_date", "")
                     except Exception as e:
                         self.main_window.logger.log(f"Error reading project metadata: {str(e)}", "WARN")
                 
                 # Create project item
                 project_item = QStandardItem(project_name)
                 desc_item = QStandardItem(project_desc)
-                date_item = QStandardItem(project_date)
+                duration_item = QStandardItem("")
+                sensors_item = QStandardItem("")
+                video_item = QStandardItem("")
+                images_item = QStandardItem("")
                 
                 # Add project to root
-                root_item.appendRow([project_item, desc_item, date_item])
+                root_item.appendRow([project_item, desc_item, duration_item, sensors_item, video_item, images_item])
                 
                 # Scan for test series within project
                 series_dirs = []
@@ -276,7 +428,6 @@ class ProjectController(QObject):
                         
                     # Load metadata if exists
                     series_desc = ""
-                    series_date = ""
                     series_metadata_file = os.path.join(series_dir, "series_metadata.json")
                     
                     if os.path.exists(series_metadata_file):
@@ -284,17 +435,19 @@ class ProjectController(QObject):
                             with open(series_metadata_file, 'r') as f:
                                 metadata = json.load(f)
                                 series_desc = metadata.get("description", "")
-                                series_date = metadata.get("created_date", "")
                         except Exception as e:
                             self.main_window.logger.log(f"Error reading series metadata: {str(e)}", "WARN")
                     
                     # Create test series item
                     series_item = QStandardItem(series_name)
                     series_desc_item = QStandardItem(series_desc)
-                    series_date_item = QStandardItem(series_date)
+                    series_duration_item = QStandardItem("")
+                    series_sensors_item = QStandardItem("")
+                    series_video_item = QStandardItem("")
+                    series_images_item = QStandardItem("")
                     
                     # Add series to project
-                    project_item.appendRow([series_item, series_desc_item, series_date_item])
+                    project_item.appendRow([series_item, series_desc_item, series_duration_item, series_sensors_item, series_video_item, series_images_item])
                     
                     # Check for runs in the test series
                     run_dirs = []
@@ -312,33 +465,151 @@ class ProjectController(QObject):
                             
                         # Load metadata if exists
                         run_desc = ""
-                        run_date = ""
+                        run_duration = ""
+                        run_sensors = ""
+                        run_video = ""
+                        run_images = ""
                         run_metadata_file = os.path.join(run_dir, "run_metadata.json")
                         
+                        metadata = {}
                         if os.path.exists(run_metadata_file):
                             try:
                                 with open(run_metadata_file, 'r') as f:
                                     metadata = json.load(f)
                                     run_desc = metadata.get("description", "")
-                                    run_date = metadata.get("created_date", "")
-                                    if not run_date:
-                                        run_date = metadata.get("timestamp", "")
                             except Exception as e:
                                 self.main_window.logger.log(f"Error reading run metadata: {str(e)}", "WARN")
+                        
+                        # Get duration using improved fallback logic (metadata might be empty but run_dir is valid)
+                        duration_sec = self._get_run_duration(metadata, run_dir)
+                        run_duration = self._format_duration(duration_sec)
+                        
+                        # Count sensors
+                        sensor_count = self._count_sensors(run_dir)
+                        run_sensors = str(sensor_count) if sensor_count > 0 else "—"
+                        
+                        # Check for video
+                        run_video = self._has_video(metadata, run_dir)
+                        
+                        # Count images
+                        image_count = self._count_images(run_dir)
+                        run_images = str(image_count) if image_count > 0 else "—"
                         
                         # Create run item
                         run_item = QStandardItem(run_name)
                         run_desc_item = QStandardItem(run_desc)
-                        run_date_item = QStandardItem(run_date)
-                        
+                        run_duration_item = QStandardItem(run_duration)
+                        run_sensors_item = QStandardItem(run_sensors)
+                        run_video_item = QStandardItem(run_video)
+                        run_images_item = QStandardItem(run_images)
+
+                        # Highlight if it's the current run
+                        if (hasattr(self, 'current_run') and self.current_run == run_name and 
+                            hasattr(self, 'current_test_series') and self.current_test_series == series_name and
+                            hasattr(self, 'current_project') and self.current_project == project_name):
+                            # Use a light blue color for the text and make it bold
+                            from PyQt6.QtGui import QColor
+                            highlight_color = QColor("#3498DB") # Modern Light Blue
+                            
+                            row_items = [run_item, run_desc_item, run_duration_item, run_sensors_item, run_video_item, run_images_item]
+                            for item in row_items:
+                                item.setForeground(highlight_color)
+                                font = item.font()
+                                font.setBold(True)
+                                item.setFont(font)
+                                item.setToolTip("Currently loaded/active run")
+
                         # Add run to test series
-                        series_item.appendRow([run_item, run_desc_item, run_date_item])
+                        series_item.appendRow([run_item, run_desc_item, run_duration_item, run_sensors_item, run_video_item, run_images_item])
         
         except Exception as e:
             self.main_window.logger.log(f"Error updating project tree: {str(e)}", "ERROR")
             
-        # Expand the tree to show the first level
-        self.main_window.project_tree.expandToDepth(0)
+        # Expansion logic
+        if tree:
+            if expand_all:
+                tree.expandAll()
+            elif model and expanded_paths:
+                # Restore expansion state
+                for i in range(model.rowCount()):
+                    project_item = model.item(i, 0)
+                    if project_item:
+                        project_name = project_item.text()
+                        if project_name in expanded_paths:
+                            tree.expand(project_item.index())
+                            for j in range(project_item.rowCount()):
+                                series_item = project_item.child(j, 0)
+                                if series_item:
+                                    series_name = series_item.text()
+                                    if f"{project_name}/{series_name}" in expanded_paths:
+                                        tree.expand(series_item.index())
+            else:
+                # Expand the tree to show the first level if no state saved
+                tree.expandToDepth(0)
+                
+        # Auto-adjust columns to contents after loading
+        if tree and model:
+            for i in range(model.columnCount()):
+                # We skip column 1 (Description) as it's set to Stretch in ui_setup.py
+                if i != 1:
+                    tree.resizeColumnToContents(i)
+    
+    def select_tree_item(self, project_name=None, series_name=None, run_name=None):
+        """
+        Expand and select an item in the project tree.
+        
+        Args:
+            project_name: Name of the project to select.
+            series_name: Optional test series name.
+            run_name: Optional run name.
+        """
+        model = getattr(self.main_window, "project_model", None)
+        tree = getattr(self.main_window, "project_tree", None)
+        if not model or not tree or not project_name:
+            return
+        
+        target_index = None
+        
+        for i in range(model.rowCount()):
+            project_item = model.item(i, 0)
+            if not project_item or project_item.text() != project_name:
+                continue
+            project_index = project_item.index()
+            tree.expand(project_index)
+            
+            if not series_name:
+                target_index = project_index
+                break
+            
+            for j in range(project_item.rowCount()):
+                series_item = project_item.child(j, 0)
+                if not series_item or series_item.text() != series_name:
+                    continue
+                series_index = series_item.index()
+                tree.expand(series_index)
+                
+                if not run_name:
+                    target_index = series_index
+                    break
+                
+                for k in range(series_item.rowCount()):
+                    run_item = series_item.child(k, 0)
+                    if run_item and run_item.text() == run_name:
+                        target_index = run_item.index()
+                        break
+                break
+            if target_index:
+                break
+        
+        if target_index:
+            selection_model = tree.selectionModel()
+            if selection_model:
+                selection_model.select(
+                    target_index,
+                    QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows
+                )
+                tree.scrollTo(target_index)
+                self.on_project_tree_clicked(target_index)
     
     def update_project_selector(self):
         """Update the project selector dropdown with existing projects"""
@@ -444,7 +715,7 @@ class ProjectController(QObject):
                 self.main_window.save_config()
             
             self.main_window.logger.log(f"Set project base directory to: {directory}")
-            self.update_project_tree()
+            self.update_project_tree(expand_all=True)
             
             # Update group box colors
             if hasattr(self.main_window, 'update_project_group_box_colors'):
@@ -462,6 +733,137 @@ class ProjectController(QObject):
             return
             
         self.load_run()
+    
+    def on_delete_run_clicked(self):
+        """Called when the Delete Run button is clicked to remove a run"""
+        # Prevent deletion while a run is active
+        if getattr(self.main_window, "running", False):
+            QMessageBox.warning(
+                self.main_window,
+                "Run Active",
+                "Stop the current run before deleting a run."
+            )
+            return
+        
+        if self.last_selected_type != "run":
+            QMessageBox.information(
+                self.main_window,
+                "Select Run",
+                "Please select a run in the Project Browser to delete."
+            )
+            return
+        
+        base_dir = self.main_window.project_base_dir.text()
+        if not base_dir or not os.path.exists(base_dir):
+            QMessageBox.warning(
+                self.main_window,
+                "Missing Base Directory",
+                "Please set a valid base directory before deleting runs."
+            )
+            return
+        
+        project_name = self.last_selected_project
+        series_name = self.last_selected_series
+        run_name = self.last_selected_run
+        run_dir = os.path.join(base_dir, project_name, series_name, run_name)
+        
+        if not os.path.exists(run_dir):
+            QMessageBox.warning(
+                self.main_window,
+                "Run Not Found",
+                f"The run directory does not exist:\n{run_dir}"
+            )
+            return
+        
+        # Collect files within the run directory for confirmation preview
+        file_paths = []
+        for root, _, files in os.walk(run_dir):
+            for file in files:
+                rel_path = os.path.relpath(os.path.join(root, file), run_dir)
+                file_paths.append(rel_path)
+        file_paths = sorted(file_paths)
+        
+        max_preview = 200
+        preview_paths = file_paths[:max_preview]
+        if len(file_paths) > max_preview:
+            preview_paths.append(f"... and {len(file_paths) - max_preview} more files")
+        
+        if not preview_paths:
+            preview_paths = ["(no files found in this run folder)"]
+        
+        # Build confirmation dialog
+        dialog = QDialog(self.main_window)
+        dialog.setWindowTitle("Delete Run")
+        layout = QVBoxLayout(dialog)
+        
+        message = (
+            f"Delete run '{run_name}' from test series '{series_name}' in project '{project_name}'?\n"
+            "This will permanently remove the folder and the files listed below."
+        )
+        label = QLabel(message)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        
+        files_text = QTextEdit()
+        files_text.setReadOnly(True)
+        files_text.setMinimumHeight(200)
+        files_text.setPlainText("\n".join(preview_paths))
+        layout.addWidget(files_text)
+        
+        button_layout = QHBoxLayout()
+        confirm_btn = QPushButton("Delete")
+        cancel_btn = QPushButton("Cancel")
+        button_layout.addStretch(1)
+        button_layout.addWidget(confirm_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+        
+        confirm_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+        
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        
+        # Perform deletion
+        try:
+            shutil.rmtree(run_dir)
+            self.main_window.logger.log(f"Deleted run directory: {run_dir}", "INFO")
+        except Exception as e:
+            QMessageBox.critical(
+                self.main_window,
+                "Delete Failed",
+                f"Could not delete run:\n{str(e)}"
+            )
+            self.main_window.logger.log(f"Error deleting run directory: {str(e)}", "ERROR")
+            return
+        
+        # Clear selection and refresh UI
+        if hasattr(self.main_window, "project_tree"):
+            self.main_window.project_tree.clearSelection()
+        self.last_selected_type = None
+        self.last_selected_project = None
+        self.last_selected_series = None
+        self.last_selected_run = None
+        
+        # If the deleted run was loaded, clear current run references
+        if (self.current_project == project_name and
+            self.current_test_series == series_name and
+            self.current_run == run_name):
+            self.current_run = None
+            self.run_description = ""
+            if hasattr(self.main_window, "run_description"):
+                self.main_window.run_description.clear()
+            if hasattr(self.main_window, "run_testers"):
+                self.main_window.run_testers.clear()
+        
+        self.update_project_tree()
+        self.status_changed.emit()
+        
+        QMessageBox.information(
+            self.main_window,
+            "Run Deleted",
+            f"Run '{run_name}' has been deleted."
+        )
     
     def browse_base_directory(self):
         """Browse for the base directory"""
@@ -739,59 +1141,61 @@ class ProjectController(QObject):
         """Get the current date as a formatted string"""
         return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    def load_run(self):
-        """Load a saved run"""
-        # Check if a run is selected in the project tree
-        selected_indexes = self.main_window.project_tree.selectedIndexes()
-        if not selected_indexes:
-            self.main_window.logger.log("No run selected in the project tree.", "WARN")
-            self.update_status_text("Error: No run selected", "red")
-            return
+    def load_run(self, project_name=None, series_name=None, run_name=None, is_startup_load=False):
+        """Load a saved run. If project/series/run names are provided, use them.
+        Otherwise, use the current selection in the project tree."""
+        # Clear snapshots immediately when starting to load a run
+        if hasattr(self.main_window, "load_snapshots_for_run"):
+            self.main_window.load_snapshots_for_run(None)
             
-        # Get the selected index for the name column (0)
-        name_index = selected_indexes[0]
-        if name_index.column() != 0:
-            # Get the corresponding name index if we selected description or date column
-            name_index = self.main_window.project_model.index(name_index.row(), 0, name_index.parent())
-            
-        # Get the selected item name
-        item_name = self.main_window.project_model.data(name_index)
-        
-        # Get the parent item (if any)
-        parent_index = name_index.parent()
-        parent_name = None
-        if parent_index.isValid():
-            # Ensure we get column 0 (name) for the parent
-            parent_name_index = self.main_window.project_model.index(parent_index.row(), 0, parent_index.parent())
-            parent_name = self.main_window.project_model.data(parent_name_index)
-            
-        # Get grandparent item (if any)
-        grandparent_name = None
-        if parent_index.isValid():
-            grandparent_index = parent_index.parent()
-            if grandparent_index and grandparent_index.isValid():
-                # Ensure we get column 0 (name) for the grandparent
-                grandparent_name_index = self.main_window.project_model.index(grandparent_index.row(), 0, grandparent_index.parent())
-                grandparent_name = self.main_window.project_model.data(grandparent_name_index)
-                
         # Get base directory
         base_dir = self.main_window.project_base_dir.text()
         if not base_dir or not os.path.exists(base_dir):
             self.main_window.logger.log("Base directory not set or does not exist.", "WARN")
             self.update_status_text("Error: Base directory not set", "red")
             return
+
+        # Use provided names if available, otherwise get from selection
+        if project_name is None or series_name is None or run_name is None:
+            # Check if a run is selected in the project tree
+            selected_indexes = self.main_window.project_tree.selectedIndexes()
+            if not selected_indexes:
+                self.main_window.logger.log("No run selected in the project tree.", "WARN")
+                self.update_status_text("Error: No run selected", "red")
+                return
+                
+            # Get the selected index for the name column (0)
+            name_index = selected_indexes[0]
+            if name_index.column() != 0:
+                # Get the corresponding name index if we selected description or date column
+                name_index = self.main_window.project_model.index(name_index.row(), 0, name_index.parent())
+                
+            # Get the selected item name
+            run_name = self.main_window.project_model.data(name_index)
             
-        # Check if selection is a run (has both parent and grandparent)
-        if grandparent_name is None:
-            self.main_window.logger.log("Selection is not a run. Please select a run.", "WARN")
-            self.update_status_text("Error: Selected item is not a run", "red")
-            return
+            # Get the parent item (if any)
+            parent_index = name_index.parent()
+            series_name = None
+            if parent_index.isValid():
+                # Ensure we get column 0 (name) for the parent
+                parent_name_index = self.main_window.project_model.index(parent_index.row(), 0, parent_index.parent())
+                series_name = self.main_window.project_model.data(parent_name_index)
+                
+            # Get grandparent item (if any)
+            project_name = None
+            if parent_index.isValid():
+                grandparent_index = parent_index.parent()
+                if grandparent_index and grandparent_index.isValid():
+                    # Ensure we get column 0 (name) for the grandparent
+                    grandparent_name_index = self.main_window.project_model.index(grandparent_index.row(), 0, grandparent_index.parent())
+                    project_name = self.main_window.project_model.data(grandparent_name_index)
+                    
+            # Check if selection is a run (has both parent and grandparent)
+            if project_name is None:
+                self.main_window.logger.log("Selection is not a run. Please select a run.", "WARN")
+                self.update_status_text("Error: Selected item is not a run", "red")
+                return
             
-        # This is a run - grandparent is project, parent is test series
-        project_name = grandparent_name
-        series_name = parent_name
-        run_name = item_name
-        
         # Build run directory path
         run_dir = os.path.join(base_dir, project_name, series_name, run_name)
         if not os.path.exists(run_dir):
@@ -806,7 +1210,8 @@ class ProjectController(QObject):
                 with open(run_metadata_file, 'r') as f:
                     metadata = json.load(f)
                     self.run_description = metadata.get("description", "")
-                    self.main_window.run_description.setText(self.run_description)
+                    # Do not populate run UI fields when loading an existing run;
+                    # testers/description remain visible in project browser and notes.
             except Exception as e:
                 self.main_window.logger.log(f"Error reading run metadata: {str(e)}", "WARN")
                 
@@ -846,17 +1251,47 @@ class ProjectController(QObject):
         self.current_test_series = series_name
         self.current_run = run_name
         
+        # Update global configuration with the last loaded run
+        if hasattr(self.main_window, 'config'):
+            self.main_window.config["last_project"] = project_name
+            self.main_window.config["last_test_series"] = series_name
+            self.main_window.config["last_run"] = run_name
+            self.main_window.save_config()
+        
         # Update sidebar status
         self.main_window.sidebar_project_name.setText(project_name)
         self.main_window.sidebar_test_series.setText(series_name)
-        self.main_window.sidebar_ready_status.setText("Ready")
-        self.main_window.sidebar_ready_status.setStyleSheet("color: green;")
+        # Only update status if not currently running
+        if not (hasattr(self.main_window, 'running') and self.main_window.running):
+            self.main_window.sidebar_ready_status.setText("Ready")
+            self.main_window.sidebar_ready_status.setStyleSheet("color: green;")
         
         # Update status
         self.update_status_text(f"Run '{run_name}' loaded successfully", "green")
+        if hasattr(self.main_window, "update_run_context_text"):
+            self.main_window.update_run_context_text("Loaded run", run_name)
         
         # Load sensor configuration from the run directory
         self.load_sensors_from_run(run_dir)
+        
+        # Update project tree to show highlighting for the loaded run
+        self.update_project_tree()
+        
+        # Load historical graph data for this run so the Graphs tab shows the selected run
+        if hasattr(self.main_window, 'data_collection_controller'):
+            try:
+                dc_controller = self.main_window.data_collection_controller
+                dc_controller.csv_historical_data = dc_controller.read_historical_data_from_csv(run_dir)
+                if dc_controller.csv_historical_data and hasattr(self.main_window, 'graph_controller'):
+                    # Plot historical data using the general method (plots all sensors)
+                    # Pass run_dir so automation events can be loaded
+                    self.main_window.graph_controller.plot_historical_data(dc_controller.csv_historical_data, run_dir=run_dir)
+                    
+                    self.main_window.logger.log(f"Plotted historical graph data from {run_dir}")
+                else:
+                    self.main_window.logger.log(f"No historical graph data found in {run_dir}", "INFO")
+            except Exception as e:
+                self.main_window.logger.log(f"Error loading historical graph data: {str(e)}", "WARN")
         
         # Load control run configuration from the run directory
         if hasattr(self.main_window, 'control_run_controller'):
@@ -899,12 +1334,72 @@ class ProjectController(QObject):
                 self.main_window.logger.log(f"Automation sequences updated for run: {run_dir}")
             except Exception as e:
                  self.main_window.logger.log(f"Error updating automation sequence path: {str(e)}", "ERROR")
+        
+        # Load overlays if camera controller exists
+        if hasattr(self.main_window, 'camera_controller'):
+            try:
+                self.main_window.camera_controller.load_overlays_from_run(run_dir)
+            except Exception as e:
+                self.main_window.logger.log(f"Error loading overlays from run: {str(e)}", "WARN")
+        
+        # Update optical sensor settings with run directory
+        if hasattr(self.main_window, 'sensor_controller'):
+            try:
+                sensor_controller = self.main_window.sensor_controller
+                if hasattr(sensor_controller, 'optical_sensor_interfaces'):
+                    # Update all connected optical sensors with the run directory
+                    for sensor_name, interface in sensor_controller.optical_sensor_interfaces.items():
+                        if interface and interface.is_connected():
+                            # Get current settings and update with run directory
+                            settings = {"run_directory": run_dir}
+                            interface.update_settings(settings)
+                    self.main_window.logger.log(f"Updated optical sensor settings with run directory: {run_dir}", "INFO")
+            except Exception as e:
+                self.main_window.logger.log(f"Error updating optical sensor settings: {str(e)}", "WARN")
+
+        # Initialize dashboard replay with the loaded run so dashboard matches Graphs tab
+        if hasattr(self.main_window, "on_replay_load_clicked"):
+            try:
+                self.main_window.on_replay_load_clicked()
+            except Exception as e:
+                self.main_window.logger.log(f"Error initializing replay after loading run: {str(e)}", "WARN")
+
+        # Also trigger a refresh of the main graph based on current UI selections
+        # We do this AFTER on_replay_load_clicked so dashboard_start_time is set
+        if hasattr(self.main_window, 'update_graph'):
+            self.main_window.update_graph()
+
+        # Ensure notes tab reflects the loaded run
+        if hasattr(self.main_window, "notes_controller"):
+            try:
+                # Force reload of the note for this run
+                self.main_window.notes_controller.document_loaded = False
+                self.main_window.notes_controller.load_note()
+            except Exception as e:
+                self.main_window.logger.log(f"Error loading notes for run: {str(e)}", "WARN")
+
+        # Save the project state to JSON to ensure it's available next time
+        self.save_state_to_json()
+
+        # If this is a startup load, override with global settings from configuration
+        # This prevents run-specific settings from overwriting global user preferences on startup
+        if is_startup_load and hasattr(self.main_window, 'load_settings'):
+            self.main_window.logger.log("Startup load: Overriding with global settings", "INFO")
+            self.main_window.load_settings(is_startup_load=True)
 
         # Emit status changed signal
         self.status_changed.emit()
     
     def save_project(self):
         """Save the current project and test series details"""
+        # If in replay mode, don't overwrite metadata in the run/project folders.
+        # This keeps the history of that specific experiment secure.
+        if getattr(self.main_window, 'is_replay_mode', False):
+            # We don't save project/series metadata here, but we could still 
+            # save the "last used" state to the global config if we wanted.
+            # For now, let's just return to satisfy the "impossible to change" requirement.
+            return
+
         # Set flag to prevent recursion
         if self.is_saving:
             return
@@ -1062,8 +1557,10 @@ class ProjectController(QObject):
         
         # Update status
         self.update_status_text("Project settings applied successfully", "green")
-        self.main_window.sidebar_ready_status.setText("Ready")
-        self.main_window.sidebar_ready_status.setStyleSheet("color: green;")
+        # Only update status if not currently running
+        if not (hasattr(self.main_window, 'running') and self.main_window.running):
+            self.main_window.sidebar_ready_status.setText("Ready")
+            self.main_window.sidebar_ready_status.setStyleSheet("color: green;")
         
         # Set current project and test series
         self.current_project = project_name
@@ -1202,6 +1699,11 @@ class ProjectController(QObject):
         Save the current project, test series, and run details to a JSON file
         in the project directory for future retrieval.
         """
+        # If in replay mode, don't overwrite the project_state.json in the project folder
+        # to keep the existing project hierarchy secure.
+        if getattr(self.main_window, 'is_replay_mode', False):
+            return
+
         if not self.current_project:
             self.main_window.logger.log("Cannot save project state - no active project", "WARN")
             return
@@ -1343,6 +1845,12 @@ class ProjectController(QObject):
                     self.main_window.run_description.setPlainText(self.run_description)
                 if hasattr(self.main_window, 'run_testers'):
                     self.main_window.run_testers.setText(run_testers)
+            
+            if hasattr(self.main_window, "update_run_context_text"):
+                self.main_window.update_run_context_text(
+                    "Loaded run" if self.current_run else None,
+                    self.current_run
+                )
                     
             # Emit status changed signal
             self.status_changed.emit()
@@ -1465,6 +1973,8 @@ class ProjectController(QObject):
         
         # Save run metadata
         self.run_description = run_description  # Save in controller instance
+        self.current_project = project_name
+        self.current_test_series = series_name
         self.current_run = run_name
         
         # Save run metadata to JSON
@@ -1513,14 +2023,92 @@ class ProjectController(QObject):
             except Exception as e:
                 self.main_window.logger.log(f"Error saving control run data: {str(e)}", "WARN")
         
+        # Save camera overlays to the run directory
+        if hasattr(self.main_window, 'camera_controller'):
+            try:
+                self.main_window.camera_controller.save_overlays_to_run()
+            except Exception as e:
+                self.main_window.logger.log(f"Error saving overlays to run: {str(e)}", "WARN")
+        
+        # Update optical sensor settings with run directory
+        if hasattr(self.main_window, 'sensor_controller'):
+            try:
+                sensor_controller = self.main_window.sensor_controller
+                if hasattr(sensor_controller, 'optical_sensor_interfaces'):
+                    # Update all connected optical sensors with the new run directory
+                    for sensor_name, interface in sensor_controller.optical_sensor_interfaces.items():
+                        if interface and interface.is_connected():
+                            # Get current settings and update with run directory
+                            settings = {"run_directory": run_dir}
+                            interface.update_settings(settings)
+                    self.main_window.logger.log(f"Updated optical sensor settings with run directory: {run_dir}", "INFO")
+            except Exception as e:
+                self.main_window.logger.log(f"Error updating optical sensor settings: {str(e)}", "WARN")
+        
         # Save current project and test series in config for next startup
         if hasattr(self.main_window, 'config'):
             self.main_window.config["last_project"] = project_name
             self.main_window.config["last_test_series"] = series_name
+            self.main_window.config["last_run"] = run_name
             self.main_window.save_config()
-            self.main_window.logger.log(f"Updated config with last project: {project_name}, last test series: {series_name}")
+            self.main_window.logger.log(f"Updated config with last project: {project_name}, last test series: {series_name}, last run: {run_name}")
+        
+        # Refresh the project browser and highlight the new run
+        self.update_project_tree()
+        self.select_tree_item(project_name, series_name, run_name)
                 
         return run_dir
+    
+    def update_run_metadata(self, run_dir, updates: dict):
+        """
+        Merge the provided fields into a run's metadata JSON.
+
+        Args:
+            run_dir: Path to the run directory.
+            updates: Dict of fields to merge into run_metadata.json.
+        """
+        if not run_dir or not os.path.exists(run_dir):
+            self.main_window.logger.log("Cannot update run metadata - invalid run directory", "WARN")
+            return
+
+        run_metadata_file = os.path.join(run_dir, "run_metadata.json")
+        try:
+            current = {}
+            if os.path.exists(run_metadata_file):
+                with open(run_metadata_file, 'r') as f:
+                    current = json.load(f)
+
+            current.update(updates or {})
+            with open(run_metadata_file, 'w') as f:
+                json.dump(current, f, indent=4)
+
+            self.main_window.logger.log(f"Updated run metadata: {run_metadata_file}", "INFO")
+        except Exception as e:
+            self.main_window.logger.log(f"Error updating run metadata: {str(e)}", "WARN")
+
+    def get_run_metadata(self, run_dir=None):
+        """
+        Read run_metadata.json for the given run directory (or current run).
+
+        Args:
+            run_dir: Optional override for run directory.
+
+        Returns:
+            dict with metadata or {} if missing/error.
+        """
+        try:
+            if not run_dir:
+                run_dir = self.get_current_run_directory()
+            if not run_dir:
+                return {}
+            meta_path = os.path.join(run_dir, "run_metadata.json")
+            if not os.path.exists(meta_path):
+                return {}
+            with open(meta_path, "r") as f:
+                return json.load(f) or {}
+        except Exception as e:
+            self.main_window.logger.log(f"Error reading run metadata: {str(e)}", "WARN")
+            return {}
     
     def save_sensors_to_run(self, run_dir):
         """
@@ -1984,6 +2572,128 @@ class ProjectController(QObject):
                 f"An error occurred during export:\n{str(e)}"
             )
             self.main_window.logger.log(f"Export error: {str(e)}", "ERROR")
+
+    def import_project(self):
+        """
+        Import project data from a zip archive.
+        The user selects a zip file, and its contents are extracted into the base directory.
+        """
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox, QProgressDialog
+        from PyQt6.QtCore import Qt
+        import zipfile
+        import datetime
+
+        # Get base directory
+        base_dir = self.main_window.project_base_dir.text()
+        if not base_dir or not os.path.exists(base_dir):
+            QMessageBox.warning(
+                self.main_window,
+                "Import Error",
+                "Please set a valid base directory first in the Projects tab."
+            )
+            return
+
+        # Ask user for the zip file
+        zip_path, _ = QFileDialog.getOpenFileName(
+            self.main_window,
+            "Select Project Archive",
+            os.path.expanduser("~"),
+            "Zip Archives (*.zip)"
+        )
+
+        if not zip_path:
+            return
+
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                # Get the list of files in the zip
+                file_list = zip_ref.namelist()
+                
+                # Identify project folders (they should be top-level directories or containing project_metadata.json)
+                project_folders = set()
+                for file_path in file_list:
+                    parts = file_path.strip('/').split('/')
+                    if len(parts) >= 1:
+                        # If we see project_metadata.json, the parent is definitely a project folder
+                        if "project_metadata.json" in parts:
+                            idx = parts.index("project_metadata.json")
+                            if idx > 0:
+                                project_folders.add(parts[idx-1])
+                            else:
+                                # project_metadata.json is at root of zip? 
+                                # This shouldn't happen with our export logic but we handle it
+                                pass
+                        else:
+                            # Otherwise assume the first part is the project name
+                            project_folders.add(parts[0])
+
+                if not project_folders:
+                    QMessageBox.warning(
+                        self.main_window,
+                        "Import Error",
+                        "The selected archive does not appear to contain any valid project folders."
+                    )
+                    return
+
+                # Notify user about the destination
+                project_list_str = "\n".join([f"• {p}" for p in sorted(project_folders)])
+                confirm_msg = (
+                    f"The following projects were found in the archive:\n\n{project_list_str}\n\n"
+                    f"These will be extracted to your base directory:\n{base_dir}\n\n"
+                    "Existing files with the same names will be overwritten. Do you want to continue?"
+                )
+                
+                reply = QMessageBox.question(
+                    self.main_window,
+                    "Confirm Import",
+                    confirm_msg,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No
+                )
+                
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+
+                # Show progress dialog
+                progress = QProgressDialog("Importing files...", "Cancel", 0, len(file_list), self.main_window)
+                progress.setWindowTitle("Project Import")
+                progress.setWindowModality(Qt.WindowModality.WindowModal)
+                progress.setMinimumDuration(0)
+                progress.show()
+
+                # Extract files
+                extracted_count = 0
+                for file_info in file_list:
+                    if progress.wasCanceled():
+                        break
+                    
+                    zip_ref.extract(file_info, base_dir)
+                    extracted_count += 1
+                    progress.setValue(extracted_count)
+                
+                progress.close()
+
+                if not progress.wasCanceled():
+                    self.main_window.logger.log(f"Successfully imported project data from {zip_path}", "INFO")
+                    QMessageBox.information(
+                        self.main_window,
+                        "Import Successful",
+                        f"Successfully imported {len(project_folders)} project(s) to:\n{base_dir}"
+                    )
+                    
+                    # Refresh the project tree and selector
+                    self.update_project_list()
+                    self.update_project_tree()
+                    
+        except Exception as e:
+            QMessageBox.critical(
+                self.main_window,
+                "Import Error",
+                f"An error occurred during import:\n{str(e)}"
+            )
+            self.main_window.logger.log(f"Import error: {str(e)}", "ERROR")
+            import traceback
+            traceback.print_exc()
     
     def on_project_tree_clicked(self, index):
         """
@@ -2039,7 +2749,7 @@ class ProjectController(QObject):
             
         self.main_window.logger.log(f"Stored selection: {self.last_selected_type} - Project: {self.last_selected_project}, Series: {self.last_selected_series}, Run: {self.last_selected_run}", "DEBUG") 
 
-    def load_newest_run(self):
+    def load_newest_run(self, is_startup_load=False):
         """Find and load the newest run in the current test series"""
         if not self.current_project or not self.current_test_series:
             return
@@ -2051,7 +2761,6 @@ class ProjectController(QObject):
         # Build the test series path
         series_dir = os.path.join(base_dir, self.current_project, self.current_test_series)
         if not os.path.exists(series_dir):
-            self.main_window.logger.log(f"Test series directory not found: {series_dir}", "WARN")
             return
             
         # Find all run directories in the test series
@@ -2072,38 +2781,18 @@ class ProjectController(QObject):
             
         # Sort runs by creation time, newest first
         sorted_runs = sorted(run_dirs, key=lambda x: x[2], reverse=True)
-        newest_run = sorted_runs[0]
-        run_name = newest_run[0]
-        run_path = newest_run[1]
+        newest_run_name = sorted_runs[0][0]
         
-        self.main_window.logger.log(f"Found newest run: {run_name}", "INFO")
+        self.main_window.logger.log(f"Found newest run for startup load: {newest_run_name}", "INFO")
         
-        # Set the current run
-        self.current_run = run_name
-        
-        # Load run metadata just for reference (load metadata but don't set the UI description)
-        run_metadata_file = os.path.join(run_path, "run_metadata.json")
-        if os.path.exists(run_metadata_file):
-            try:
-                with open(run_metadata_file, 'r') as f:
-                    metadata = json.load(f)
-                    # Store the description internally but don't set it in the UI
-                    self.run_description = ""
-                    # Clear the run description in the UI - user must enter a new one
-                    self.main_window.run_description.clear()
-            except Exception as e:
-                self.main_window.logger.log(f"Error reading run metadata: {str(e)}", "WARN")
-        else:
-            # Clear the run description
-            self.run_description = ""
-            self.main_window.run_description.clear()
-        
-        # Load sensors from the run directory
-        if hasattr(self.main_window, 'sensor_controller'):
-            self.load_sensors_from_run(run_path)
-            
-        # Save the project state to JSON to ensure it's available next time
-        self.save_state_to_json()
+        # Now use the unified load_run method to perform the actual loading
+        # This ensures consistency between manual and automatic loading
+        self.load_run(
+            project_name=self.current_project,
+            series_name=self.current_test_series,
+            run_name=newest_run_name,
+            is_startup_load=is_startup_load
+        )
             
         # Notify the user that they need to enter a new run description
         self.main_window.logger.log("Please enter a new run description before starting data acquisition", "INFO")

@@ -12,7 +12,7 @@ import threading
 import queue
 import serial
 import serial.tools.list_ports
-from PyQt6.QtCore import QThread, pyqtSignal, QMutex
+from PyQt6.QtCore import QThread, pyqtSignal, QMutex, QMutexLocker
 from app.core.interfaces.arduino_interface import ArduinoInterface
 
 
@@ -23,6 +23,10 @@ class ArduinoMasterSlaveThread(QThread):
     data_received_signal = pyqtSignal(dict)  # Signal emitted when new data is received
     connection_status_signal = pyqtSignal(bool, str)  # For connection status updates
     error_signal = pyqtSignal(str)  # For error notifications
+    connection_lost_signal = pyqtSignal(str)  # Signal when connection is unexpectedly lost
+    
+    # Thread termination timeout in milliseconds
+    THREAD_STOP_TIMEOUT_MS = 3000
     
     def __init__(self, parent=None):
         """Initialize the Arduino master-slave interface thread"""
@@ -31,21 +35,53 @@ class ArduinoMasterSlaveThread(QThread):
         # Create Arduino interface
         self.arduino = ArduinoInterface()
         
-        # Thread control
-        self.running = False
-        self.paused = False
+        # Thread control - use threading.Event for thread-safe flag
+        self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # Not paused by default (set = running)
+        
         self.monitoring_only = False  # Flag to indicate monitoring mode (no CSV writing)
         self.mutex = QMutex()
         
         # Data collection settings
         self.poll_interval = 1.0  # Default polling interval in seconds
+        self.auto_reconnect = True  # Enable auto-reconnect by default
+        self._last_reconnect_attempt = 0
+        self._reconnect_interval = 5.0  # seconds
         
         # Data buffer
         self.data_queue = queue.Queue(maxsize=100)  # Queue for thread-safe data access
+        self._dropped_data_count = 0  # Counter for dropped data packets
         
         # Thread-safe data access
         self.latest_data = {}  # Latest data received
         self.data_mutex = QMutex()  # Mutex for thread-safe access to latest_data
+        
+    @property
+    def running(self):
+        """Check if thread should be running (for backwards compatibility)"""
+        return not self._stop_event.is_set()
+    
+    @running.setter
+    def running(self, value):
+        """Set running state (for backwards compatibility)"""
+        if value:
+            self._stop_event.clear()
+        else:
+            self._stop_event.set()
+        
+    @property
+    def paused(self):
+        """Check if thread is paused"""
+        return not self._pause_event.is_set()
+    
+    @paused.setter
+    def paused(self, value):
+        """Set paused state"""
+        if value:
+            self._pause_event.clear()
+        else:
+            self._pause_event.set()
         
     def set_poll_interval(self, interval):
         """Set the polling interval in seconds"""
@@ -58,13 +94,28 @@ class ArduinoMasterSlaveThread(QThread):
         # Create directory if it doesn't exist
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
+    
+    def _on_connection_lost(self, error_message):
+        """Callback when Arduino connection is lost"""
+        print(f"ArduinoMasterSlaveThread: Connection lost - {error_message}")
+        self.connection_lost_signal.emit(error_message)
+        self.connection_status_signal.emit(False, f"Connection lost: {error_message}")
             
     def connect(self, port, baud_rate=9600):
         """Connect to the Arduino master"""
         try:
             print(f"ArduinoMasterSlaveThread: Attempting to connect to Arduino on {port} with baud rate {baud_rate}")
-            self.arduino = ArduinoInterface(port=port, baud_rate=baud_rate, 
-                                          mode="polled", poll_interval=self.poll_interval)
+            
+            # Create new Arduino interface with settings
+            self.arduino = ArduinoInterface(
+                port=port, 
+                baud_rate=baud_rate, 
+                mode="polled", 
+                poll_interval=self.poll_interval
+            )
+            
+            # Set connection lost callback
+            self.arduino.on_connection_lost = self._on_connection_lost
             
             success = self.arduino.connect()
             if success:
@@ -73,9 +124,9 @@ class ArduinoMasterSlaveThread(QThread):
                 
                 # Start a basic monitoring thread to receive sensor data
                 # (without CSV writing or full data collection)
-                if not self.running:
-                    self.running = True
-                    self.paused = False
+                if not self.isRunning():
+                    self._stop_event.clear()
+                    self._pause_event.set()  # Not paused
                     self.monitoring_only = True  # Flag to indicate monitoring mode only
                     self.start()
                 
@@ -85,6 +136,7 @@ class ArduinoMasterSlaveThread(QThread):
                 print(f"ArduinoMasterSlaveThread: Failed to connect to Arduino: {error_msg}")
                 self.connection_status_signal.emit(False, error_msg)
                 return False
+                
         except Exception as e:
             error_msg = f"Failed to connect to Arduino: {str(e)}"
             print(f"ArduinoMasterSlaveThread: Exception during connect: {error_msg}")
@@ -95,19 +147,32 @@ class ArduinoMasterSlaveThread(QThread):
         """Disconnect from the Arduino master"""
         if self.arduino:
             print("ArduinoMasterSlaveThread: Disconnecting from Arduino")
-            # Stop the thread if running
-            if self.running:
-                self.running = False
-                self.wait()  # Wait for thread to finish
-                
+            
+            # Signal thread to stop
+            self._stop_event.set()
+            self._pause_event.set()  # Ensure not blocked on pause
+            
+            # Wait for thread to finish with timeout to avoid deadlock
+            if self.isRunning():
+                print("ArduinoMasterSlaveThread: Waiting for thread to stop...")
+                if not self.wait(self.THREAD_STOP_TIMEOUT_MS):
+                    print("ArduinoMasterSlaveThread: Thread did not stop in time, forcing termination")
+                    self.terminate()
+                    self.wait(1000)  # Brief wait after termination
+            
+            # Now disconnect the Arduino
             self.arduino.disconnect()
             print("ArduinoMasterSlaveThread: Emitting disconnection status")
             self.connection_status_signal.emit(False, "Disconnected from Arduino")
             
-            # Clear latest data
-            self.data_mutex.lock()
-            self.latest_data = {}
-            self.data_mutex.unlock()
+            # Clear latest data (thread-safe)
+            with QMutexLocker(self.data_mutex):
+                self.latest_data = {}
+                
+            # Log dropped data if any
+            if self._dropped_data_count > 0:
+                print(f"ArduinoMasterSlaveThread: Total data packets dropped due to queue overflow: {self._dropped_data_count}")
+                self._dropped_data_count = 0
         else:
             print("ArduinoMasterSlaveThread: disconnect called but no Arduino interface exists")
             
@@ -120,41 +185,34 @@ class ArduinoMasterSlaveThread(QThread):
         if not self.is_connected():
             self.error_signal.emit("Cannot start data collection - not connected to Arduino")
             return False
-            
-        self.mutex.lock()
-        # Switch from monitoring mode to full data collection
-        self.monitoring_only = False
         
-        # Check if thread is already running from monitoring mode
-        already_running = self.running
-        self.mutex.unlock()
+        with QMutexLocker(self.mutex):
+            # Switch from monitoring mode to full data collection
+            self.monitoring_only = False
         
         # Start the thread if not already running
-        if not already_running:
-            self.running = True
-            self.paused = False
+        if not self.isRunning():
+            self._stop_event.clear()
+            self._pause_event.set()  # Not paused
             self.start()
         
         return True
         
     def stop_data_collection(self):
         """Stop data collection thread"""
-        self.running = False
+        self._stop_event.set()
         
-        # Wait for thread to finish
-        self.wait()
+        # Wait for thread to finish with timeout
+        if not self.wait(self.THREAD_STOP_TIMEOUT_MS):
+            print("ArduinoMasterSlaveThread: Thread did not stop in time during stop_data_collection")
         
     def pause_data_collection(self):
         """Pause data collection"""
-        self.mutex.lock()
-        self.paused = True
-        self.mutex.unlock()
+        self._pause_event.clear()
         
     def resume_data_collection(self):
         """Resume data collection"""
-        self.mutex.lock()
-        self.paused = False
-        self.mutex.unlock()
+        self._pause_event.set()
         
     def get_available_sensor_names(self):
         """
@@ -163,12 +221,8 @@ class ArduinoMasterSlaveThread(QThread):
         Returns:
             List of sensor names
         """
-        self.data_mutex.lock()
-        try:
-            # Return the keys of the latest data dictionary
+        with QMutexLocker(self.data_mutex):
             return list(self.latest_data.keys()) if self.latest_data else []
-        finally:
-            self.data_mutex.unlock()
             
     def get_latest_data(self):
         """
@@ -177,37 +231,56 @@ class ArduinoMasterSlaveThread(QThread):
         Returns:
             Dictionary with sensor values or empty dict if no data
         """
-        self.data_mutex.lock()
-        try:
+        with QMutexLocker(self.data_mutex):
             return self.latest_data.copy()
-        finally:
-            self.data_mutex.unlock()
         
     def run(self):
         """Thread main method - runs when thread.start() is called"""
         print("Arduino master-slave thread started")
-        self.running = True
         
-        while self.running:
+        while not self._stop_event.is_set():
+            loop_start = time.time()
+            
             try:
-                # Check if thread is paused
-                self.mutex.lock()
-                is_paused = self.paused
-                is_monitoring_only = self.monitoring_only
-                self.mutex.unlock()
-                
-                if is_paused:
-                    time.sleep(0.1)
+                # Check if thread is paused - wait with timeout so we can check stop event
+                if not self._pause_event.wait(timeout=0.1):
                     continue
+                
+                # Check stop event after pause wait
+                if self._stop_event.is_set():
+                    break
+                
+                # Check if still connected
+                if not self.is_connected():
+                    if self.auto_reconnect:
+                        current_time = time.time()
+                        if current_time - self._last_reconnect_attempt >= self._reconnect_interval:
+                            self._last_reconnect_attempt = current_time
+                            print(f"Arduino master-slave thread: Connection lost, attempting reconnect to {self.arduino.port}...")
+                            if self.arduino.connect():
+                                print("Arduino master-slave thread: Reconnected successfully")
+                                self.connection_status_signal.emit(True, f"Reconnected to Arduino on {self.arduino.port}")
+                            else:
+                                print("Arduino master-slave thread: Reconnect failed")
+                        
+                        # Wait a bit before next check/attempt
+                        self._stop_event.wait(timeout=1.0)
+                        continue
+                    else:
+                        print("Arduino master-slave thread: Connection lost, stopping")
+                        break
+                
+                # Get monitoring mode flag (thread-safe)
+                with QMutexLocker(self.mutex):
+                    is_monitoring_only = self.monitoring_only
                 
                 # Read data from Arduino
                 data = self.arduino.read_data()
                 
                 if data:
                     # Update latest data (thread-safe)
-                    self.data_mutex.lock()
-                    self.latest_data = data
-                    self.data_mutex.unlock()
+                    with QMutexLocker(self.data_mutex):
+                        self.latest_data = data.copy()
                     
                     # Add timestamp to data
                     data['timestamp'] = time.time()
@@ -215,13 +288,16 @@ class ArduinoMasterSlaveThread(QThread):
                     # Emit signal with the data
                     self.data_received_signal.emit(data)
                     
-                    # Only handle CSV and data buffer in full data collection mode
+                    # Only handle data buffer in full data collection mode
                     if not is_monitoring_only:
                         # Put data in queue for other parts of the application to access
                         try:
                             self.data_queue.put_nowait(data)
                         except queue.Full:
-                            # Queue is full, remove oldest item
+                            # Queue is full, remove oldest item and log
+                            self._dropped_data_count += 1
+                            if self._dropped_data_count == 1 or self._dropped_data_count % 100 == 0:
+                                print(f"ArduinoMasterSlaveThread: Queue full, dropping data (total dropped: {self._dropped_data_count})")
                             try:
                                 self.data_queue.get_nowait()
                                 self.data_queue.put_nowait(data)
@@ -229,13 +305,24 @@ class ArduinoMasterSlaveThread(QThread):
                                 pass
                 
                 # Sleep for polling interval (adjusted to account for processing time)
-                time.sleep(max(0.01, self.poll_interval - 0.01))
-                
+                elapsed = time.time() - loop_start
+                remaining = self.poll_interval - elapsed
+                if remaining > 0:
+                    # Use Event.wait() instead of time.sleep() so we can be interrupted
+                    self._stop_event.wait(timeout=remaining)
+                    
             except Exception as e:
                 error_msg = f"Error in Arduino thread: {str(e)}"
                 print(error_msg)
                 self.error_signal.emit(error_msg)
-                time.sleep(1.0)  # Sleep longer on error to avoid high CPU
+                
+                # Check if this is a connection error
+                if not self.is_connected():
+                    print("Arduino master-slave thread: Connection lost after error, stopping")
+                    break
+                    
+                # Sleep longer on error to avoid high CPU, but use Event.wait()
+                self._stop_event.wait(timeout=1.0)
         
         print("Arduino master-slave thread stopped")
         
@@ -248,12 +335,6 @@ class ArduinoMasterSlaveThread(QThread):
             List of available ports
         """
         return ArduinoInterface.list_ports()
-
-    def stop_processing_thread(self):
-        """Stop the frame processing thread"""
-        self.processing_running = False
-        if self.processing_thread:
-            self.processing_thread.join()
     
     def send_command(self, command, device=None, value=None):
         """
@@ -304,4 +385,4 @@ class ArduinoMasterSlaveThread(QThread):
         if level == "ERROR":
             self.error_signal.emit(message)
         else:
-            print(f"[ArduinoThread] {message}") 
+            print(f"[ArduinoThread] {message}")

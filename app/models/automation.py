@@ -8,7 +8,7 @@ import datetime
 import json
 import os
 import traceback
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal, QThreadPool, QRunnable
 from enum import Enum
 
 # --- Triggers ---
@@ -17,6 +17,9 @@ class TriggerType(Enum):
     TIME_SPECIFIC = 2
     SENSOR_VALUE = 3
     EVENT = 4
+    OPTICAL_EVENT = 5  # For optical sensor events (light detection, fill level, etc.)
+    AUDIO_EVENT = 6  # For audio sensor events (frequency, level, etc.)
+    COMPOUND = 7  # Combined triggers (AND/OR)
 
 class BaseTrigger(QObject):
     triggered = pyqtSignal(object) # Signal when trigger condition is met
@@ -30,6 +33,14 @@ class BaseTrigger(QObject):
     def check(self, context): # context might contain sensor values, events, etc.
         """Check if the trigger condition is met."""
         raise NotImplementedError
+    
+    def reset(self):
+        """Reset trigger state (called when sequence starts or loops)"""
+        pass
+    
+    def cleanup(self):
+        """Clean up any resources or disconnect signals."""
+        pass
     
     def to_dict(self):
         """Serialize trigger to a dictionary"""
@@ -53,6 +64,12 @@ class BaseTrigger(QObject):
             return SensorValueTrigger.from_dict(data)
         elif trigger_type_name == TriggerType.EVENT.name:
             return EventTrigger.from_dict(data)
+        elif trigger_type_name == TriggerType.OPTICAL_EVENT.name:
+            return OpticalEventTrigger.from_dict(data)
+        elif trigger_type_name == TriggerType.AUDIO_EVENT.name:
+            return AudioEventTrigger.from_dict(data)
+        elif trigger_type_name == TriggerType.COMPOUND.name:
+            return CompoundTrigger.from_dict(data)
         else:
             raise ValueError(f"Unknown trigger type: {trigger_type_name}")
             
@@ -70,6 +87,9 @@ class TimeDurationTrigger(BaseTrigger):
         """Record the start time when the step begins."""
         self.start_time = time.monotonic()
         print(f"TimeDurationTrigger started: {self.description}, duration={self.duration}s, start_time={self.start_time}")
+        
+    def reset(self):
+        self.start_time = None
         
     def check(self, context=None): # Context not strictly needed here
         if self.start_time is None:
@@ -108,6 +128,9 @@ class TimeSpecificTrigger(BaseTrigger):
         self.triggered_today = False
         self.description = f"At time {self.hour:02d}:{self.minute:02d}"
         
+    def reset(self):
+        self.triggered_today = False
+
     def check(self, context=None): # Context not needed
         now = datetime.datetime.now().time()
         target_time = datetime.time(self.hour, self.minute)
@@ -136,12 +159,24 @@ class TimeSpecificTrigger(BaseTrigger):
         return TimeSpecificTrigger(data['name'], data['hour'], data['minute'])
 
 class SensorValueTrigger(BaseTrigger):
-    def __init__(self, name, sensor_name, operator, threshold):
+    def __init__(self, name, sensor_name, operator, threshold, hysteresis=0.0):
         super().__init__(name, TriggerType.SENSOR_VALUE)
         self.sensor_name = str(sensor_name) # Ensure it's a string
         self.operator = str(operator)
         self.threshold = float(threshold)
+        self.hysteresis = float(hysteresis)
+        self._last_state = False # Track if it was previously triggered
+        self._last_trigger_time = 0 # Prevent rapid fire
+        self.trigger_cooldown = 1.0 # Minimum 1.0s between triggers
+        
         self.description = f"When {self.sensor_name} {self.operator} {self.threshold}"
+        if self.hysteresis > 0:
+            self.description += f" (hyst: {self.hysteresis})"
+        
+    def reset(self):
+        """Reset trigger state (called when sequence starts)"""
+        self._last_state = False
+        self._last_trigger_time = 0
         
     def check(self, context):
         if context is None or 'sensors' not in context:
@@ -156,33 +191,75 @@ class SensorValueTrigger(BaseTrigger):
         except (ValueError, TypeError):
             return False # Cannot compare if value is not a number
             
-        # Evaluate condition
+        # Evaluate condition with hysteresis
+        # If we were triggered, we stay triggered until we cross (threshold -/+ hysteresis)
+        triggered = False
         if self.operator == '>':
-            return current_value > self.threshold
+            if not self._last_state:
+                triggered = current_value > self.threshold
+            else:
+                triggered = current_value > (self.threshold - self.hysteresis)
         elif self.operator == '<':
-            return current_value < self.threshold
+            if not self._last_state:
+                triggered = current_value < self.threshold
+            else:
+                triggered = current_value < (self.threshold + self.hysteresis)
         elif self.operator == '==':
-            # Use approximate comparison for floats
-            return abs(current_value - self.threshold) < 1e-6
+            triggered = abs(current_value - self.threshold) < (1e-6 + self.hysteresis)
         elif self.operator == '>=':
-            return current_value >= self.threshold
+            if not self._last_state:
+                triggered = current_value >= self.threshold
+            else:
+                triggered = current_value >= (self.threshold - self.hysteresis)
         elif self.operator == '<=':
-            return current_value <= self.threshold
+            if not self._last_state:
+                triggered = current_value <= self.threshold
+            else:
+                triggered = current_value <= (self.threshold + self.hysteresis)
+        
+        # --- Update Hysteresis State ---
+        # We update _last_state as soon as the condition is met, 
+        # even if we don't fire the action due to cooldown.
+        prev_state = self._last_state
+        self._last_state = triggered
+
+        if triggered:
+            # Only log on the initial transition to triggered state
+            if not prev_state:
+                print(f"[AUTOMATION] Trigger '{self.name}' entered ACTIVE state for sensor '{self.sensor_name}' (value: {current_value:.2f}, threshold: {self.threshold})")
+
+            # Debounce/Cooldown logic for the ACTION (the True return value)
+            now = time.time()
+            if now - self._last_trigger_time < self.trigger_cooldown:
+                # Still in cooldown, condition is met but don't fire action yet
+                return False
+            
+            self._last_trigger_time = now
+            return True
         else:
-            return False # Unknown operator
+            if prev_state:
+                print(f"[AUTOMATION] Trigger '{self.name}' reset to INACTIVE state (sensor '{self.sensor_name}' value: {current_value:.2f}, threshold: {self.threshold})")
+            return False
             
     def to_dict(self):
         data = super().to_dict()
         data.update({
             'sensor_name': self.sensor_name,
             'operator': self.operator,
-            'threshold': self.threshold
+            'threshold': self.threshold,
+            'hysteresis': self.hysteresis
         })
         return data
 
     @staticmethod
     def from_dict(data):
-        return SensorValueTrigger(data['name'], data['sensor_name'], data['operator'], data['threshold'])
+        return SensorValueTrigger(
+            data['name'], 
+            data['sensor_name'], 
+            data['operator'], 
+            data['threshold'],
+            data.get('hysteresis', 0.0)
+        )
 
 class EventTrigger(BaseTrigger):
     def __init__(self, name, event_type):
@@ -191,6 +268,9 @@ class EventTrigger(BaseTrigger):
         self.description = f"On event: {self.event_type}"
         self.triggered_event = False # Flag to trigger only once per event occurrence
         
+    def reset(self):
+        self.triggered_event = False
+
     def check(self, context):
         if context is None or 'events' not in context:
             return False
@@ -198,11 +278,11 @@ class EventTrigger(BaseTrigger):
         # Check if the specific event occurred recently
         if self.event_type in context['events']:
             if not self.triggered_event:
-                 self.triggered_event = True # Set flag
-                 return True
+                self.triggered_event = True # Set flag
+                return True
         else:
-             # Reset the flag if the event is no longer in the current context
-             self.triggered_event = False
+            # Reset the flag if the event is no longer in the current context
+            self.triggered_event = False
              
         return False
         
@@ -217,6 +297,464 @@ class EventTrigger(BaseTrigger):
     def from_dict(data):
         return EventTrigger(data['name'], data['event_type'])
 
+
+class OpticalEventTrigger(BaseTrigger):
+    """Trigger for optical sensor events (light detection, fill level changes, etc.)"""
+    
+    # Available event types for optical sensors
+    EVENT_TYPES = {
+        'light_event': 'Light Event Detected',
+        'brightness_above': 'Brightness Above Threshold',
+        'brightness_below': 'Brightness Below Threshold',
+        'fill_level_above': 'Fill Level Above Threshold',
+        'fill_level_below': 'Fill Level Below Threshold',
+        'particle_count_above': 'Particle Count Above Threshold',
+        'color_detected': 'Target Color Detected',
+        'position_changed': 'Position Changed Significantly',
+    }
+    
+    def __init__(self, name, sensor_name, event_type, threshold=None, threshold_percent=None):
+        super().__init__(name, TriggerType.OPTICAL_EVENT)
+        self.sensor_name = str(sensor_name)
+        self.event_type = str(event_type)
+        self.threshold = float(threshold) if threshold is not None else None
+        self.threshold_percent = float(threshold_percent) if threshold_percent is not None else None
+        self._last_event_count = 0
+        self._last_position = None
+        self._triggered = False
+        
+        # Build description
+        if event_type == 'light_event':
+            self.description = f"When {sensor_name} detects light event"
+        elif 'above' in event_type:
+            self.description = f"When {sensor_name} {event_type.replace('_', ' ')} {threshold or threshold_percent}{'%' if threshold_percent else ''}"
+        elif 'below' in event_type:
+            self.description = f"When {sensor_name} {event_type.replace('_', ' ')} {threshold or threshold_percent}{'%' if threshold_percent else ''}"
+        else:
+            self.description = f"When {sensor_name}: {self.EVENT_TYPES.get(event_type, event_type)}"
+    
+    def check(self, context):
+        """Check if the optical event condition is met"""
+        if context is None:
+            return False
+        
+        # Get optical sensor data from context
+        optical_data = context.get('optical_sensors', {})
+        sensor_data = optical_data.get(self.sensor_name, {})
+        
+        if not sensor_data:
+            # Fallback: Check regular sensor values
+            sensors = context.get('sensors', {})
+            sensor_value = sensors.get(self.sensor_name)
+            if sensor_value is not None:
+                sensor_data = {'value': sensor_value}
+        
+        if not sensor_data:
+            return False
+        
+        # Check based on event type
+        if self.event_type == 'light_event':
+            # Check if a new light event was detected
+            event_count = sensor_data.get('event_count', 0)
+            if event_count > self._last_event_count:
+                self._last_event_count = event_count
+                return True
+            return False
+        
+        elif self.event_type == 'brightness_above':
+            brightness = sensor_data.get('brightness_mean', sensor_data.get('value', 0))
+            threshold = self.threshold if self.threshold is not None else 128
+            if brightness > threshold and not self._triggered:
+                self._triggered = True
+                return True
+            elif brightness <= threshold:
+                self._triggered = False
+            return False
+        
+        elif self.event_type == 'brightness_below':
+            brightness = sensor_data.get('brightness_mean', sensor_data.get('value', 255))
+            threshold = self.threshold if self.threshold is not None else 128
+            if brightness < threshold and not self._triggered:
+                self._triggered = True
+                return True
+            elif brightness >= threshold:
+                self._triggered = False
+            return False
+        
+        elif self.event_type == 'fill_level_above':
+            fill_level = sensor_data.get('fill_level', 0)
+            threshold = self.threshold_percent if self.threshold_percent is not None else 80
+            if fill_level > threshold and not self._triggered:
+                self._triggered = True
+                return True
+            elif fill_level <= threshold:
+                self._triggered = False
+            return False
+        
+        elif self.event_type == 'fill_level_below':
+            fill_level = sensor_data.get('fill_level', 100)
+            threshold = self.threshold_percent if self.threshold_percent is not None else 20
+            if fill_level < threshold and not self._triggered:
+                self._triggered = True
+                return True
+            elif fill_level >= threshold:
+                self._triggered = False
+            return False
+        
+        elif self.event_type == 'particle_count_above':
+            count = sensor_data.get('particle_count', 0)
+            threshold = self.threshold if self.threshold is not None else 10
+            if count > threshold and not self._triggered:
+                self._triggered = True
+                return True
+            elif count <= threshold:
+                self._triggered = False
+            return False
+        
+        elif self.event_type == 'color_detected':
+            color_percent = sensor_data.get('target_color_percent', 0)
+            threshold = self.threshold_percent if self.threshold_percent is not None else 10
+            if color_percent > threshold and not self._triggered:
+                self._triggered = True
+                return True
+            elif color_percent <= threshold:
+                self._triggered = False
+            return False
+        
+        elif self.event_type == 'position_changed':
+            x = sensor_data.get('position_x_percent', 50)
+            y = sensor_data.get('position_y_percent', 50)
+            threshold = self.threshold_percent if self.threshold_percent is not None else 10
+            
+            if self._last_position is None:
+                self._last_position = (x, y)
+                return False
+            
+            # Calculate distance moved
+            dx = abs(x - self._last_position[0])
+            dy = abs(y - self._last_position[1])
+            distance = (dx**2 + dy**2) ** 0.5
+            
+            if distance > threshold:
+                self._last_position = (x, y)
+                return True
+            return False
+        
+        return False
+    
+    def reset(self):
+        """Reset trigger state"""
+        self._last_event_count = 0
+        self._last_position = None
+        self._triggered = False
+    
+    def to_dict(self):
+        data = super().to_dict()
+        data.update({
+            'sensor_name': self.sensor_name,
+            'event_type': self.event_type,
+            'threshold': self.threshold,
+            'threshold_percent': self.threshold_percent
+        })
+        return data
+    
+    @staticmethod
+    def from_dict(data):
+        return OpticalEventTrigger(
+            data['name'],
+            data['sensor_name'],
+            data['event_type'],
+            data.get('threshold'),
+            data.get('threshold_percent')
+        )
+
+
+class AudioEventTrigger(BaseTrigger):
+    """Trigger for audio sensor events (frequency changes, level thresholds, etc.)"""
+    
+    # Available event types for audio sensors
+    EVENT_TYPES = {
+        'rms_above': 'RMS Level Above Threshold',
+        'rms_below': 'RMS Level Below Threshold',
+        'peak_above': 'Peak Amplitude Above Threshold',
+        'peak_below': 'Peak Amplitude Below Threshold',
+        'frequency_above': 'Frequency Above Threshold',
+        'frequency_below': 'Frequency Below Threshold',
+        'frequency_stable': 'Frequency Stable (within range)',
+        'frequency_unstable': 'Frequency Unstable (outside range)',
+        'db_above': 'dB Level Above Threshold',
+        'db_below': 'dB Level Below Threshold',
+        'band_energy_above': 'Band Energy Above Threshold',
+        'band_energy_below': 'Band Energy Below Threshold',
+    }
+    
+    def __init__(self, name, sensor_name, event_type, threshold=None, threshold_percent=None):
+        super().__init__(name, TriggerType.AUDIO_EVENT)
+        self.sensor_name = str(sensor_name)
+        self.event_type = str(event_type)
+        self.threshold = float(threshold) if threshold is not None else None
+        self.threshold_percent = float(threshold_percent) if threshold_percent is not None else None
+        self._triggered = False
+        self._last_frequency = None
+        self._frequency_stability_window = []
+        
+        # Build description
+        if 'above' in event_type:
+            self.description = f"When {sensor_name} {event_type.replace('_', ' ')} {threshold or threshold_percent}{'%' if threshold_percent else ''}"
+        elif 'below' in event_type:
+            self.description = f"When {sensor_name} {event_type.replace('_', ' ')} {threshold or threshold_percent}{'%' if threshold_percent else ''}"
+        elif 'stable' in event_type or 'unstable' in event_type:
+            threshold_str = f" (range: ±{threshold or threshold_percent}{'%' if threshold_percent else ' Hz'})"
+            self.description = f"When {sensor_name}: {self.EVENT_TYPES.get(event_type, event_type)}{threshold_str}"
+        else:
+            self.description = f"When {sensor_name}: {self.EVENT_TYPES.get(event_type, event_type)}"
+    
+    def check(self, context):
+        """Check if the audio event condition is met"""
+        if context is None:
+            return False
+        
+        # Get audio sensor data from context
+        audio_data = context.get('audio_sensors', {})
+        sensor_data = audio_data.get(self.sensor_name, {})
+        
+        if not sensor_data:
+            # Fallback: Check regular sensor values
+            sensors = context.get('sensors', {})
+            sensor_value = sensors.get(self.sensor_name)
+            if sensor_value is not None:
+                sensor_data = {'value': sensor_value}
+        
+        if not sensor_data:
+            return False
+        
+        # Check based on event type
+        if self.event_type == 'rms_above':
+            rms = sensor_data.get('rms', sensor_data.get('value', 0))
+            threshold = self.threshold if self.threshold is not None else 0.5
+            if rms > threshold and not self._triggered:
+                self._triggered = True
+                return True
+            elif rms <= threshold:
+                self._triggered = False
+            return False
+        
+        elif self.event_type == 'rms_below':
+            rms = sensor_data.get('rms', sensor_data.get('value', 0))
+            threshold = self.threshold if self.threshold is not None else 0.1
+            if rms < threshold and not self._triggered:
+                self._triggered = True
+                return True
+            elif rms >= threshold:
+                self._triggered = False
+            return False
+        
+        elif self.event_type == 'peak_above':
+            peak = sensor_data.get('peak', sensor_data.get('peak_hold', sensor_data.get('value', 0)))
+            threshold = self.threshold if self.threshold is not None else 0.8
+            if peak > threshold and not self._triggered:
+                self._triggered = True
+                return True
+            elif peak <= threshold:
+                self._triggered = False
+            return False
+        
+        elif self.event_type == 'peak_below':
+            peak = sensor_data.get('peak', sensor_data.get('peak_hold', sensor_data.get('value', 0)))
+            threshold = self.threshold if self.threshold is not None else 0.2
+            if peak < threshold and not self._triggered:
+                self._triggered = True
+                return True
+            elif peak >= threshold:
+                self._triggered = False
+            return False
+        
+        elif self.event_type == 'frequency_above':
+            freq = sensor_data.get('dominant_frequency', sensor_data.get('value', 0))
+            threshold = self.threshold if self.threshold is not None else 1000
+            if freq > threshold and not self._triggered:
+                self._triggered = True
+                return True
+            elif freq <= threshold:
+                self._triggered = False
+            return False
+        
+        elif self.event_type == 'frequency_below':
+            freq = sensor_data.get('dominant_frequency', sensor_data.get('value', 0))
+            threshold = self.threshold if self.threshold is not None else 100
+            if freq < threshold and not self._triggered:
+                self._triggered = True
+                return True
+            elif freq >= threshold:
+                self._triggered = False
+            return False
+        
+        elif self.event_type == 'frequency_stable':
+            freq = sensor_data.get('dominant_frequency', sensor_data.get('value', 0))
+            if freq == 0:
+                return False
+            
+            # Track frequency in a window
+            self._frequency_stability_window.append(freq)
+            if len(self._frequency_stability_window) > 10:
+                self._frequency_stability_window.pop(0)
+            
+            if len(self._frequency_stability_window) < 5:
+                return False
+            
+            # Calculate stability (std dev)
+            import numpy as np
+            freq_std = np.std(self._frequency_stability_window)
+            threshold = self.threshold if self.threshold is not None else 5.0  # Hz
+            
+            if freq_std <= threshold and not self._triggered:
+                self._triggered = True
+                return True
+            elif freq_std > threshold:
+                self._triggered = False
+            return False
+        
+        elif self.event_type == 'frequency_unstable':
+            freq = sensor_data.get('dominant_frequency', sensor_data.get('value', 0))
+            if freq == 0:
+                return False
+            
+            # Track frequency in a window
+            self._frequency_stability_window.append(freq)
+            if len(self._frequency_stability_window) > 10:
+                self._frequency_stability_window.pop(0)
+            
+            if len(self._frequency_stability_window) < 5:
+                return False
+            
+            # Calculate stability (std dev)
+            import numpy as np
+            freq_std = np.std(self._frequency_stability_window)
+            threshold = self.threshold if self.threshold is not None else 10.0  # Hz
+            
+            if freq_std > threshold and not self._triggered:
+                self._triggered = True
+                return True
+            elif freq_std <= threshold:
+                self._triggered = False
+            return False
+        
+        elif self.event_type == 'db_above':
+            db_level = sensor_data.get('db_level', sensor_data.get('value', -60))
+            threshold = self.threshold if self.threshold is not None else -20
+            if db_level > threshold and not self._triggered:
+                self._triggered = True
+                return True
+            elif db_level <= threshold:
+                self._triggered = False
+            return False
+        
+        elif self.event_type == 'db_below':
+            db_level = sensor_data.get('db_level', sensor_data.get('value', -60))
+            threshold = self.threshold if self.threshold is not None else -40
+            if db_level < threshold and not self._triggered:
+                self._triggered = True
+                return True
+            elif db_level >= threshold:
+                self._triggered = False
+            return False
+        
+        elif self.event_type == 'band_energy_above':
+            band_energy = sensor_data.get('band_energy', sensor_data.get('value', 0))
+            threshold = self.threshold if self.threshold is not None else 0.5
+            if band_energy > threshold and not self._triggered:
+                self._triggered = True
+                return True
+            elif band_energy <= threshold:
+                self._triggered = False
+            return False
+        
+        elif self.event_type == 'band_energy_below':
+            band_energy = sensor_data.get('band_energy', sensor_data.get('value', 0))
+            threshold = self.threshold if self.threshold is not None else 0.1
+            if band_energy < threshold and not self._triggered:
+                self._triggered = True
+                return True
+            elif band_energy >= threshold:
+                self._triggered = False
+            return False
+        
+        return False
+    
+    def reset(self):
+        """Reset trigger state"""
+        self._triggered = False
+        self._last_frequency = None
+        self._frequency_stability_window = []
+    
+    def to_dict(self):
+        data = super().to_dict()
+        data.update({
+            'sensor_name': self.sensor_name,
+            'event_type': self.event_type,
+            'threshold': self.threshold,
+            'threshold_percent': self.threshold_percent
+        })
+        return data
+    
+    @staticmethod
+    def from_dict(data):
+        # Validate required fields
+        if 'name' not in data:
+            raise ValueError("Missing 'name' in AudioEventTrigger data")
+        if 'sensor_name' not in data:
+            raise ValueError("Missing 'sensor_name' in AudioEventTrigger data")
+        if 'event_type' not in data:
+            raise ValueError("Missing 'event_type' in AudioEventTrigger data")
+        
+        return AudioEventTrigger(
+            data['name'],
+            data['sensor_name'],
+            data['event_type'],
+            data.get('threshold'),
+            data.get('threshold_percent')
+        )
+
+class CompoundTrigger(BaseTrigger):
+    def __init__(self, name, triggers=None, logic='AND'):
+        super().__init__(name, TriggerType.COMPOUND)
+        self.triggers = triggers if triggers else []
+        self.logic = logic # 'AND' or 'OR'
+        self.description = f"{self.logic} of {len(self.triggers)} triggers"
+        
+    def check(self, context):
+        if not self.triggers:
+            return False
+            
+        results = [t.check(context) for t in self.triggers]
+        
+        if self.logic == 'AND':
+            return all(results)
+        else:
+            return any(results)
+            
+    def reset(self):
+        for t in self.triggers:
+            t.reset()
+
+    def cleanup(self):
+        for t in self.triggers:
+            t.cleanup()
+            
+    def to_dict(self):
+        data = super().to_dict()
+        data.update({
+            'logic': self.logic,
+            'triggers': [t.to_dict() for t in self.triggers]
+        })
+        return data
+
+    @staticmethod
+    def from_dict(data):
+        triggers = [BaseTrigger.from_dict(t_data) for t_data in data.get('triggers', [])]
+        return CompoundTrigger(data['name'], triggers, data.get('logic', 'AND'))
+
+
 # --- Actions ---
 class ActionType(Enum):
     ARDUINO_COMMAND = 1
@@ -224,6 +762,10 @@ class ActionType(Enum):
     SERIAL_COMMAND = 3
     SYSTEM_ACTION = 4
     SET_VARIABLE = 5 # Added for variable support
+    JUMP_TO_STEP = 6 # Added for branching
+    CONDITION = 7 # Added for conditional branching
+    MQTT_PUBLISH = 8 # Added for MQTT support
+    INFO_MARKER = 9 # Added for info markers on graph
 
 class BaseAction(QObject):
     action_completed = pyqtSignal(object) # Signal when action is done
@@ -234,11 +776,17 @@ class BaseAction(QObject):
         self.name = name
         self.action_type = action_type
         self.description = "Base Action"
+        self.is_async = False # Whether to run in a separate thread
+        self.last_image_path = None # Store path of any image created by this action
 
     def execute(self, context): # context provides access to interfaces (arduino, labjack, etc.)
         """Execute the action."""
         raise NotImplementedError
         
+    def cleanup(self):
+        """Clean up any resources or disconnect signals."""
+        pass
+
     def to_dict(self):
         """Serialize action to a dictionary"""
         return {
@@ -262,6 +810,14 @@ class BaseAction(QObject):
             return SystemAction.from_dict(data)
         elif action_type_name == ActionType.SET_VARIABLE.name:
             return SetVariableAction.from_dict(data)
+        elif action_type_name == ActionType.JUMP_TO_STEP.name:
+            return JumpToStepAction.from_dict(data)
+        elif action_type_name == ActionType.CONDITION.name:
+            return ConditionAction.from_dict(data)
+        elif action_type_name == ActionType.MQTT_PUBLISH.name:
+            return MQTTPublishAction.from_dict(data)
+        elif action_type_name == ActionType.INFO_MARKER.name:
+            return InfoMarkerAction.from_dict(data)
         else:
             raise ValueError(f"Unknown action type: {action_type_name}")
 
@@ -278,7 +834,18 @@ class ArduinoCommandAction(BaseAction):
                 # Substitute variables if present
                 resolved_command = context.get('resolve_variables', lambda x: x)(self.command)
                 # Send command (assuming a method like send_command exists)
-                arduino_interface.send_command(resolved_command) 
+                arduino_interface.send_command(resolved_command)
+                
+                # Track outbound command for data flow monitoring
+                main_window = context.get('main_window')
+                if main_window and hasattr(main_window, 'data_flow_controller'):
+                    sequence_name = context.get('current_sequence_name', 'Automation')
+                    main_window.data_flow_controller.record_outbound_command(
+                        target='arduino',
+                        command=resolved_command,
+                        source_automation=sequence_name
+                    )
+                
                 self.action_completed.emit(self)
             except Exception as e:
                 self.action_failed.emit(self, f"Failed to send Arduino command: {e}")
@@ -324,6 +891,19 @@ class LabJackCommandAction(BaseAction):
                 
                 # Send command (assuming a method like write_channel exists)
                 labjack_interface.write_channel(resolved_channel, resolved_value)
+                
+                # Track outbound command for data flow monitoring
+                main_window = context.get('main_window')
+                if main_window and hasattr(main_window, 'data_flow_controller'):
+                    sequence_name = context.get('current_sequence_name', 'Automation')
+                    main_window.data_flow_controller.record_outbound_command(
+                        target='labjack',
+                        command=f"{resolved_channel}={resolved_value}",
+                        source_automation=sequence_name,
+                        channel=resolved_channel,
+                        value=resolved_value
+                    )
+                
                 self.action_completed.emit(self)
             except Exception as e:
                 self.action_failed.emit(self, f"Failed to send LabJack command: {e}")
@@ -364,6 +944,18 @@ class SerialCommandAction(BaseAction):
                 
                 # Send command using the manager
                 serial_manager.send_command(resolved_port, resolved_command, self.baudrate, self.timeout)
+                
+                # Track outbound command for data flow monitoring
+                main_window = context.get('main_window')
+                if main_window and hasattr(main_window, 'data_flow_controller'):
+                    sequence_name = context.get('current_sequence_name', 'Automation')
+                    main_window.data_flow_controller.record_outbound_command(
+                        target='serial',
+                        command=resolved_command.strip(),
+                        source_automation=sequence_name,
+                        port=resolved_port
+                    )
+                
                 self.action_completed.emit(self)
             except Exception as e:
                 self.action_failed.emit(self, f"Failed to send Serial command to {self.port}: {e}")
@@ -387,6 +979,49 @@ class SerialCommandAction(BaseAction):
             data.get('baudrate', 9600), data.get('timeout', 1)
         )
 
+class MQTTPublishAction(BaseAction):
+    def __init__(self, name, topic, payload):
+        super().__init__(name, ActionType.MQTT_PUBLISH)
+        self.topic = str(topic)
+        self.payload = str(payload)
+        self.description = f"MQTT Publish '{self.payload}' to {self.topic}"
+        
+    def execute(self, context):
+        # Access MQTT interface via data_collection_controller in main_window
+        main_window = context.get('main_window')
+        if main_window and hasattr(main_window, 'data_collection_controller'):
+            dcc = main_window.data_collection_controller
+            if hasattr(dcc, 'mqtt_thread') and dcc.mqtt_thread.is_connected():
+                try:
+                    # Resolve variables in topic and payload
+                    resolve_func = context.get('resolve_variables', lambda x: x)
+                    resolved_topic = resolve_func(self.topic)
+                    resolved_payload = resolve_func(self.payload)
+                    
+                    success = dcc.mqtt_thread.publish(resolved_topic, resolved_payload)
+                    if success:
+                        self.action_completed.emit(self)
+                    else:
+                        self.action_failed.emit(self, "Failed to publish MQTT message")
+                except Exception as e:
+                    self.action_failed.emit(self, f"MQTT publish error: {e}")
+            else:
+                self.action_failed.emit(self, "MQTT broker not connected")
+        else:
+            self.action_failed.emit(self, "Data collection controller not available")
+            
+    def to_dict(self):
+        data = super().to_dict()
+        data.update({
+            'topic': self.topic,
+            'payload': self.payload
+        })
+        return data
+
+    @staticmethod
+    def from_dict(data):
+        return MQTTPublishAction(data['name'], data['topic'], data['payload'])
+
 class SystemAction(BaseAction):
     def __init__(self, name, action_type, parameters=None):
         # Call BaseAction init with the correct ENUM type
@@ -407,58 +1042,59 @@ class SystemAction(BaseAction):
             return
 
         try:
-             # Substitute variables in parameters
-             resolved_params = {} 
-             resolve_func = context.get('resolve_variables', lambda x: x)
-             for key, value in self.parameters.items():
-                 if isinstance(value, str):
-                     resolved_params[key] = resolve_func(value)
-                 else:
-                     resolved_params[key] = value # Keep non-strings as is
+            # Substitute variables in parameters
+            resolved_params = {} 
+            resolve_func = context.get('resolve_variables', lambda x: x)
+            for key, value in self.parameters.items():
+                if isinstance(value, str):
+                    resolved_params[key] = resolve_func(value)
+                else:
+                    resolved_params[key] = value # Keep non-strings as is
 
-             # Find the appropriate controller/method on main_window or its controllers
-             # This is a simplified example; a more robust system might use signals/slots
-             # or a dedicated system action handler.
-             if self.specific_action_type == "start_recording" and hasattr(main_window, 'data_logger'):
-                 main_window.data_logger.start_recording()
-             elif self.specific_action_type == "stop_recording" and hasattr(main_window, 'data_logger'):
-                 main_window.data_logger.stop_recording()
-             elif self.specific_action_type == "take_snapshot" and hasattr(main_window, 'camera_controller'):
-                 main_window.camera_controller.take_snapshot() # Assuming method exists
-             elif self.specific_action_type == "display_message":
-                 from PyQt6.QtWidgets import QMessageBox
-                 QMessageBox.information(main_window, 
-                                         resolved_params.get("title", "Automation Message"), 
-                                         resolved_params.get("message", ""))
-             elif self.specific_action_type == "play_sound":
-                  # Requires a sound playing utility
-                  sound_player = context.get('sound_player')
-                  if sound_player:
-                       sound = resolved_params.get("sound", "beep")
-                       if sound == "custom":
-                            file_path = resolved_params.get("file_path")
-                            if file_path and os.path.exists(file_path):
-                                 sound_player.play_wav(file_path)
-                            else:
-                                 raise ValueError(f"Custom sound file not found or specified: {file_path}")
-                       elif sound == "beep":
-                            sound_player.play_beep()
-                       # Add other standard sounds if needed
-                  else:
-                       print("Warning: Sound player not available in context.")
-                       # Optionally, play a system beep as fallback
-                       try:
-                           import winsound # Windows only
-                           winsound.MessageBeep()
-                       except ImportError:
-                           print("\a", end='') # Generic terminal bell
-             else:
-                 raise NotImplementedError(f"System action '{self.specific_action_type}' not implemented")
-                 
-             self.action_completed.emit(self)
-             
+            # Find the appropriate controller/method on main_window or its controllers
+            # This is a simplified example; a more robust system might use signals/slots
+            # or a dedicated system action handler.
+            if self.specific_action_type == "start_recording" and hasattr(main_window, 'camera_controller'):
+                main_window.camera_controller.start_recording()
+            elif self.specific_action_type == "stop_recording" and hasattr(main_window, 'camera_controller'):
+                main_window.camera_controller.stop_recording()
+            elif self.specific_action_type == "take_snapshot" and hasattr(main_window, 'camera_controller'):
+                # Capture the snapshot path to include in automation event
+                self.last_image_path = main_window.camera_controller.take_snapshot()
+            elif self.specific_action_type == "display_message":
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.information(main_window, 
+                                        resolved_params.get("title", "Automation Message"), 
+                                        resolved_params.get("message", ""))
+            elif self.specific_action_type == "play_sound":
+                # Requires a sound playing utility
+                sound_player = context.get('sound_player')
+                if sound_player:
+                    sound = resolved_params.get("sound", "beep")
+                    if sound == "custom":
+                        file_path = resolved_params.get("file_path")
+                        if file_path and os.path.exists(file_path):
+                            sound_player.play_wav(file_path)
+                        else:
+                            raise ValueError(f"Custom sound file not found or specified: {file_path}")
+                    elif sound == "beep":
+                        sound_player.play_beep()
+                    # Add other standard sounds if needed
+                else:
+                    print("Warning: Sound player not available in context.")
+                    # Optionally, play a system beep as fallback
+                    try:
+                        import winsound # Windows only
+                        winsound.MessageBeep()
+                    except ImportError:
+                        print("\a", end='') # Generic terminal bell
+            else:
+                raise NotImplementedError(f"System action '{self.specific_action_type}' not implemented")
+                
+            self.action_completed.emit(self)
+            
         except Exception as e:
-             self.action_failed.emit(self, f"Failed to execute system action '{self.specific_action_type}': {e}")
+            self.action_failed.emit(self, f"Failed to execute system action '{self.specific_action_type}': {e}")
              
     def to_dict(self):
         # Get base dictionary (which includes the correct 'type': ActionType.SYSTEM_ACTION.name)
@@ -494,7 +1130,6 @@ class SetVariableAction(BaseAction):
         
     def execute(self, context):
         variable_manager = context.get('variable_manager')
-        resolve_func = context.get('resolve_variables', lambda x: x)
         
         if not variable_manager:
              self.action_failed.emit(self, "Variable manager not available in context")
@@ -505,25 +1140,10 @@ class SetVariableAction(BaseAction):
              return
              
         try:
-             # 1. Resolve any variables within the expression first
-             resolved_expression = resolve_func(self.expression)
+             # Use the manager's enhanced expression evaluator
+             value_to_set = variable_manager.evaluate_expression(self.expression, context)
              
-             # 2. Evaluate the resolved expression (safely!)
-             # For now, let's treat it as a literal string or number assignment
-             # A safe evaluation (like ast.literal_eval or a custom parser) is needed 
-             # for arithmetic or sensor-based expressions. 
-             # TODO: Implement safe evaluation for expressions
-             value_to_set = resolved_expression # Basic assignment for now
-             
-             # Try converting to number if possible
-             try:
-                 value_to_set = float(resolved_expression)
-                 if value_to_set == int(value_to_set):
-                      value_to_set = int(value_to_set)
-             except ValueError:
-                 pass # Keep as string if not a number
-
-             # 3. Set the variable in the manager
+             # Set the variable in the manager
              variable_manager.set_variable(self.variable_name, value_to_set)
              self.action_completed.emit(self)
              
@@ -542,7 +1162,135 @@ class SetVariableAction(BaseAction):
     def from_dict(data):
         return SetVariableAction(data['name'], data['variable_name'], data['expression'])
 
+# --- Flow Control Actions ---
+class JumpToStepAction(BaseAction):
+    def __init__(self, name, target_step_index):
+        super().__init__(name, ActionType.JUMP_TO_STEP)
+        self.target_step_index = int(target_step_index)
+        self.description = f"Jump to step {self.target_step_index + 1}"
+        
+    def execute(self, context):
+        sequence = context.get('current_sequence')
+        if sequence:
+            # We subtract 1 because _handle_step_completed will increment it
+            sequence.current_step_index = self.target_step_index - 1
+            self.action_completed.emit(self)
+        else:
+            self.action_failed.emit(self, "Current sequence not found in context")
+            
+    def to_dict(self):
+        data = super().to_dict()
+        data.update({'target_step_index': self.target_step_index})
+        return data
+
+    @staticmethod
+    def from_dict(data):
+        return JumpToStepAction(data['name'], data['target_step_index'])
+
+class ConditionAction(BaseAction):
+    def __init__(self, name, condition_expression, if_true_step, if_false_step=None):
+        super().__init__(name, ActionType.CONDITION)
+        self.condition_expression = str(condition_expression)
+        self.if_true_step = int(if_true_step)
+        self.if_false_step = int(if_false_step) if if_false_step is not None else None
+        
+        self.description = f"If '{self.condition_expression}' jump to {self.if_true_step + 1}"
+        if self.if_false_step is not None:
+            self.description += f" else {self.if_false_step + 1}"
+            
+    def execute(self, context):
+        variable_manager = context.get('variable_manager')
+        sequence = context.get('current_sequence')
+        
+        if not variable_manager or not sequence:
+            self.action_failed.emit(self, "Manager or sequence not in context")
+            return
+            
+        try:
+            # Resolve variables in the expression
+            resolved = variable_manager.resolve_variables(self.condition_expression)
+            
+            # Simple evaluation for conditions (supporting <, >, ==, !=, <=, >=)
+            # We'll use a slightly more permissive regex for conditions
+            import re
+            if not re.match(r'^[0-9.+\-*/%() !<>=&|]*$', resolved):
+                 # Fallback to direct comparison if it's not a mathy condition
+                 # (e.g., "{status} == 'OK'")
+                 # This is still very basic.
+                 pass
+            
+            # Use eval for the condition
+            # Note: We should probably use a safer way, but following the pattern for now.
+            is_true = eval(resolved, {"__builtins__": None}, {})
+            
+            if is_true:
+                sequence.current_step_index = self.if_true_step - 1
+            elif self.if_false_step is not None:
+                sequence.current_step_index = self.if_false_step - 1
+            
+            self.action_completed.emit(self)
+        except Exception as e:
+            self.action_failed.emit(self, f"Condition error: {e}")
+            
+    def to_dict(self):
+        data = super().to_dict()
+        data.update({
+            'condition_expression': self.condition_expression,
+            'if_true_step': self.if_true_step,
+            'if_false_step': self.if_false_step
+        })
+        return data
+
+    @staticmethod
+    def from_dict(data):
+        return ConditionAction(
+            data['name'], 
+            data['condition_expression'], 
+            data['if_true_step'], 
+            data.get('if_false_step')
+        )
+
+class InfoMarkerAction(BaseAction):
+    def __init__(self, name, marker_text):
+        super().__init__(name, ActionType.INFO_MARKER)
+        self.marker_text = str(marker_text)
+        self.description = f"Info Marker: {self.marker_text}"
+        
+    def execute(self, context):
+        # Info markers don't "do" anything in the system, 
+        # but they trigger a log event which shows up on the graph.
+        # Variable resolution is supported in the marker text.
+        resolve_func = context.get('resolve_variables', lambda x: x)
+        resolved_text = resolve_func(self.marker_text)
+        self.description = f"Info: {resolved_text}"
+        self.action_completed.emit(self)
+        
+    def to_dict(self):
+        data = super().to_dict()
+        data.update({'marker_text': self.marker_text})
+        return data
+
+    @staticmethod
+    def from_dict(data):
+        return InfoMarkerAction(data['name'], data.get('marker_text', ''))
+
 # --- Step and Sequence ---
+class ActionWorker(QRunnable):
+    """Worker for executing actions in a separate thread."""
+    def __init__(self, action, context):
+        super().__init__()
+        self.action = action
+        self.context = context
+
+    def run(self):
+        try:
+            self.action.execute(self.context)
+        except Exception as e:
+            error_msg = f"Worker exception: {e}"
+            print(error_msg)
+            traceback.print_exc()
+            self.action.action_failed.emit(self.action, error_msg)
+
 class AutomationStep(QObject):
     step_started = pyqtSignal(object)
     step_completed = pyqtSignal(object)
@@ -581,17 +1329,73 @@ class AutomationStep(QObject):
              return
              
         self.is_running = True
+        # Clear previous result data
+        self.action.last_image_path = None
+        # Capture context and start time for logging
+        self._last_context = context
+        self.last_execution_timestamp = time.time()
+        
         self.step_started.emit(self)
         
         # If it's a time duration trigger, start its timer now
         if isinstance(self.trigger, TimeDurationTrigger):
             self.trigger.start()
+        
+        # We now log action execution AFTER completion to capture any generated data (like snapshot paths)
+        # unless it's an async action that might take a long time.
+        # For simplicity, we'll log most actions on completion.
             
-        # Execute the action
-        self.action.execute(context)
+        # Execute the action (async if requested)
+        if getattr(self.action, 'is_async', False):
+            # For async actions, we still log at the start because completion might be much later
+            self._log_action_event(context, timestamp=self.last_execution_timestamp)
+            worker = ActionWorker(self.action, context)
+            QThreadPool.globalInstance().start(worker)
+        else:
+            self.action.execute(context)
+            # Synchronous actions are logged in _on_action_completed which is called at the end of execute()
+    
+    def _log_action_event(self, context, timestamp=None):
+        """Log when an action is executed"""
+        import time
+        # Get sequence name from context if available
+        sequence_name = context.get('current_sequence_name', 'Unknown')
+        # Try to get manager from context or main_window
+        manager = None
+        main_window = context.get('main_window')
+        if main_window and hasattr(main_window, 'automation_controller'):
+            manager = main_window.automation_controller.manager
+        
+        if manager and hasattr(manager, 'event_logged'):
+            event = {
+                'timestamp': timestamp or time.time(),
+                'type': 'action',
+                'sequence_name': sequence_name,
+                'action_name': self.action.name,
+                'action_description': getattr(self.action, 'description', 'Unknown action'),
+                'action_type': self.action.action_type.name if hasattr(self.action, 'action_type') else 'Unknown',
+                'image_path': getattr(self.action, 'last_image_path', None)
+            }
+            manager.event_logged.emit(event)
         
     def _on_action_completed(self, action_obj):
         if action_obj == self.action:
+            # For synchronous actions, log now so we include any result data (like last_image_path)
+            if not getattr(self.action, 'is_async', False):
+                # Retrieve context from parent sequence if possible
+                context = getattr(self.parent(), '_context', {}) if hasattr(self, 'parent') else {}
+                # If we can't get context easily, we'll use a minimal one or find it from main_window
+                if not context:
+                    main_window = None
+                    # Try to find main_window to get controller
+                    # This is a bit of a hack but AutomationStep doesn't store context
+                    pass 
+                
+                # Actually, AutomationStep.execute_action receives context. 
+                # Let's store a reference to the last context.
+                last_context = getattr(self, '_last_context', {})
+                self._log_action_event(last_context, timestamp=self.last_execution_timestamp)
+
             self.is_running = False
             self.step_completed.emit(self)
             
@@ -600,10 +1404,39 @@ class AutomationStep(QObject):
             self.is_running = False
             self.step_failed.emit(self, reason)
 
+    def cleanup(self):
+        """Clean up step resources and disconnect signals."""
+        try:
+            self.action.action_completed.disconnect(self._on_action_completed)
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            self.action.action_failed.disconnect(self._on_action_failed)
+        except (TypeError, RuntimeError):
+            pass
+        
+        self.trigger.cleanup()
+        self.action.cleanup()
+
     def to_dict(self):
+        # Serialize trigger and action with error handling
+        try:
+            trigger_dict = self.trigger.to_dict()
+        except Exception as e:
+            print(f"Error serializing trigger '{getattr(self.trigger, 'name', 'Unknown')}' in step: {e}")
+            traceback.print_exc()
+            raise  # Re-raise to let caller handle it
+        
+        try:
+            action_dict = self.action.to_dict()
+        except Exception as e:
+            print(f"Error serializing action '{getattr(self.action, 'name', 'Unknown')}' in step: {e}")
+            traceback.print_exc()
+            raise  # Re-raise to let caller handle it
+        
         return {
-            'trigger': self.trigger.to_dict(),
-            'action': self.action.to_dict(),
+            'trigger': trigger_dict,
+            'action': action_dict,
             'enabled': self.enabled
         }
         
@@ -654,13 +1487,10 @@ class AutomationSequence(QObject):
         self.current_step_index = 0
         self._current_step_failed = False
         
-        # Reset specific trigger types
+        # Reset all triggers and step states
         for step in self.steps:
-             if isinstance(step.trigger, TimeSpecificTrigger):
-                 step.trigger.triggered_today = False
-             elif isinstance(step.trigger, EventTrigger):
-                 step.trigger.triggered_event = False
-             # Duration trigger's start_time is set when its step executes
+             step.trigger.reset()
+             step.is_running = False
 
         self.sequence_started.emit(self)
         self.sequence_step_changed.emit(self, self.current_step_index)
@@ -716,7 +1546,9 @@ class AutomationSequence(QObject):
         if not current_step.is_running:
              # Check the trigger for the current step
              if current_step.check_trigger(self._context):
-                 # Trigger condition met, execute the action
+                 # Trigger condition met - log trigger event
+                 self._log_trigger_event(current_step, self._context)
+                 # Execute the action
                  try:
                      current_step.execute_action(self._context)
                  except Exception as e:
@@ -748,14 +1580,14 @@ class AutomationSequence(QObject):
                 self.current_step_index = 0
                 print(f"Sequence '{self.name}' looping back to step 1.")
                 self.sequence_step_changed.emit(self, self.current_step_index)
-                # Reset specific trigger types for the new loop
-                for step in self.steps:
-                    if isinstance(step.trigger, TimeSpecificTrigger):
-                         step.trigger.triggered_today = False
-                    elif isinstance(step.trigger, EventTrigger):
-                         step.trigger.triggered_event = False
-                # Immediately check the first step trigger again
-                self._run_loop() 
+                
+                # We don't call trigger.reset() here because we want to maintain 
+                # state like cooldowns and hysteresis across loops.
+                # reset() is only called when the sequence is explicitly (re)started.
+                    
+                # Use singleShot to break recursion and allow event loop processing
+                # This prevents UI hangs in tight loops
+                QTimer.singleShot(0, self._run_loop)
             else:
                 # Sequence finished
                 print(f"Sequence '{self.name}' completed.")
@@ -764,8 +1596,8 @@ class AutomationSequence(QObject):
         else:
             # Proceed to the next step
             self.sequence_step_changed.emit(self, self.current_step_index)
-            # Immediately check the next step's trigger
-            self._run_loop()
+            # Use singleShot to break recursion
+            QTimer.singleShot(0, self._run_loop)
             
     def _handle_step_failed(self, failed_step, reason):
          if not self.is_running or failed_step != self.steps[self.current_step_index]:
@@ -775,13 +1607,59 @@ class AutomationSequence(QObject):
          self._current_step_failed = True # Flag to stop the run loop
          self.stop()
          self.sequence_error.emit(self, f"Step {self.current_step_index + 1} failed: {reason}")
+    
+    def _log_trigger_event(self, step, context):
+        """Log when a trigger fires"""
+        import time
+        if hasattr(self, 'manager') and hasattr(self.manager, 'event_logged'):
+            event = {
+                'timestamp': time.time(),
+                'type': 'trigger',
+                'sequence_name': self.name,
+                'step_index': self.current_step_index,
+                'trigger_name': step.trigger.name,
+                'trigger_description': getattr(step.trigger, 'description', 'Unknown trigger'),
+                'action_name': step.action.name,
+                'action_description': getattr(step.action, 'description', 'Unknown action'),
+                'image_path': None # Triggers don't usually have images, but keep schema consistent
+            }
+            print(f"DEBUG AUTOMATION: Emitting trigger event: {event.get('trigger_description')} from sequence '{self.name}'")
+            self.manager.event_logged.emit(event)
+        else:
+            print(f"DEBUG AUTOMATION: Cannot log trigger event - manager not available (has manager: {hasattr(self, 'manager')})")
+
+    def cleanup(self):
+        """Clean up sequence resources and disconnect signals."""
+        self.stop()
+        for step in self.steps:
+            try:
+                step.step_completed.disconnect(self._handle_step_completed)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                step.step_failed.disconnect(self._handle_step_failed)
+            except (TypeError, RuntimeError):
+                pass
+            step.cleanup()
 
     def to_dict(self):
+        # Serialize steps with error handling
+        steps_data = []
+        for i, step in enumerate(self.steps):
+            try:
+                step_dict = step.to_dict()
+                steps_data.append(step_dict)
+            except Exception as e:
+                print(f"Error serializing step {i} in sequence '{self.name}': {e}")
+                traceback.print_exc()
+                # Skip this step but continue with others
+                continue
+        
         return {
             'name': self.name,
             'loop': self.loop,
             'checked': self.checked,
-            'steps': [step.to_dict() for step in self.steps]
+            'steps': steps_data
         }
         
     @staticmethod
@@ -802,12 +1680,14 @@ class AutomationManager(QObject):
     sequence_step_changed = pyqtSignal(object, int) # Re-emitted from sequence
     sequence_error = pyqtSignal(object, str) # Re-emitted from sequence
     status_changed = pyqtSignal() # Generic signal for UI updates
+    event_logged = pyqtSignal(dict) # Emitted when an automation event occurs (for CSV/graph logging)
 
-    def __init__(self, sequences_file="automation_sequences.json", app_context=None):
+    def __init__(self, sequences_file="automation_sequences.json", app_context=None, master_file=None):
         super().__init__()
         self.sequences = []
         self.active_sequences = set() # Sequences currently running
         self.sequences_file = sequences_file
+        self.master_file = master_file
         self.app_context = app_context if app_context else {}
         self.variables = {} # Dictionary to store shared variables
         self.load_sequences() # Load sequences on initialization
@@ -819,37 +1699,34 @@ class AutomationManager(QObject):
             self.sequences_file = new_path
             # Note: load_sequences is called separately after setting the path
 
+    def set_master_file(self, new_path):
+        """Sets the path for the master sequences JSON file (for persistent storage)."""
+        if self.master_file != new_path:
+            print(f"AutomationManager: Setting master sequences file to {new_path}")
+            self.master_file = new_path
+
     def get_available_sensors(self):
         """Get a list of sensor names available in the context."""
+        return [s.name for s in self.get_available_sensor_objects()]
+
+    def get_available_sensor_objects(self):
+        """Get a list of SensorModel objects available in the context."""
         # First check if we have a sensor_controller
         sensor_controller = self.app_context.get('sensor_controller')
         if sensor_controller:
-            if hasattr(sensor_controller, 'get_sensor_names'):
-                return sensor_controller.get_sensor_names()
-            elif hasattr(sensor_controller, 'get_sensor_list'):
-                return sensor_controller.get_sensor_list()
-            elif hasattr(sensor_controller, 'get_sensors'):
-                sensors = sensor_controller.get_sensors()
-                if isinstance(sensors, list):
-                    return [s.name for s in sensors if hasattr(s, 'name')]
+            if hasattr(sensor_controller, 'get_sensors'):
+                return sensor_controller.get_sensors()
+            elif hasattr(sensor_controller, 'sensors'):
+                return sensor_controller.sensors
                 
-        # Fallback to checking data_logger if sensor_controller doesn't work
-        data_logger = self.app_context.get('data_logger')
-        if data_logger and hasattr(data_logger, 'get_channel_names'):
-             return data_logger.get_channel_names()
-             
-        # If we have a main_window, try to get sensor names from there
+        # If we have a main_window, try to get from there
         main_window = self.app_context.get('main_window')
         if main_window and hasattr(main_window, 'sensor_controller'):
-            sensor_controller = main_window.sensor_controller
-            if hasattr(sensor_controller, 'get_sensor_names'):
-                return sensor_controller.get_sensor_names()
-            elif hasattr(sensor_controller, 'get_sensor_list'):
-                return sensor_controller.get_sensor_list()
-            elif hasattr(sensor_controller, 'get_sensors'):
-                sensors = sensor_controller.get_sensors()
-                if isinstance(sensors, list):
-                    return [s.name for s in sensors if hasattr(s, 'name')]
+            sc = main_window.sensor_controller
+            if hasattr(sc, 'get_sensors'):
+                return sc.get_sensors()
+            elif hasattr(sc, 'sensors'):
+                return sc.sensors
                 
         return [] # Return empty list if unavailable
         
@@ -866,6 +1743,14 @@ class AutomationManager(QObject):
          context['variable_manager'] = self
          context['resolve_variables'] = self.resolve_variables
          context['variables'] = self.variables # Direct access (read-only recommended)
+         
+         # Preserve events dictionary if it exists (don't overwrite with empty dict)
+         if 'events' in self.app_context and 'events' not in context:
+             # Keep existing events
+             pass
+         elif 'events' not in self.app_context:
+             # Initialize events if it doesn't exist
+             context.setdefault('events', set())
          
          self.app_context.update(context)
          # Update context for all currently running sequences
@@ -894,14 +1779,43 @@ class AutomationManager(QObject):
         placeholders = re.findall(r"\{([^}]+)\}", text)
         for placeholder in placeholders:
             var_name = placeholder.strip()
+            # Try to resolve from variables or sensors
             value = self.get_variable(var_name)
+            
+            # If not in variables, check sensors in app_context
+            if value is None:
+                sensors = self.app_context.get('sensors', {})
+                value = sensors.get(var_name)
+                
             if value is not None:
                 resolved_text = resolved_text.replace(f"{{{placeholder}}}", str(value))
             else:
-                 print(f"[Automation] Warning: Variable '{var_name}' not found for substitution in '{text}'")
-                 # Optionally, leave the placeholder or replace with an empty string/error marker
-                 # resolved_text = resolved_text.replace(f"{{{placeholder}}}", "[VAR_NOT_FOUND]")
+                 print(f"[Automation] Warning: Variable/Sensor '{var_name}' not found for substitution in '{text}'")
         return resolved_text
+
+    def evaluate_expression(self, expression, context=None):
+        """Safely evaluate a mathematical expression."""
+        if not expression:
+            return None
+            
+        # 1. Resolve variables first
+        resolved = self.resolve_variables(str(expression))
+        
+        # 2. Basic cleanup
+        # Only allow numbers, basic operators, and parentheses
+        import re
+        if not re.match(r'^[0-9.+\-*/%() ]*$', resolved):
+            # If it's not a pure math expression, return the resolved string
+            # This allows it to still be used for simple string assignments
+            return resolved
+            
+        try:
+            # Using a very restricted eval is still slightly risky, 
+            # but the regex above only allows safe characters.
+            return eval(resolved, {"__builtins__": None}, {})
+        except Exception as e:
+            print(f"[Automation] Error evaluating expression '{expression}' (resolved as '{resolved}'): {e}")
+            return resolved
         
     # --- Sequence Management ---
     def add_sequence(self, sequence):
@@ -914,14 +1828,29 @@ class AutomationManager(QObject):
             print("Error: Attempted to add non-sequence object to manager.")
             
     def remove_sequence(self, sequence_to_remove):
+        """Remove a sequence from the list and save to file."""
+        sequence_name = sequence_to_remove.name if hasattr(sequence_to_remove, 'name') else "Unknown"
+        print(f"Removing sequence: {sequence_name} from file: {self.sequences_file}")
+        
         if sequence_to_remove in self.active_sequences:
             self.stop_sequence(sequence_to_remove)
             
         if sequence_to_remove in self.sequences:
             self.sequences.remove(sequence_to_remove)
             self._disconnect_sequence_signals(sequence_to_remove)
+            print(f"Sequence '{sequence_name}' removed from memory. Remaining sequences: {len(self.sequences)}")
             self.sequences_changed.emit()
-            self.save_sequences()
+            
+            # Save to file immediately after removal
+            try:
+                self.save_sequences()
+                print(f"Sequences saved after removal of '{sequence_name}'")
+            except Exception as e:
+                print(f"Error saving sequences after removal: {e}")
+                traceback.print_exc()
+                raise  # Re-raise to notify caller of failure
+        else:
+            print(f"Warning: Sequence '{sequence_name}' not found in sequences list")
             
     def update_sequence(self, original_sequence, updated_sequence_data):
         """Update an existing sequence (e.g., after editing)"""
@@ -961,7 +1890,12 @@ class AutomationManager(QObject):
             self.active_sequences.add(sequence)
             # Pass the current context to the sequence
             self.update_context({}) # Ensure latest context vars are included
+            # Add sequence info to context for event logging and flow control
+            self.app_context['current_sequence_name'] = sequence.name
+            self.app_context['current_sequence'] = sequence
             sequence.set_context(self.app_context)
+            # Store reference to manager in sequence for event logging
+            sequence.manager = self
             sequence.start()
             self.status_changed.emit()
         elif sequence in self.active_sequences:
@@ -990,26 +1924,100 @@ class AutomationManager(QObject):
             print("Error: No sequence file path set for saving.")
             return
 
+        # Check for replay mode via app_context
+        main_window = self.app_context.get('main_window')
+        is_replay = getattr(main_window, 'is_replay_mode', False) if main_window else False
+
         try:
             # Ensure the directory exists
             directory = os.path.dirname(self.sequences_file)
             if directory:
                 os.makedirs(directory, exist_ok=True)
             
-            # Serialize sequences
-            sequences_data = [seq.to_dict() for seq in self.sequences]
+            # Serialize sequences with error handling for each sequence
+            sequences_data = []
+            for i, seq in enumerate(self.sequences):
+                try:
+                    seq_dict = seq.to_dict()
+                    sequences_data.append(seq_dict)
+                except Exception as e:
+                    print(f"Error serializing sequence {i} '{getattr(seq, 'name', 'Unknown')}': {e}")
+                    traceback.print_exc()
+                    # Skip this sequence but continue with others
+                    continue
             
-            # Write to file
-            with open(self.sequences_file, 'w') as f:
-                json.dump(sequences_data, f, indent=4)
-            print(f"Automation sequences saved to {self.sequences_file}")
+            # Use atomic write: write to temporary file first, then rename
+            # This ensures the file is either completely written or not at all
+            
+            # If in replay mode, we skip saving to the specific run file (sequences_file)
+            # and instead save directly to the master file if it exists.
+            target_file = self.master_file if is_replay and self.master_file else self.sequences_file
+            
+            if not target_file:
+                return
+
+            temp_file = target_file + ".tmp"
+            
+            # Write to temporary file
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(sequences_data, f, indent=4, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())  # Force write to disk
+            
+            # Atomic rename: replace old file with new one
+            # On Windows, we need to remove the old file first if it exists
+            if os.path.exists(target_file):
+                os.replace(temp_file, target_file)
+            else:
+                os.rename(temp_file, target_file)
+            
+            # Verify the save was successful by checking file exists and is readable
+            if os.path.exists(target_file):
+                with open(target_file, 'r', encoding='utf-8') as f:
+                    saved_data = json.load(f)
+                    if len(saved_data) == len(sequences_data):
+                        print(f"Automation sequences saved successfully to {target_file} ({len(sequences_data)} sequences)")
+                        
+                        # ALSO save to master file if it's different (persistence across runs)
+                        # but only if we weren't ALREADY saving to the master file
+                        if not is_replay and self.master_file and self.master_file != target_file:
+                            try:
+                                # Ensure the master directory exists
+                                master_dir = os.path.dirname(self.master_file)
+                                if master_dir:
+                                    os.makedirs(master_dir, exist_ok=True)
+                                
+                                # Use shutil to copy the file we just verified
+                                import shutil
+                                shutil.copy2(target_file, self.master_file)
+                                print(f"Master automation sequences also updated at: {self.master_file}")
+                            except Exception as e:
+                                print(f"Error updating master sequences file {self.master_file}: {e}")
+                    else:
+                        print(f"Warning: Saved sequence count mismatch. Expected {len(sequences_data)}, got {len(saved_data)}")
+            else:
+                print(f"Error: File was not created at {target_file}")
 
         except IOError as e:
-            print(f"Error saving automation sequences to {self.sequences_file}: {e}")
-            # Consider emitting an error signal or showing a message box
+            print(f"Error saving automation sequences to {target_file}: {e}")
+            traceback.print_exc()
+            # Clean up temp file if it exists
+            temp_file = target_file + ".tmp"
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
         except Exception as e:
             print(f"Unexpected error saving automation sequences: {e}")
             traceback.print_exc()
+            # Clean up temp file if it exists
+            temp_file = target_file + ".tmp"
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
 
     def load_sequences(self):
         """Load sequences from the JSON file."""
@@ -1019,6 +2027,13 @@ class AutomationManager(QObject):
         # Clear existing sequences
         self.sequences = []
         self.active_sequences.clear()
+
+        # Clear sensor and event data from context to avoid stale triggers from previous runs
+        if 'sensors' in self.app_context:
+            self.app_context['sensors'] = {}
+        if 'events' in self.app_context:
+            self.app_context['events'] = set()
+        self.variables = {} # Reset shared automation variables
 
         if not self.sequences_file:
             print("Error: No sequence file path set for loading.")
@@ -1081,29 +2096,20 @@ class AutomationManager(QObject):
          sequence.sequence_error.connect(self.sequence_error)
          
     def _disconnect_sequence_signals(self, sequence):
-         # Attempt to disconnect signals safely
-         try: sequence.sequence_started.disconnect(self.sequence_started)
-         except TypeError: pass
-         try: sequence.sequence_stopped.disconnect(self._handle_sequence_stopped)
-         except TypeError: pass
-         try: sequence.sequence_completed.disconnect(self.sequence_completed)
-         except TypeError: pass
-         try: sequence.sequence_step_changed.disconnect(self.sequence_step_changed)
-         except TypeError: pass
-         try: sequence.sequence_error.disconnect(self.sequence_error)
-         except TypeError: pass
+         # Use the new cleanup method
+         sequence.cleanup()
          
-         # Also disconnect step signals within the sequence
-         for step in sequence.steps:
-             try: step.step_completed.disconnect(sequence._handle_step_completed)
-             except TypeError: pass
-             try: step.step_failed.disconnect(sequence._handle_step_failed)
-             except TypeError: pass
-             # Disconnect action signals within the step
-             try: step.action.action_completed.disconnect(step._on_action_completed)
-             except TypeError: pass
-             try: step.action.action_failed.disconnect(step._on_action_failed)
-             except TypeError: pass
+         # Also attempt to disconnect sequence signals from manager
+         try: sequence.sequence_started.disconnect(self.sequence_started)
+         except (TypeError, RuntimeError): pass
+         try: sequence.sequence_stopped.disconnect(self._handle_sequence_stopped)
+         except (TypeError, RuntimeError): pass
+         try: sequence.sequence_completed.disconnect(self.sequence_completed)
+         except (TypeError, RuntimeError): pass
+         try: sequence.sequence_step_changed.disconnect(self.sequence_step_changed)
+         except (TypeError, RuntimeError): pass
+         try: sequence.sequence_error.disconnect(self.sequence_error)
+         except (TypeError, RuntimeError): pass
 
     def _handle_sequence_stopped(self, sequence):
         """Handle sequence stopped signal to remove from active set."""
