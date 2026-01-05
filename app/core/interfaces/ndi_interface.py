@@ -9,34 +9,124 @@ logger = logging.getLogger(__name__)
 
 # Try to import NDI, but provide fallback if not available
 NDI_AVAILABLE = False
+import sys
+logger.info(f"NDI search - Python: {sys.version}")
+logger.info(f"NDI search - Executable: {sys.executable}")
+# logger.debug(f"NDI search - Path: {sys.path}")
+
 try:
-    # Note: The package is 'ndi-python', but the module is 'ndi'
-    from ndi import finder, send, timecode_from_time, VideoFrameV2, FrameFormatType, Create
+    # Option 1: Try the 'ndi' module (from common versions of ndi-python)
+    import ndi
+    from ndi import (
+        finder, send, recv, 
+        timecode_from_time, VideoFrameV2, FrameFormatType, Create,
+        find_create_v2, find_get_current_sources, find_destroy,
+        recv_create_v3, recv_connect, recv_capture_v2, recv_destroy,
+        recv_free_video_v2, FRAME_TYPE_VIDEO
+    )
     NDI_AVAILABLE = True
-    logger.info("NDI Python module found and imported successfully.")
+    logger.info("NDI module 'ndi' found and imported successfully.")
 except ImportError:
-    logger.warning("NDI Python module ('ndi') not found. NDI output will be disabled.")
-    logger.warning("To enable NDI: ")
-    logger.warning("  1. Install the NDI SDK from https://ndi.tv/sdk/")
-    logger.warning("  2. Add the NDI SDK Bin directory to your system PATH.")
-    logger.warning("  3. Install the Python package: pip install ndi-python")
-    # Define dummy classes/functions if NDI is not available to prevent errors
-    class DummySender:
-        def send_video_v2(self, frame):
-            pass
-    class DummyCreate:
-        def __call__(self, *args, **kwargs):
-            return DummySender()
-    class DummyVideoFrameV2:
-        def __init__(self, *args, **kwargs):
-            pass
-    
-    finder = None # type: ignore
-    send = None   # type: ignore
-    timecode_from_time = lambda: 0 # type: ignore
-    VideoFrameV2 = DummyVideoFrameV2 # type: ignore
-    FrameFormatType = type('FrameFormatType', (object,), {'PROGRESSIVE': 0})() # type: ignore
-    Create = DummyCreate() # type: ignore
+    try:
+        # Option 2: Try the 'NDIlib' module (sometimes installed by ndi-python on Windows)
+        import NDIlib
+        NDI_AVAILABLE = True
+        logger.info("NDI module 'NDIlib' found. Setting up compatibility layer.")
+        
+        # Map constants and functions
+        VideoFrameV2 = NDIlib.VideoFrameV2
+        FrameFormatType = NDIlib.FrameFormatType
+        find_create_v2 = NDIlib.find_create_v2
+        find_get_current_sources = NDIlib.find_get_current_sources
+        find_destroy = NDIlib.find_destroy
+        recv_create_v3 = NDIlib.recv_create_v3
+        recv_connect = NDIlib.recv_connect
+        recv_capture_v2 = NDIlib.recv_capture_v2
+        recv_destroy = NDIlib.recv_destroy
+        recv_free_video_v2 = NDIlib.recv_free_video_v2
+        FRAME_TYPE_VIDEO = NDIlib.FRAME_TYPE_VIDEO
+        
+        # Compatibility wrappers
+        def timecode_from_time():
+            return NDIlib.SEND_TIMECODE_SYNTHESIZE
+
+        _ndilib_initialized = False
+        def ensure_ndilib_initialized():
+            global _ndilib_initialized
+            if not _ndilib_initialized:
+                if hasattr(NDIlib, 'initialize'):
+                    if not NDIlib.initialize():
+                        logger.error("Failed to initialize NDIlib")
+                    else:
+                        logger.info("NDIlib initialized successfully")
+                        _ndilib_initialized = True
+            return _ndilib_initialized
+
+        def recv_create_v3(settings=None):
+            ensure_ndilib_initialized()
+            if settings is None:
+                settings = NDIlib.RecvCreateV3()
+                settings.color_format = NDIlib.RECV_COLOR_FORMAT_BGRX_BGRA
+                settings.bandwidth = NDIlib.RECV_BANDWIDTH_HIGHEST
+                settings.allow_video_fields = False
+            return NDIlib.recv_create_v3(settings)
+
+        class NDISenderWrapper:
+            def __init__(self, settings):
+                self.handle = NDIlib.send_create(settings)
+            def __bool__(self):
+                return self.handle is not None
+            def send_video_v2(self, frame):
+                return NDIlib.send_send_video_v2(self.handle, frame)
+
+        def Create(name="NDI Source", groups=None, clock_video=True, clock_audio=True):
+            ensure_ndilib_initialized()
+            settings = NDIlib.SendCreate()
+            settings.ndi_name = name
+            settings.groups = groups
+            settings.clock_video = clock_video
+            settings.clock_audio = clock_audio
+            return NDISenderWrapper(settings)
+
+        # These aren't used in the code but defined for completeness
+        finder = None
+        send = None
+        recv = None
+
+    except ImportError:
+        logger.warning("NDI Python module ('ndi' or 'NDIlib') not found. NDI output and reception will be disabled.")
+        logger.warning("To enable NDI: ")
+        logger.warning("  1. Install the NDI SDK from https://ndi.tv/sdk/")
+        logger.warning("  2. Add the NDI SDK Bin directory to your system PATH.")
+        logger.warning("  3. Install the Python package: pip install ndi-python")
+        
+        # Define dummy classes/functions if NDI is not available to prevent errors
+        class DummySender:
+            def send_video_v2(self, frame):
+                pass
+        class DummyCreate:
+            def __call__(self, *args, **kwargs):
+                return DummySender()
+        class DummyVideoFrameV2:
+            def __init__(self, *args, **kwargs):
+                pass
+        
+        finder = None # type: ignore
+        send = None   # type: ignore
+        recv = None   # type: ignore
+        timecode_from_time = lambda: 0 # type: ignore
+        VideoFrameV2 = DummyVideoFrameV2 # type: ignore
+        FrameFormatType = type('FrameFormatType', (object,), {'PROGRESSIVE': 0})() # type: ignore
+        Create = DummyCreate() # type: ignore
+        find_create_v2 = lambda: None
+        find_get_current_sources = lambda x: []
+        find_destroy = lambda x: None
+        recv_create_v3 = lambda: None
+        recv_connect = lambda x, y: None
+        recv_capture_v2 = lambda x, y: (0, None, None, None)
+        recv_destroy = lambda x: None
+        recv_free_video_v2 = lambda x, y: None
+        FRAME_TYPE_VIDEO = 1
 
 
 class NDIInterface:
@@ -267,4 +357,122 @@ class NDIInterface:
 
     def is_available(self) -> bool:
         """Checks if NDI libraries are available."""
-        return self.ndi_available 
+        return self.ndi_available
+
+
+class NDISourceFinder:
+    """Discovers NDI sources on the network."""
+    def __init__(self):
+        self._finder = None
+        if NDI_AVAILABLE:
+            ensure_ndilib_initialized()
+            try:
+                self._finder = find_create_v2()
+            except Exception as e:
+                logger.error(f"Failed to create NDI finder: {e}")
+
+    def get_sources(self):
+        """Returns a list of discovered NDI sources."""
+        if not self._finder:
+            return []
+        try:
+            # This returns a list of Source objects
+            return find_get_current_sources(self._finder)
+        except Exception as e:
+            logger.error(f"Error getting NDI sources: {e}")
+            return []
+
+    def __del__(self):
+        if self._finder:
+            try:
+                find_destroy(self._finder)
+            except:
+                pass
+
+
+class NDIReceiver:
+    """Receives video frames from an NDI source."""
+    def __init__(self, source_name=None):
+        self.source_name = source_name
+        self._receiver = None
+        self._connected = False
+
+    def connect(self, source):
+        """Connects to a specific NDI source.
+        
+        Args:
+            source: An NDI Source object (from finder)
+        """
+        if not NDI_AVAILABLE:
+            return False
+        
+        try:
+            if self._receiver:
+                self.disconnect()
+            
+            self._receiver = recv_create_v3()
+            if not self._receiver:
+                return False
+            
+            recv_connect(self._receiver, source)
+            self._connected = True
+            # Use ndi_name which is often available on the source object
+            self.source_name = getattr(source, 'ndi_name', str(source))
+            logger.info(f"Connected to NDI source: {self.source_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to connect to NDI source: {e}")
+            return False
+
+    def disconnect(self):
+        """Disconnects from the current NDI source."""
+        if self._receiver:
+            try:
+                recv_destroy(self._receiver)
+            except:
+                pass
+            self._receiver = None
+        self._connected = False
+        logger.info(f"Disconnected from NDI source: {self.source_name}")
+
+    def capture_frame(self, timeout_ms=1000):
+        """Captures a single video frame from the NDI source."""
+        if not self._receiver or not self._connected:
+            return None
+
+        try:
+            # capture video, audio, metadata
+            frame_type, video_data, audio_data, metadata_data = recv_capture_v2(self._receiver, timeout_ms)
+            
+            if frame_type != 0: # 0 is usually FRAME_TYPE_NONE
+                 # Only log non-none frames to avoid spamming
+                 logger.debug(f"Captured NDI frame type: {frame_type}")
+
+            if frame_type == FRAME_TYPE_VIDEO:
+                # video_data.data is a numpy array (BGRA)
+                if video_data is None or video_data.data is None:
+                    logger.error("NDI Video frame captured but data is None")
+                    return None
+                    
+                frame = np.copy(video_data.data)
+                # Free the frame back to the NDI SDK
+                recv_free_video_v2(self._receiver, video_data)
+                
+                # Convert BGRA to BGR if needed (most of our app uses BGR)
+                if frame is not None and frame.shape[2] == 4:
+                    return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                return frame
+            
+            # If we got audio or metadata, we still want to free them if the SDK requires it
+            # (though our current Dummy/NDIlib wrapper might not handle audio_free yet)
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error capturing NDI frame: {e}")
+            return None
+
+    def is_connected(self):
+        return self._connected
+
+    def __del__(self):
+        self.disconnect()

@@ -137,10 +137,27 @@ class SensorController(QObject):
             name_item = QTableWidgetItem(sensor.name)
             table.setItem(i, 1, name_item)
             
-            # Current value (could be None if no data yet)
-            value_text = str(sensor.current_value) if sensor.current_value is not None else "N/A"
-            if sensor.unit:
-                value_text += f" {sensor.unit}"
+            # Current value (check for staleness)
+            is_stale = False
+            if hasattr(self.main_window, 'data_collection_controller'):
+                dcc = self.main_window.data_collection_controller
+                hist_key = self.get_historical_buffer_key(sensor)
+                if hist_key:
+                    timeout_val = dcc._get_stale_timeout_for_key(hist_key)
+                    if hist_key in dcc._last_sensor_update:
+                        last_ts = dcc._last_sensor_update[hist_key]
+                        if time.time() - last_ts > timeout_val:
+                            is_stale = True
+                    else:
+                        is_stale = True
+
+            if is_stale:
+                value_text = self.NO_VALUE_DISPLAY
+            else:
+                value_text = str(sensor.current_value) if sensor.current_value is not None else self.NO_VALUE_DISPLAY
+                if sensor.unit and sensor.current_value is not None:
+                    value_text += f" {sensor.unit}"
+            
             value_item = QTableWidgetItem(value_text)
             table.setItem(i, 2, value_item)
             
@@ -580,6 +597,7 @@ class SensorController(QObject):
             device_type_combo.addItem("MQTT")
             device_type_combo.addItem("Other/Virtual Sensor")
             device_type_combo.addItem("Optical Sensor")
+            device_type_combo.addItem("Read CSV")
             device_type_combo.setCurrentIndex(0)  # Default to Arduino
             
             print("Created device type combo")
@@ -634,6 +652,11 @@ class SensorController(QObject):
             labjack_channel_combo = QComboBox()
             labjack_channel_combo.setVisible(False)  # Hide initially
             port_layout.addWidget(labjack_channel_combo)
+            
+            # CSV Mapping selection widgets
+            csv_mapping_combo = QComboBox()
+            csv_mapping_combo.setVisible(False)  # Hide initially
+            port_layout.addWidget(csv_mapping_combo)
             
             form_layout.addRow("Port/Channel:", port_container)
             
@@ -701,17 +724,40 @@ class SensorController(QObject):
                     arduino_port_combo.setVisible(False)
                     refresh_btn.setVisible(False)
                     labjack_channel_combo.setVisible(True)
+                    csv_mapping_combo.setVisible(False)
                     if hasattr(self, 'mqtt_topic_input'): self.mqtt_topic_input.setVisible(False)
                     populate_labjack_channels()  # Populate channels when switching to LabJack
                 elif device_type == "MQTT":
                     arduino_port_combo.setVisible(False)
                     refresh_btn.setVisible(False)
                     labjack_channel_combo.setVisible(False)
+                    csv_mapping_combo.setVisible(False)
                     if not hasattr(self, 'mqtt_topic_input'):
                         self.mqtt_topic_input = QLineEdit()
                         self.mqtt_topic_input.setPlaceholderText("e.g. sensors/temperature")
                         port_layout.addWidget(self.mqtt_topic_input)
                     self.mqtt_topic_input.setVisible(True)
+                elif device_type == "Read CSV":
+                    arduino_port_combo.setVisible(False)
+                    refresh_btn.setVisible(False)
+                    labjack_channel_combo.setVisible(False)
+                    csv_mapping_combo.setVisible(True)
+                    if hasattr(self, 'mqtt_topic_input'): self.mqtt_topic_input.setVisible(False)
+                    
+                    # Populate CSV mappings
+                    csv_mapping_combo.clear()
+                    csv_configs = getattr(self.main_window, 'csv_configs', [])
+                    for cfg in csv_configs:
+                        file_name = os.path.basename(cfg.get('file', 'Unknown'))
+                        for mapping in cfg.get('mappings', []):
+                            sensor_name = mapping.get('sensor_name', 'Unnamed')
+                            csv_mapping_combo.addItem(f"{sensor_name} (from {file_name})", sensor_name)
+                    
+                    if csv_mapping_combo.count() == 0:
+                        csv_mapping_combo.addItem("No CSV mappings configured")
+                        csv_mapping_combo.setEnabled(False)
+                    else:
+                        csv_mapping_combo.setEnabled(True)
                 elif device_type == "Other/Virtual Sensor":
                     # First check if we have any sequences with published variables
                     other_sequences = getattr(self.main_window, 'other_sequences', [])
@@ -836,6 +882,15 @@ class SensorController(QObject):
             # Connect the LabJack channel combo box change event
             labjack_channel_combo.currentIndexChanged.connect(on_labjack_channel_changed)
             
+            # Function to update sensor name text field when CSV mapping is selected
+            def on_csv_mapping_changed(index):
+                sensor_name = csv_mapping_combo.currentData()
+                if sensor_name:
+                    sensor_name_edit.setText(sensor_name)
+            
+            # Connect the CSV mapping combo box change event
+            csv_mapping_combo.currentIndexChanged.connect(on_csv_mapping_changed)
+            
             # Automatically refresh Arduino ports if Arduino is connected
             if device_type_combo.currentText() == "Arduino" and hasattr(self.main_window, 'data_collection_controller'):
                 if 'arduino' in self.main_window.data_collection_controller.interfaces and \
@@ -883,8 +938,8 @@ class SensorController(QObject):
             # Function to handle device type change for sensor names
             def update_sensor_name_options(index):
                 device_type = device_type_combo.currentText()
-                if device_type == "LabJack":
-                    # For LabJack, hide the dropdown and enable text field directly
+                if device_type == "LabJack" or device_type == "Read CSV":
+                    # For LabJack and CSV, hide the dropdown and enable text field directly
                     sensor_name_combo.setVisible(False)
                     sensor_name_edit.setVisible(True)
                     sensor_name_edit.setEnabled(True)
@@ -972,8 +1027,8 @@ class SensorController(QObject):
                 device_type = device_type_combo.currentText()
                 
                 # Get the sensor name based on device type
-                if device_type == "LabJack":
-                    # For LabJack, just use the text from the edit field
+                if device_type == "LabJack" or device_type == "Read CSV":
+                    # For LabJack/CSV, just use the text from the edit field
                     name = sensor_name_edit.text()
                 else:
                     # For Arduino, use existing logic
@@ -993,6 +1048,22 @@ class SensorController(QObject):
                         color=selected_color.name(),
                         enabled=True,
                         show_in_graph=show_in_graph.isChecked()
+                    )
+                elif device_type == "Read CSV":
+                    # For CSV, use the selected mapping name as port
+                    port = f"csv_{csv_mapping_combo.currentData()}"
+                    new_sensor = SensorModel(
+                        name=name,
+                        interface_type="CSV",
+                        port=port,
+                        unit=unit_edit.text(),
+                        offset=offset_spinbox.value(),
+                        conversion_factor=1.0,
+                        color=selected_color.name(),
+                        enabled=True,
+                        show_in_graph=show_in_graph.isChecked(),
+                        stale_timeout_factor=3.0, # Set stale factor to 3x sampling interval
+                        averaging_enabled=False
                     )
                 elif device_type == "MQTT":
                     # For MQTT, use the topic input
@@ -2095,6 +2166,18 @@ class SensorController(QObject):
                     # Match by topic (stored in 'port' field) for MQTT
                     # print(f"DEBUG - Topic match found for MQTT sensor {sensor.name} via topic {sensor.port}, value: {data[sensor.port]}")
                     sensor.process_reading(data[sensor.port])
+                elif sensor.interface_type == "CSV":
+                    # Match by prefixed key (stored in 'port' field) or name
+                    target_key = sensor.port
+                    if not target_key:
+                        target_key = f"csv_{sensor.name}"
+                        
+                    if target_key in data:
+                        sensor.process_reading(data[target_key])
+                    elif f"csv_{sensor.name}" in data:
+                        sensor.process_reading(data[f"csv_{sensor.name}"])
+                    elif sensor.name in data:
+                        sensor.process_reading(data[sensor.name])
             
         # Update UI with the new values
         self.update_sensor_values()
@@ -2185,13 +2268,20 @@ class SensorController(QObject):
         for i, sensor in enumerate(self.sensors):
             # Check for staleness
             is_stale = False
+            timeout_val = 2.0
             if hasattr(self.main_window, 'data_collection_controller'):
                 dcc = self.main_window.data_collection_controller
                 hist_key = self.get_historical_buffer_key(sensor)
-                if hist_key and hist_key in dcc._last_sensor_update:
-                    last_ts = dcc._last_sensor_update[hist_key]
-                    timeout = dcc._get_stale_timeout_for_key(hist_key)
-                    if time.time() - last_ts > timeout:
+                if hist_key:
+                    timeout_val = dcc._get_stale_timeout_for_key(hist_key)
+                    if hist_key in dcc._last_sensor_update:
+                        last_ts = dcc._last_sensor_update[hist_key]
+                        if time.time() - last_ts > timeout_val:
+                            is_stale = True
+                    else:
+                        # If we have a current_value but it's not in _last_sensor_update yet,
+                        # it means no data has ever been received for this prefixed key.
+                        # We should treat it as stale/unavailable.
                         is_stale = True
                 
             value_display = ""
@@ -3878,6 +3968,11 @@ class SensorController(QObject):
         elif interface_type == 'mqtt':
             # MQTT uses key pattern "mqtt_{topic}" where topic is stored in 'port'
             result_key = f"mqtt_{getattr(sensor, 'port', 'unknown')}"
+        elif interface_type == 'csv':
+            # CSV interface uses the prefixed key stored in the port field
+            result_key = getattr(sensor, 'port', None)
+            if not result_key:
+                result_key = f"csv_{getattr(sensor, 'name', 'unknown')}"
         # result_key = f"unknown_{getattr(sensor, 'name', 'unknown')}"
             
         # print(f"DEBUG: get_historical_buffer_key for {getattr(sensor, 'name', 'unknown')} (type: {interface_type}) => {result_key}")

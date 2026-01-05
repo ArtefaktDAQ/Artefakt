@@ -1258,6 +1258,13 @@ class ProjectController(QObject):
             self.main_window.config["last_run"] = run_name
             self.main_window.save_config()
         
+        # Load sensor configuration from the run directory
+        self.load_sensors_from_run(run_dir)
+
+        # Load CSV configuration from the run directory if it exists
+        if hasattr(self.main_window, 'load_virtual_sensors'):
+            self.main_window.load_virtual_sensors()
+
         # Update sidebar status
         self.main_window.sidebar_project_name.setText(project_name)
         self.main_window.sidebar_test_series.setText(series_name)
@@ -2001,6 +2008,10 @@ class ProjectController(QObject):
         
         # Save current sensor configuration to the run directory
         self.save_sensors_to_run(run_dir)
+        
+        # Save current CSV and virtual sensor configuration to the run directory
+        if hasattr(self.main_window, 'save_virtual_sensors'):
+             self.main_window.save_virtual_sensors()
         
         # Update Automation Controller with the new run path (copying sequences if needed)
         if hasattr(self.main_window, 'automation_controller'):

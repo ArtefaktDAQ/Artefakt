@@ -1,6 +1,10 @@
 # Changelog
 
-# Changelog
+## Version 0.3.1-beta - 2026-01-05
+
+### Changes:
+- **Addition of CSV as a sensor source**: Allows importing external data as sensor signals.
+- **Upgraded NDI functions**: Enhanced Network Device Interface support for better video streaming and discovery.
 
 ## Version 0.3 - 2026-01-03
 

@@ -578,9 +578,9 @@ DIAGNOSTICS_HELP = {
     "title": "Hardware Diagnostics Guide",
     "sections": [
         {
-            "title": "Device Status Cards",
+            "title": "Interface Status Cards",
             "icon": "📟",
-            "content": """Each card shows the connection status of a device type:
+            "content": """Each card shows the connection status of an interface type:
 
 ARDUINO
 • Shows COM port and baud rate
@@ -597,7 +597,7 @@ CAMERA
 • Current FPS (frames per second)
 • Backend in use
 
-Click "Test Connection" on any card to verify the device is responding and see current readings."""
+Click "Test Connection" on any card to verify the interface is responding and see current readings."""
         },
         {
             "title": "Serial Ports Table",
@@ -970,7 +970,7 @@ COMMON USES:
 • Process control (machinery sounds)"""
         },
         {
-            "title": "Device & Basic Settings",
+            "title": "Interface & Basic Settings",
             "icon": "⚙️",
             "content": """AUDIO DEVICE SELECTION:
 • Choose your microphone or audio input
@@ -1103,10 +1103,11 @@ SENSORS_HELP = {
             "content": """SENSORS TAB OVERVIEW:
 This tab lets you configure and manage all your data acquisition sensors.
 
-DEVICE CARDS (TOP):
-Click on any device card to open its configuration:
+INTERFACE CARDS (TOP):
+Click on any interface card to open its configuration:
 • Arduino - USB serial sensors
 • LabJack - High-precision DAQ
+• Read CSV - External CSV file monitoring
 • Optical Sensor - Camera-based measurements
 • Audio Sensor - Microphone input
 • MQTT - IoT and network sensors
@@ -1121,17 +1122,17 @@ Shows all configured sensors with their current values and settings."""
             "icon": "➕",
             "content": """TO ADD A NEW SENSOR:
 
-1️⃣ CLICK DEVICE CARD
-Click the appropriate device card (Arduino, LabJack, etc.) to open its settings.
+1️⃣ CLICK INTERFACE CARD
+Click the appropriate interface card (Arduino, LabJack, CSV, etc.) to open its settings.
 
 2️⃣ CONFIGURE CONNECTION
-Set up the connection parameters (COM port, baud rate, etc.).
+Set up the connection parameters (COM port, baud rate, file path, etc.).
 
 3️⃣ ADD SENSOR
-Click "Add Sensor" button and configure:
+Click "Add Sensor" or "Add Mapping" button and configure:
 • Name: Descriptive sensor name
-• Interface: Which device it connects to
-• Channel/Index: Which input to read
+• Interface: Which interface it connects to
+• Channel/Index/Column: Which input to read
 • Unit: Measurement unit (°C, Pa, etc.)
 
 4️⃣ ENABLE GRAPH
@@ -1151,7 +1152,7 @@ VALUE:
 Current reading with units
 
 INTERFACE:
-Which device the sensor is connected to
+Which interface the sensor is connected to
 
 OFFSET/UNIT:
 Calibration offset and measurement unit
@@ -1183,7 +1184,7 @@ When to use:
 
 Note: Smoothing applies a rolling average over the last 10 values. The checkbox is per-sensor, so you can smooth some sensors while keeping others raw.
 
-IMPORTANT - Device-Specific Behavior:
+IMPORTANT - Interface-Specific Behavior:
 • LABJACK: Can be configured with a higher internal sampling rate in device settings. When enabled, smoothing uses samples from this higher-rate collection, providing immediate, responsive data with noise reduction. The smoothing window uses the last 10 samples regardless of sampling rate.
 • ARDUINO: Runs at the global sampling rate (no higher internal rate). Smoothing will use a rolling average of the last 10 values, which may introduce some delay depending on sampling rate. For immediate readings, disable smoothing on Arduino sensors.
 
@@ -1194,7 +1195,7 @@ CAL. (CALIBRATE):
 Click to open calibration wizard"""
         },
         {
-            "title": "Device Types",
+            "title": "Interface Types",
             "icon": "🔌",
             "content": """ARDUINO:
 • USB serial connection
@@ -1207,6 +1208,17 @@ LABJACK:
 • High precision measurements
 • Multiple analog inputs
 • Digital I/O support
+
+READ CSV:
+• Monitor external data files in real-time
+• Reads the newest values automatically
+• Supports column mapping and regex extraction
+• Use for devices that log to local files
+
+Example Regex:
+• ([-+]?[0-9.]+) : Extracts numbers like "-12.5"
+• ([-+]?\\d*\\.\\d+|\\d+) : More robust number extraction
+• Value:\\s*([-+]?[0-9.]+) : Matches "Value: 25.4" and extracts 25.4
 
 OPTICAL SENSOR:
 • Camera-based measurement
@@ -1324,7 +1336,7 @@ Set when the step should activate:
 
 4️⃣ CONFIGURE ACTIONS
 Define what happens when triggered:
-• Device commands
+• Interface commands
 • Camera operations
 • System notifications
 
@@ -1458,6 +1470,54 @@ TIPS:
 }
 
 
+CAMERA_HELP = {
+    "title": "Camera & Video Help",
+    "sections": [
+        {
+            "title": "NDI® Integration",
+            "icon": "🌐",
+            "content": """NDI (Network Device Interface) allows you to send and receive high-quality video over your local network.
+
+NDI INPUT (Receive):
+• Discovered NDI sources appear in the "Camera" dropdown prefixed with "NDI:".
+• Select an NDI source and click "Connect" to use a remote camera or OBS stream as your video source.
+• Overlays and motion detection work exactly like local USB cameras.
+
+NDI OUTPUT (Send):
+• Enable "NDI Output Settings" in the Camera settings popup.
+• This broadcasts your current camera feed (with or without overlays) to the network.
+• Professional software like OBS or vMix can pick up this feed instantly.
+
+REQUIREMENTS:
+• Ensure the NDI SDK is installed on your system.
+• All devices must be on the same local network.
+• Check your firewall settings if sources do not appear."""
+        },
+        {
+            "title": "Recording & Overlays",
+            "icon": "⏺️",
+            "content": """RECORDING:
+• Use the "Start Recording" button to save video.
+• Recordings include all active overlays (sensor data, timestamps).
+• Select between direct streaming (FFmpeg) or buffered recording in settings.
+
+OVERLAYS:
+• Right-click on the video feed to add text, sensor values, or motion boxes.
+• Drag overlays to reposition them.
+• Overlays are burned into the video during recording."""
+        },
+        {
+            "title": "Motion Detection",
+            "icon": "🔍",
+            "content": """AUTOMATION TRIGGERS:
+• Enable motion detection to trigger automation sequences.
+• Adjust sensitivity and minimum area to filter out noise.
+• Motion events are logged and can be used as start/stop triggers for data collection."""
+        }
+    ]
+}
+
+
 def get_help_content(tool_name: str) -> dict:
     """Get help content for a specific tool"""
     help_map = {
@@ -1470,6 +1530,7 @@ def get_help_content(tool_name: str) -> dict:
         "audio_sensor": AUDIO_SENSOR_HELP,
         "automation": AUTOMATION_HELP,
         "sensors": SENSORS_HELP,
+        "camera": CAMERA_HELP,
     }
     return help_map.get(tool_name, {"title": "Help", "sections": []})
 

@@ -101,6 +101,8 @@ class DashMetricCard(QFrame):
 
     def update_value(self, value):
         if value is None:
+            self.value_label.setText("---")
+            self.trend_label.setText("")
             return
             
         try:
@@ -1135,8 +1137,8 @@ def setup_ui(self):
     
     # Left side - Camera settings (Tabbed Interface)
     camera_settings_container = QWidget()
-    camera_settings_container.setMinimumWidth(320)
-    camera_settings_container.setMaximumWidth(400)
+    camera_settings_container.setMinimumWidth(380) # Increased from 320
+    camera_settings_container.setMaximumWidth(500) # Increased from 400
     camera_settings_main_layout = QVBoxLayout(camera_settings_container)
     camera_settings_main_layout.setContentsMargins(0, 0, 5, 0)
     camera_settings_main_layout.setSpacing(0)
@@ -1152,13 +1154,24 @@ def setup_ui(self):
     source_layout.setContentsMargins(10, 15, 10, 10)
     source_layout.setSpacing(12)
     
-    # Advanced settings button moved to top of source tab
+    # Help and Settings button at the top
+    top_buttons_layout = QHBoxLayout()
+    
     self.camera_settings_btn = QPushButton("⚙️ Advanced Settings")
-    self.camera_settings_btn.setFixedHeight(38)
-    self.camera_settings_btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
+    self.camera_settings_btn.setFixedHeight(32)
+    self.camera_settings_btn.setStyleSheet(ButtonStyles.get("secondary", "small"))
     self.camera_settings_btn.setFont(Typography.button())
     self.camera_settings_btn.clicked.connect(self.show_camera_settings_popup)
-    source_layout.addWidget(self.camera_settings_btn)
+    top_buttons_layout.addWidget(self.camera_settings_btn, 1)
+    
+    self.camera_help_btn = QPushButton("❓ Help")
+    self.camera_help_btn.setCheckable(True)
+    self.camera_help_btn.setFixedHeight(32)
+    self.camera_help_btn.setFixedWidth(70)
+    self.camera_help_btn.setStyleSheet(ButtonStyles.get("secondary", "small"))
+    top_buttons_layout.addWidget(self.camera_help_btn)
+    
+    source_layout.addLayout(top_buttons_layout)
     
     # Camera connection settings - modernized
     camera_connection_group = QGroupBox("📹 Camera Connection")
@@ -1171,33 +1184,55 @@ def setup_ui(self):
     self.camera_connection_group = camera_connection_group
     
     # Camera selection
-    camera_connection_layout.addWidget(QLabel("Camera:"), 0, 0)
-    self.camera_id = QComboBox()
-    self.camera_id.addItems(["0", "1", "2", "3"])
-    self.camera_id.setStyleSheet(InputStyles.default())
-    camera_connection_layout.addWidget(self.camera_id, 0, 1)
+    camera_connection_layout.addWidget(QLabel("Mode:"), 0, 0)
+    self.camera_mode = QComboBox()
+    self.camera_mode.addItems(["Local Camera", "NDI Source"])
+    self.camera_mode.setStyleSheet(InputStyles.default())
+    camera_connection_layout.addWidget(self.camera_mode, 0, 1, 1, 2)
+    
+    camera_connection_layout.addWidget(QLabel("Source:"), 1, 0)
+    source_row_layout = QHBoxLayout()
+    # Use a very unique name to avoid any shadowing
+    self.camera_source_combo = QComboBox() 
+    self.camera_id = self.camera_source_combo # Compatibility
+    self.camera_id_dropdown = self.camera_source_combo # Compatibility
+    self.camera_source_combo.setObjectName("camera_source_dropdown_widget")
+    
+    print(f"UI_SETUP: Created camera_source_combo (id={id(self.camera_source_combo)})")
+    print(f"UI_SETUP: Assigned to self.camera_id (id={id(self.camera_id)})")
+    
+    self.camera_source_combo.setStyleSheet(InputStyles.default())
+    self.camera_source_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    source_row_layout.addWidget(self.camera_source_combo)
+    
+    self.camera_refresh_btn = QPushButton("🔄")
+    self.camera_refresh_btn.setFixedSize(30, 28)
+    self.camera_refresh_btn.setToolTip("Refresh camera list")
+    self.camera_refresh_btn.setStyleSheet(ButtonStyles.get("secondary", "small"))
+    source_row_layout.addWidget(self.camera_refresh_btn)
+    camera_connection_layout.addLayout(source_row_layout, 1, 1)
     
     # Connect button
     self.camera_connect_btn = QPushButton("Connect")
     self.camera_connect_btn.setFixedSize(85, 28)
     self.camera_connect_btn.setStyleSheet(ButtonStyles.success("small"))
-    camera_connection_layout.addWidget(self.camera_connect_btn, 0, 2)
+    camera_connection_layout.addWidget(self.camera_connect_btn, 1, 2)
 
     # FPS Display
     fps_label = QLabel("Frame Rate:")
     fps_label.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY};")
-    camera_connection_layout.addWidget(fps_label, 1, 0)
+    camera_connection_layout.addWidget(fps_label, 2, 0)
     
     self.camera_fps_display = QLabel("0.0 / 0.0 FPS")
     self.camera_fps_display.setStyleSheet(f"color: {COLORS.PRIMARY_LIGHT}; font-weight: bold;")
     self.camera_fps_display.setToolTip("Actual FPS / Target FPS")
-    camera_connection_layout.addWidget(self.camera_fps_display, 1, 1, 1, 2)
+    camera_connection_layout.addWidget(self.camera_fps_display, 2, 1, 1, 2)
     
     # Sync Note
     sync_note = QLabel("Note: If actual FPS is lower than target, frames are duplicated to maintain sync with sensor data.")
     sync_note.setWordWrap(True)
     sync_note.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 10px; font-style: italic;")
-    camera_connection_layout.addWidget(sync_note, 2, 0, 1, 3)
+    camera_connection_layout.addWidget(sync_note, 3, 0, 1, 3)
     
     # Add camera connection group to source layout
     source_layout.addWidget(camera_connection_group)
@@ -1579,8 +1614,46 @@ def setup_ui(self):
     # Add camera view container to the splitter
     camera_splitter.addWidget(camera_view_container)
     
+    # Right side: Help panel (import HelpPanel and get_help_content)
+    from app.ui.tools.help_panel import HelpPanel, get_help_content
+    
+    # Create a container for the help panel to match height
+    self.camera_help_container = QWidget()
+    self.camera_help_container.setVisible(False)
+    self.camera_help_container.setFixedWidth(320)
+    camera_help_container_layout = QVBoxLayout(self.camera_help_container)
+    camera_help_container_layout.setContentsMargins(5, 0, 0, 0)
+    
+    self.camera_help_panel = HelpPanel("Camera & NDI Help")
+    camera_help_container_layout.addWidget(self.camera_help_panel)
+    
+    # Load camera help content
+    camera_help_content = get_help_content("camera")
+    self.camera_help_panel.clear_sections()
+    for section in camera_help_content.get("sections", []):
+        self.camera_help_panel.add_section(
+            section.get("title", ""),
+            section.get("content", ""),
+            section.get("icon", "📖")
+        )
+    # Expand first section by default
+    if self.camera_help_panel.sections:
+        self.camera_help_panel.sections[0].expand()
+    
+    # Add help container to the splitter
+    camera_splitter.addWidget(self.camera_help_container)
+    
+    # Connect help button and panel close
+    def toggle_camera_help():
+        is_visible = not self.camera_help_container.isVisible()
+        self.camera_help_container.setVisible(is_visible)
+        self.camera_help_btn.setChecked(is_visible)
+    
+    self.camera_help_btn.clicked.connect(toggle_camera_help)
+    self.camera_help_panel.close_requested.connect(toggle_camera_help)
+    
     # Set initial sizes for the splitter (30% for settings, 70% for camera view)
-    camera_splitter.setSizes([300, 700])
+    camera_splitter.setSizes([300, 700, 0])
     
     # Add camera tab to stacked widget
     self.stacked_widget.addWidget(camera_tab)
@@ -1681,7 +1754,7 @@ def setup_ui(self):
     sensors_content_layout.setSpacing(12)
     
     # Device cards section with proper styling (matching automation tab)
-    devices_section = QGroupBox("Devices")
+    devices_section = QGroupBox("Interfaces")
     devices_section.setStyleSheet(GroupBoxStyles.elevated())
     devices_section_layout = QVBoxLayout(devices_section)
     devices_section_layout.setContentsMargins(12, 10, 12, 12)
@@ -1745,6 +1818,15 @@ def setup_ui(self):
     mqtt_layout.setContentsMargins(6, 6, 6, 6)
     mqtt_layout.setSpacing(2)
 
+    # CSV Data container
+    csv_container = QFrame()
+    csv_container.setFixedSize(card_width, card_height)
+    csv_container.setStyleSheet(device_card_style)
+    csv_container.setCursor(Qt.CursorShape.PointingHandCursor)
+    csv_layout = QVBoxLayout(csv_container)
+    csv_layout.setContentsMargins(6, 6, 6, 6)
+    csv_layout.setSpacing(2)
+
     # Other sensors container (last position)
     other_container = QFrame()
     other_container.setFixedSize(card_width, card_height)
@@ -1758,6 +1840,7 @@ def setup_ui(self):
     devices_cards_layout.addWidget(arduino_container)
     devices_cards_layout.addWidget(labjack_container)
     devices_cards_layout.addWidget(other_container)
+    devices_cards_layout.addWidget(csv_container)
     devices_cards_layout.addWidget(optical_container)
     devices_cards_layout.addWidget(audio_container)
     devices_cards_layout.addWidget(mqtt_container)
@@ -1900,6 +1983,24 @@ def setup_ui(self):
     self.mqtt_status.setObjectName("mqtt_status_label")
     mqtt_layout.addWidget(self.mqtt_status)
 
+    # CSV Data content
+    csv_icon = QLabel("📄")
+    csv_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    csv_icon.setFixedHeight(30)
+    csv_icon.setStyleSheet(card_icon_style)
+    csv_layout.addWidget(csv_icon)
+    
+    csv_label = QLabel("Read CSV")
+    csv_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    csv_label.setStyleSheet(card_label_style)
+    csv_layout.addWidget(csv_label)
+
+    self.csv_status = QLabel("Not configured")
+    self.csv_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    self.csv_status.setStyleSheet(card_status_style)
+    self.csv_status.setObjectName("csv_status_label")
+    csv_layout.addWidget(self.csv_status)
+
     # Other sensors content (last position) - use image if available
     other_icon = QLabel()
     other_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1931,6 +2032,7 @@ def setup_ui(self):
     labjack_container.mousePressEvent = lambda event: self.show_labjack_settings_popup()
     other_container.mousePressEvent = lambda event: self.show_other_settings_popup()
     mqtt_container.mousePressEvent = lambda event: self.show_mqtt_settings_popup()
+    csv_container.mousePressEvent = lambda event: self.show_csv_settings_popup()
     optical_container.mousePressEvent = lambda event: self.show_optical_sensor_popup()
     audio_container.mousePressEvent = lambda event: self.show_audio_sensor_popup()
     

@@ -18,6 +18,7 @@ from app.utils.power_management import PowerManagement
 
 from app.core.interfaces.arduino_master_slave import ArduinoMasterSlaveThread
 from app.core.interfaces.other_serial_interface import OtherSerialThread, SerialSequence, SendCommandStep, WaitStep, ReadResponseStep, ParseValueStep, PublishValueStep
+from app.core.interfaces.csv_interface import CSVThread
 from app.core.interfaces.labjack_data_thread import LabJackDataThread
 from app.core.interfaces.mqtt_thread import MQTTDataThread
 
@@ -149,6 +150,10 @@ class DataCollectionController(QObject):
         self.mqtt_thread.data_received_signal.connect(self.handle_mqtt_data)
         self.mqtt_thread.connection_status_signal.connect(self.handle_mqtt_status)
         self.mqtt_thread.error_signal.connect(self.handle_mqtt_error)
+        
+        # Setup CSV interface
+        self.csv_thread = CSVThread()
+        self.csv_thread.data_received_signal.connect(self.handle_csv_data)
         
         # Create a timer for combined data emission
         # Use PreciseTimer to allow intervals below 500ms (CoarseTimer minimum on Windows)
@@ -865,6 +870,26 @@ class DataCollectionController(QObject):
             self.log(f"Error disconnecting from MQTT: {e}", "ERROR")
             return False
 
+    def update_csv_interfaces(self, configs):
+        """Update CSV interface configurations and restart thread if needed."""
+        # print(f"DEBUG: update_csv_interfaces called with {len(configs)} configs")
+        try:
+            self.csv_thread.stop()
+            self.csv_thread.set_configs(configs)
+            if configs and any(c.get('enabled', True) for c in configs):
+                # print("DEBUG: Starting CSVThread")
+                self.csv_thread.start()
+                self.log(f"Started CSV data monitoring for {len(configs)} files")
+                return True
+            else:
+                # print("DEBUG: No enabled CSV configs, thread NOT started")
+                self.log("Stopped all CSV data monitoring")
+                return True
+        except Exception as e:
+            # print(f"DEBUG: Error in update_csv_interfaces: {e}")
+            self.log(f"Error updating CSV interfaces: {e}", "ERROR")
+            return False
+
     def disconnect_all_interfaces(self):
         """Disconnect from all hardware interfaces"""
         print("DEBUG: disconnect_all_interfaces called")
@@ -872,6 +897,8 @@ class DataCollectionController(QObject):
         self.disconnect_other_serial()
         self.disconnect_labjack()
         self.disconnect_mqtt()
+        if hasattr(self, 'csv_thread'):
+            self.csv_thread.stop()
         self.log("Disconnected all interfaces.")
         
     def start_data_collection(self, run_dir):
@@ -1040,6 +1067,16 @@ class DataCollectionController(QObject):
                 else:
                     self.labjack_thread.monitoring_only = False
                     self.log("LabJack thread switched from monitoring to full data collection")
+            
+            # --- Ensure CSV monitoring thread is running ---
+            if hasattr(self, 'csv_thread') and not self.csv_thread.isRunning():
+                # Check if there are any enabled CSV configs
+                configs = getattr(self.main_window, 'csv_configs', [])
+                if configs and any(c.get('enabled', True) for c in configs):
+                    self.log("Restarting CSV thread for data collection.")
+                    self.csv_thread.set_configs(configs)
+                    self.csv_thread.start()
+            # -----------------------------------------------
 
             # MQTT Support
             if 'mqtt' in self.interfaces and self.interfaces['mqtt']['connected']:
@@ -1226,6 +1263,50 @@ class DataCollectionController(QObject):
         # Process the data through SensorController for UI updates
         if self.main_window and hasattr(self.main_window, 'sensor_controller'):
             self.main_window.sensor_controller.update_sensor_data(data)
+
+    def handle_csv_data(self, data):
+        """Handle data received from CSV thread."""
+        if not data: return
+        
+        # Discard data for storage if collection is not active, but allow monitoring for UI updates
+        store_data = self.collecting_data
+        
+        # Ensure timestamp exists
+        if 'timestamp' not in data:
+            data['timestamp'] = time.time()
+        sample_ts = data['timestamp']
+
+        with QMutexLocker(self.combined_data_mutex):
+            for sensor_name, value in data.items():
+                if sensor_name == 'timestamp':
+                    continue
+                
+                # Prefix CSV keys to avoid collisions
+                key = f"csv_{sensor_name}"
+                self.combined_data[key] = value
+                self._last_sensor_update[key] = sample_ts
+                
+                # Add to historical buffer if collecting
+                if store_data:
+                    with QMutexLocker(self.historical_buffer_mutex):
+                        try:
+                            float_value = float(value)
+                            self.historical_buffer[key].append((sample_ts, float_value))
+                        except (ValueError, TypeError):
+                            pass
+            
+            if store_data:
+                self.combined_data['csv_timestamp'] = sample_ts
+                if 'timestamp' not in self.combined_data or sample_ts > self.combined_data['timestamp']:
+                    self.combined_data['timestamp'] = sample_ts
+        
+        # Emit signal with prefixed keys so SensorController/etc can find it
+        prefixed_data = {f"csv_{k}" if k != 'timestamp' else k: v for k, v in data.items()}
+        self.data_received_signal.emit(prefixed_data)
+
+        # Process the data through SensorController for UI updates
+        if self.main_window and hasattr(self.main_window, 'sensor_controller'):
+            self.main_window.sensor_controller.update_sensor_data(prefixed_data)
 
     def handle_mqtt_status(self, is_connected, message):
         """Handle MQTT connection status updates"""
@@ -1931,6 +2012,8 @@ class DataCollectionController(QObject):
             return prefixed_key[len("audio_"):]
         if prefixed_key.startswith("optical_"):
             return prefixed_key[len("optical_"):]
+        if prefixed_key.startswith("csv_"):
+            return prefixed_key[len("csv_"):]
         return None
 
     def _get_sensor_for_prefixed_key(self, prefixed_key):
@@ -1964,6 +2047,9 @@ class DataCollectionController(QObject):
         elif prefixed_key.startswith('optical_'):
             iface = "OpticalSensor"
             base_key = prefixed_key[len('optical_'):]
+        elif prefixed_key.startswith('csv_'):
+            iface = "CSV"
+            base_key = prefixed_key[len('csv_'):]
 
         found_sensor = None
         for sensor in sc.sensors:
@@ -2804,10 +2890,12 @@ class DataCollectionController(QObject):
                 
                 # Process sliding window buffer
                 # Handle both old format (dict) and new format (deque) for compatibility
+                new_data_present = False
                 if isinstance(buf, dict):
                     # Old format - convert to deque and calculate average
                     if buf.get('count', 0) > 0:
                         avg_value = buf['sum'] / buf['count']
+                        new_data_present = True
                         # Convert to deque format
                         window_size = self._averaging_window_size if self._averaging_window_size is not None else 10
                         self.averaging_buffers[prefixed_key] = collections.deque(maxlen=window_size)
@@ -2822,6 +2910,7 @@ class DataCollectionController(QObject):
                     if len(buf) > 0:
                         # Calculate average from all values in the sliding window
                         avg_value = sum(buf) / len(buf)
+                        new_data_present = True
                     else:
                         # No data in window yet - use last known value or skip
                         if target_key in self.combined_data:
@@ -2834,12 +2923,20 @@ class DataCollectionController(QObject):
                 
                 # Update combined data for CSV/emission (use target_key)
                 self.combined_data[target_key] = avg_value
-                self._last_sensor_update[target_key] = current_emit_time
+                
+                # ONLY update the last seen timestamp if new data actually arrived in this window.
+                # If we are just repeating the last value from combined_data, we should let
+                # the sensor become stale if the source interface stopped sending data.
+                if new_data_present:
+                    self._last_sensor_update[target_key] = current_emit_time
                 
                 # Store in historical buffer (with target key) if collecting
                 if self.collecting_data:
                     self.historical_buffer_mutex.lock()
                     try:
+                        # For historical buffer, we still want to store the "repeated" value 
+                        # to keep the CSV rows aligned, UNLESS the sensor is already stale.
+                        # But staleness check is handled separately.
                         self.historical_buffer[target_key].append((current_emit_time, avg_value))
                     finally:
                         self.historical_buffer_mutex.unlock()
@@ -2878,11 +2975,12 @@ class DataCollectionController(QObject):
                            if k.startswith('labjack_') and not k.endswith('_timestamp')]
             other_serial_keys = [k for k in combined_data_copy.keys() if k.startswith('other_serial_') and not k.endswith('_timestamp')]
             audio_keys = [k for k in combined_data_copy.keys() if k.startswith('audio_') and not k.endswith('_timestamp')]
+            csv_keys = [k for k in combined_data_copy.keys() if k.startswith('csv_') and not k.endswith('_timestamp')]
             # print(f"DEBUG: Arduino data keys: {arduino_keys}") # <<< COMMENTED OUT
             # print(f"DEBUG: LabJack data keys: {labjack_keys}") # <<< COMMENTED OUT
             # print(f"DEBUG: OtherSerial data keys: {other_serial_keys}") # <<< COMMENTED OUT
             
-            keys_to_unprefix = arduino_keys + labjack_keys + other_serial_keys + audio_keys
+            keys_to_unprefix = arduino_keys + labjack_keys + other_serial_keys + audio_keys + csv_keys
             for prefixed_key in keys_to_unprefix:
                 unprefixed_key = None
                 if prefixed_key.startswith('arduino_'):
@@ -2893,6 +2991,8 @@ class DataCollectionController(QObject):
                     unprefixed_key = prefixed_key[len('other_serial_'):]
                 elif prefixed_key.startswith('audio_'):
                     unprefixed_key = prefixed_key[len('audio_'):]
+                elif prefixed_key.startswith('csv_'):
+                    unprefixed_key = prefixed_key[len('csv_'):]
                     
                 if unprefixed_key and unprefixed_key not in combined_data_copy:
                      if prefixed_key in combined_data_copy: 

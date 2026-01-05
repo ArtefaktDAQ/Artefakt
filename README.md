@@ -1,6 +1,6 @@
 # Artefakt DAQ
 
-A comprehensive Data Acquisition (DAQ) system built with Python and PyQt6, designed for scientific and industrial data collection applications.
+A comprehensive Data Acquisition (DAQ) system built with Python and PyQt6.
 
 ## Features
 

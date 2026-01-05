@@ -21,6 +21,8 @@ from .motion_detector import MotionDetector
 from .overlay_manager import BaseOverlay
 from threading import Thread
 
+# NDI imports are now handled inside methods to avoid driver lock/conflicts
+
 try:
     import sounddevice as sd
     SOUNDDEVICE_AVAILABLE = True
@@ -85,6 +87,9 @@ class DirectCameraThread(QThread):
         self.height = 720
         self.fps = 30
         self.cap = None
+        self.ndi_receiver = None
+        self.is_ndi = False
+        self.ndi_source_obj = None # Store the actual NDI source object
         self.running = False
         self.connected = False
         
@@ -183,17 +188,33 @@ class DirectCameraThread(QThread):
             return False
     
     def connect(self, camera_id, resolution, fps):
-        """Connect to the camera"""
+        """Setup connection parameters and start background thread for asynchronous connection."""
         try:
             # Check if already connected
             if self.connected:
                 print("Camera is already connected")
                 return True
                 
-            print(f"Attempting to connect to camera {camera_id} with resolution {resolution} at {fps} FPS")
+            print(f"Queueing connection to camera {camera_id} with resolution {resolution} at {fps} FPS")
             
-            # Parse settings
-            self.camera_id = int(camera_id)
+            # Parse and store settings for the background thread
+            # Handle NDI source which might be a special string or object
+            self.is_ndi = False
+            self.ndi_source_obj = None
+            
+            if isinstance(camera_id, str) and camera_id.startswith("NDI:"):
+                self.is_ndi = True
+                self.camera_id = camera_id
+            elif hasattr(camera_id, 'ndi_name'): # It's likely an NDI Source object
+                self.is_ndi = True
+                self.camera_id = getattr(camera_id, 'ndi_name', str(camera_id))
+                self.ndi_source_obj = camera_id
+            else:
+                try:
+                    self.camera_id = int(camera_id)
+                except (ValueError, TypeError):
+                    self.camera_id = 0
+            
             self.fps = int(fps)
             if isinstance(resolution, str) and 'x' in resolution:
                 self.width, self.height = map(int, resolution.split('x'))
@@ -201,43 +222,196 @@ class DirectCameraThread(QThread):
                 # Default resolution
                 self.width, self.height = 1280, 720
             
-            print(f"Parsed settings: width={self.width}, height={self.height}, fps={self.fps}")
+            # Start the thread - connection will be handled in _perform_connection called by run()
+            self.running = True
+            self.start()
             
-            # Make sure any existing camera is released
+            return True
+            
+        except Exception as e:
+            error_msg = f"Error preparing camera connection: {str(e)}"
+            print(error_msg)
+            self.status_update.emit(False, error_msg)
+            return False
+
+    def _perform_connection(self):
+        """Internal method to perform the actual camera connection (runs in background thread)."""
+        # Import inside method to avoid global/local conflicts
+        from .interfaces.ndi_interface import NDI_AVAILABLE, NDISourceFinder, NDIReceiver
+        
+        try:
+            print(f"Attempting to connect to camera {self.camera_id} ({self.width}x{self.height}@{self.fps}fps) in background...")
+            
+            # Make sure any existing camera or NDI receiver is released
             if self.cap:
                 print("Releasing existing camera connection")
                 self.cap.release()
                 self.cap = None
-            
+            if self.ndi_receiver:
+                print("Releasing existing NDI connection")
+                self.ndi_receiver.disconnect()
+                self.ndi_receiver = None
+
+            # --- NDI CONNECTION PATH ---
+            if self.is_ndi:
+                if not NDI_AVAILABLE:
+                    error_msg = "NDI libraries not available for reception"
+                    print(error_msg)
+                    self.status_update.emit(False, error_msg)
+                    return False
+                
+                print(f"Connecting to NDI source: {self.camera_id}")
+                self.ndi_receiver = NDIReceiver()
+                
+                # If we have the actual object, use it, otherwise we'd need a way to find it by name
+                # For now, let's assume we have the object or will handle name lookup in controller
+                if self.ndi_source_obj:
+                    if self.ndi_receiver.connect(self.ndi_source_obj):
+                        self.connected = True
+                        
+                        # Try to get initial resolution
+                        print("NDI connected, attempting to get initial resolution...")
+                        initial_frame = self.ndi_receiver.capture_frame(timeout_ms=1000)
+                        if initial_frame is not None:
+                            f_h, f_w = initial_frame.shape[:2]
+                            if f_w > 0 and f_h > 0:
+                                self.width = f_w
+                                self.height = f_h
+                                print(f"Initial NDI resolution: {self.width}x{self.height}")
+                        
+                        success_msg = f"Connected to NDI source: {self.camera_id}"
+                        print(success_msg)
+                        self.status_update.emit(True, success_msg)
+                        return True
+                    else:
+                        error_msg = f"Failed to connect to NDI source: {self.camera_id}"
+                        print(error_msg)
+                        self.status_update.emit(False, error_msg)
+                        return False
+                else:
+                    # Fallback: try to find by name if only string was provided
+                    finder = NDISourceFinder()
+                    sources = finder.get_sources()
+                    target_source = None
+                    clean_name = self.camera_id.replace("NDI:", "").strip()
+                    
+                    for s in sources:
+                        if getattr(s, 'ndi_name', '') == clean_name or str(s) == clean_name:
+                            target_source = s
+                            break
+                    
+                    if target_source and self.ndi_receiver.connect(target_source):
+                        self.connected = True
+                        
+                        # Try to get initial resolution
+                        print("NDI connected, attempting to get initial resolution...")
+                        initial_frame = self.ndi_receiver.capture_frame(timeout_ms=1000)
+                        if initial_frame is not None:
+                            f_h, f_w = initial_frame.shape[:2]
+                            if f_w > 0 and f_h > 0:
+                                self.width = f_w
+                                self.height = f_h
+                                print(f"Initial NDI resolution: {self.width}x{self.height}")
+                        
+                        success_msg = f"Connected to NDI source: {self.camera_id}"
+                        print(success_msg)
+                        self.status_update.emit(True, success_msg)
+                        return True
+                    else:
+                        error_msg = f"NDI source '{clean_name}' not found on network"
+                        print(error_msg)
+                        self.status_update.emit(False, error_msg)
+                        return False
+
+            # --- STANDARD CAMERA CONNECTION PATH ---
+            # IMPORTANT: Ensure NDI receiver and finder are fully inactive before opening a standard camera
+            # to prevent driver conflicts on Windows.
+            if self.is_ndi:
+                pass # Already handled above
+            else:
+                # If we're going for a normal camera, we need to be VERY aggressive about cleaning up NDI
+                if self.ndi_receiver:
+                    print("Destroying NDI receiver before opening standard camera...")
+                    try:
+                        self.ndi_receiver.disconnect()
+                        self.ndi_receiver = None
+                    except: pass
+                
+                # Check if NDI discovery is active and try to suppress it
+                if NDI_AVAILABLE:
+                    print("NDI available, ensuring discovery is suppressed for webcam...")
+                    # We can't easily kill the finder from here if it's in the controller,
+                    # but we can try to set the env var just in case
+                    os.environ["NDI_SKIP_LOCAL_SOURCES"] = "1"
+
             # Try to connect using different backends
             import platform
+            backends = []
             if platform.system() == 'Windows':
                 print("Windows system detected, trying different camera backends...")
-                # Try DirectShow first
-                print("Attempting DirectShow backend...")
-                self.cap = cv2.VideoCapture(self.camera_id, cv2.CAP_DSHOW)
-                if not self.cap.isOpened():
-                    print("DirectShow failed, trying Media Foundation...")
-                    # Try Media Foundation
-                    self.cap = cv2.VideoCapture(self.camera_id, cv2.CAP_MSMF)
-                if not self.cap.isOpened():
-                    print("Media Foundation failed, trying default...")
-                    # Try default
-                    self.cap = cv2.VideoCapture(self.camera_id)
+                # Try Media Foundation first as it's modern and less likely to conflict with NDI's DSHOW hooks
+                backends = [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]
             else:
-                print("Non-Windows system, using default camera backend")
-                self.cap = cv2.VideoCapture(self.camera_id)
-            
+                backends = [cv2.CAP_ANY]
+
+            self.cap = None
+            for backend in backends:
+                print(f"Attempting camera connection with backend: {backend}...")
+                self.cap = cv2.VideoCapture(self.camera_id, backend)
+                if self.cap and self.cap.isOpened():
+                    # --- WAKE-UP ROUTINE ---
+                    # Some drivers (like C920) can get stuck. Setting a low resolution 
+                    # can sometimes "wake them up".
+                    self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+                    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+                    time.sleep(0.2)
+                    
+                    # Now set the actual requested resolution
+                    self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                    self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+                    
+                    # Test if we can actually read a frame and it's not all zeros (black)
+                    # We try up to 3 times to give the driver a chance to produce a real frame
+                    for retry in range(3):
+                        ret, frame = self.cap.read()
+                        if ret and frame is not None:
+                            mean_val = np.mean(frame)
+                            std_val = np.std(frame)
+                            
+                            if mean_val > 0.1 or std_val > 0.1: 
+                                print(f"Successfully opened camera with backend {backend} (try {retry+1})")
+                                self.connected = True
+                                break
+                            else:
+                                print(f"Backend {backend} (try {retry+1}) returned black frame. Retrying...")
+                                time.sleep(0.3)
+                        else:
+                            print(f"Backend {backend} (try {retry+1}) read failed. Retrying...")
+                            time.sleep(0.3)
+                    
+                    if self.connected:
+                        break
+                    else:
+                        print(f"Backend {backend} failed black frame test. Releasing...")
+                        self.cap.release()
+                        self.cap = None
+                time.sleep(0.2) # Brief gap between attempts
+
             # Check if camera opened
-            if not self.cap.isOpened():
-                error_msg = f"Failed to open camera {self.camera_id}"
+            if not self.cap or not self.cap.isOpened():
+                error_msg = f"Failed to open camera {self.camera_id}. Returned a black frame or driver lock."
                 print(error_msg)
                 self.status_update.emit(False, error_msg)
-                self.cap.release()
-                self.cap = None
                 return False
             
-            print("Camera opened successfully, setting properties...")
+            print("Camera opened successfully, performing wake-up routine...")
+            # Set resolution to a small value then back to target to "wake up" the driver
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            time.sleep(0.1)
+            
+            print("Setting target camera properties...")
             
             # Set resolution and FPS
             try:
@@ -265,7 +439,6 @@ class DirectCameraThread(QThread):
                     self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)  # Auto exposure (0.75 is the magic value for auto)
                 
                 # Reduce format compression for faster processing
-                # cv2.CAP_PROP_FOURCC doesn't always work, but we can try
                 try:
                     # Try setting to a faster codec (MJPG) for the camera feed
                     fourcc = cv2.VideoWriter_fourcc(*'MJPG')
@@ -276,7 +449,6 @@ class DirectCameraThread(QThread):
                 print("Camera properties set successfully")
             except Exception as e:
                 print(f"Warning: Could not set camera properties: {str(e)}")
-                print("Continuing with default properties...")
             
             print("Testing frame capture...")
             # Test if we can read a frame
@@ -298,33 +470,21 @@ class DirectCameraThread(QThread):
             
             print(f"Actual camera properties: {actual_width}x{actual_height}@{actual_fps}fps")
             
-            # Update with actual values if they differ significantly or if initial FPS was 0
-            # This ensures self.fps reflects reality, which is important for recording.
+            # Update internal state
             if actual_fps > 0 and abs(actual_fps - self.fps) > 1:
                  print(f"Updating internal FPS from {self.fps} to actual {actual_fps}")
                  self.fps = actual_fps
-            # Use the initially requested FPS if the camera reports 0 or the same value
-            # self.width = int(actual_width) # Keep requested width/height
-            # self.height = int(actual_height)
-            # self.fps = actual_fps # Use actual FPS reported by camera
             
-            # Success
+            # Final success status
             self.connected = True
             success_msg = f"Connected to camera {self.camera_id} ({self.width}x{self.height}@{self.fps:.1f}fps)"
             print(success_msg)
             self.status_update.emit(True, success_msg)
-            
-            print("Starting camera thread...")
-            # Start the thread
-            self.running = True
-            self.start()
-            
             return True
             
         except Exception as e:
-            error_msg = f"Error connecting to camera: {str(e)}"
+            error_msg = f"Error in background camera connection: {str(e)}"
             print(error_msg)
-            print("Full traceback:")
             traceback.print_exc()
             self.status_update.emit(False, error_msg)
             if self.cap:
@@ -358,7 +518,7 @@ class DirectCameraThread(QThread):
                     # Don't use terminate() - it's unsafe and can leave resources in bad state
                     # Instead, just proceed with cleanup. The thread will exit on next loop iteration.
             
-            # Release camera
+            # Release camera or NDI
             if self.cap:
                 print("DirectCameraThread: Releasing camera...")
                 try:
@@ -366,6 +526,14 @@ class DirectCameraThread(QThread):
                 except Exception as release_error:
                     print(f"Error releasing camera: {release_error}")
                 self.cap = None
+            
+            if self.ndi_receiver:
+                print("DirectCameraThread: Releasing NDI receiver...")
+                try:
+                    self.ndi_receiver.disconnect()
+                except Exception as release_error:
+                    print(f"Error releasing NDI: {release_error}")
+                self.ndi_receiver = None
             
             # Emit the final status update
             print("DirectCameraThread: Set connected to False, emitting final status update...")
@@ -390,10 +558,13 @@ class DirectCameraThread(QThread):
             if self.recording:
                 self.stop_recording()
                 
-            # Release camera
+            # Release camera or NDI
             if self.cap:
                 self.cap.release()
                 self.cap = None
+            if self.ndi_receiver:
+                self.ndi_receiver.disconnect()
+                self.ndi_receiver = None
                 
             # Update state
             self.connected = False
@@ -536,11 +707,20 @@ class DirectCameraThread(QThread):
                     print(f"Warning: Could not delete temporary audio file {audio_path}: {e}")
     
     def run(self):
-        """Thread main method - runs when thread.start() is called"""
+        """Thread main method - handles connection then captures frames."""
         try:
             print("Camera thread started")
             # Set thread priority again to ensure it's applied
             self.setPriority(QThread.Priority.HighestPriority)
+            
+            # --- Perform Connection in Background ---
+            # If not yet connected, attempt connection now in this thread
+            if not self.connected:
+                if not self._perform_connection():
+                    print("Background connection failed, exiting camera thread")
+                    self.running = False
+                    return
+            # ----------------------------------------
             
             frame_count = 0
             start_time = time.time()
@@ -548,14 +728,35 @@ class DirectCameraThread(QThread):
             max_errors = 5  # Maximum number of consecutive errors before stopping
             
             # Main capture loop
-            while self.running and self.cap and self.cap.isOpened():
+            while self.running and ( (self.cap and self.cap.isOpened()) or (self.ndi_receiver and self.ndi_receiver.is_connected()) ):
                 try:
                     # Capture frame
-                    ret, frame = self.cap.read()
+                    if self.is_ndi and self.ndi_receiver:
+                        frame = self.ndi_receiver.capture_frame(timeout_ms=100)
+                        ret = frame is not None
+                        
+                        # For NDI, a timeout isn't necessarily a fatal error
+                        if not ret:
+                            # We don't increment error_count for NDI timeouts unless they persist for a long time
+                            # Let's just continue and try again
+                            continue
+                    else:
+                        ret, frame = self.cap.read()
                     
                     if ret and frame is not None:
                         # Reset error count on successful frame capture
                         error_count = 0
+                        
+                        # Sync resolution - especially important for NDI which may not match requested res
+                        f_h, f_w = frame.shape[:2]
+                        if f_w != self.width or f_h != self.height:
+                            if f_w > 0 and f_h > 0:
+                                print(f"Camera resolution changed/mismatch: {self.width}x{self.height} -> {f_w}x{f_h}. Updating...")
+                                self.width = f_w
+                                self.height = f_h
+                                # Note: If recording is active, changing resolution mid-stream will 
+                                # likely corrupt the video file as FFmpeg expects a constant resolution.
+                                # However, NDI sources typically stay constant once connected.
                         
                         # --- Motion Detection --- START
                         motion_detected = self.motion_detector.process_frame(frame)
@@ -623,9 +824,20 @@ class DirectCameraThread(QThread):
                                         # than the target FPS. In this case we skip this frame for the recording
                                         # to maintain correct time synchronization with sensors.
                                         if frames_to_send > 0:
+                                            # Ensure frame is contiguous and in the expected BGR24 format for FFmpeg
+                                            if not frame_with_overlays.flags['C_CONTIGUOUS']:
+                                                frame_with_overlays = np.ascontiguousarray(frame_with_overlays)
+                                            
                                             frame_bytes = frame_with_overlays.tobytes()
-                                            for _ in range(frames_to_send):
-                                                self.ffmpeg_process.stdin.write(frame_bytes)
+                                            
+                                            # Verify byte size matches expectations to prevent video corruption/scrambling
+                                            # (width * height * 3 bytes for bgr24)
+                                            expected_size = self.width * self.height * 3
+                                            if len(frame_bytes) != expected_size:
+                                                print(f"CRITICAL: Frame byte size mismatch! Got {len(frame_bytes)}, expected {expected_size}. Skipping frame to avoid corruption.")
+                                            else:
+                                                for _ in range(frames_to_send):
+                                                    self.ffmpeg_process.stdin.write(frame_bytes)
                                                 
                                 except Exception as write_error:
                                     print(f"Error writing frame to FFmpeg (direct streaming): {str(write_error)}")
@@ -713,8 +925,18 @@ class DirectCameraThread(QThread):
             record_audio: Whether to capture microphone audio
             audio_device_index: Index of the audio device to use (if None, use default)
         """
-        if not self.connected or not self.cap:
-            print("Start recording failed: Camera not connected or capture object invalid.")
+        if not self.connected:
+            print("Start recording failed: Camera not connected.")
+            self.recording_status_signal.emit(False)
+            return False
+            
+        if not self.is_ndi and not self.cap:
+            print("Start recording failed: Standard camera capture object invalid.")
+            self.recording_status_signal.emit(False)
+            return False
+            
+        if self.is_ndi and not self.ndi_receiver:
+            print("Start recording failed: NDI receiver object invalid.")
             self.recording_status_signal.emit(False)
             return False
         
@@ -828,9 +1050,11 @@ class DirectCameraThread(QThread):
     def _start_direct_ffmpeg_streaming(self):
         """Start streaming frames directly to FFmpeg"""
         try:
-            # Get frame dimensions from camera
-            width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            # Use current dimensions which are synced with actual frames in the run() loop.
+            # This is critical for NDI sources where the actual resolution may not match 
+            # the requested resolution.
+            width = self.width
+            height = self.height
             fps = self.fps
             
             # Get file extension from output file

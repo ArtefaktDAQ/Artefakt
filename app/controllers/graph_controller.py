@@ -638,31 +638,37 @@ class GraphController:
                 if show_in_graph and enabled:
                     color_str = getattr(sensor, 'color', '#FFFFFF')
                     sensor_name_for_legend = getattr(sensor, 'name', 'Unknown Sensor')
-                    interface_type = getattr(sensor, 'interface_type', 'Unknown')
+                    interface_type = str(getattr(sensor, 'interface_type', 'Unknown')).upper()
+                    # print(f"DEBUG GRAPH: Adding sensor {sensor_name_for_legend} (type {interface_type}) to graph")
 
                     # --- Determine the CORRECT key for matching incoming data --- 
                     sensor_key_for_data = None
-                    if interface_type == "Arduino":
+                    if interface_type == "ARDUINO":
                         # Use the sensor name for Arduino data keys (address is often empty)
                         sensor_key_for_data = getattr(sensor, 'name', None)
                         if not sensor_key_for_data:
                             print(f"WARNING GRAPH: Arduino sensor '{sensor_name_for_legend}' has no name defined. Skipping plot.")
                             continue
-                    elif interface_type == "LabJack":
+                    elif interface_type == "LABJACK":
                         # LabJack uses channel name (port/address field in SensorModel)
                         sensor_key_for_data = getattr(sensor, 'port', None) # Assuming 'port' holds the channel name
                         if not sensor_key_for_data:
                             print(f"WARNING GRAPH: LabJack sensor '{sensor_name_for_legend}' has no port/channel defined. Skipping plot.")
                             continue
-                    elif interface_type == "OtherSerial":
+                    elif interface_type == "OTHERSERIAL":
                         # OtherSerial data is keyed by the user-defined sensor name
                         sensor_key_for_data = sensor_name_for_legend 
-                    elif interface_type == "OpticalSensor":
+                    elif interface_type == "OPTICALSENSOR":
                         # OpticalSensor uses the sensor name for data keys
                         sensor_key_for_data = sensor_name_for_legend
-                    elif interface_type == "AudioSensor":
+                    elif interface_type == "AUDIOSENSOR":
                         # AudioSensor uses the sensor name for data keys
                         sensor_key_for_data = sensor_name_for_legend
+                    elif interface_type == "CSV":
+                        # CSV uses the prefixed key stored in the port field
+                        sensor_key_for_data = getattr(sensor, 'port', None)
+                        if not sensor_key_for_data:
+                            sensor_key_for_data = f"csv_{sensor_name_for_legend}"
                     else:
                         print(f"WARNING GRAPH: Unknown interface type '{interface_type}' for sensor '{sensor_name_for_legend}'. Skipping plot.")
                         continue

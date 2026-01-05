@@ -18,6 +18,7 @@ import threading
 
 from app.core.direct_camera import DirectCameraThread  # New direct camera implementation
 from app.core.overlay_manager import BaseOverlay, TextOverlay, TimestampOverlay, SensorOverlay, RectangleOverlay, MotionOverlay
+from app.core.interfaces.ndi_interface import NDI_AVAILABLE, NDISourceFinder
 
 from app.settings.settings_manager import SettingsManager
 from app.core.logger import Logger
@@ -48,7 +49,40 @@ class CameraController(QObject):
         
         # Get common UI elements
         self.camera_connect_btn = getattr(self.main_window, 'camera_connect_btn', None)
-        self.camera_select = getattr(self.main_window, 'camera_id', None)
+        self.camera_refresh_btn = getattr(self.main_window, 'camera_refresh_btn', None)
+        self.camera_mode = getattr(self.main_window, 'camera_mode', None)
+        
+        # Initialize internal reference to the UI dropdown
+        self._ui_dropdown = None
+        
+        # Try multiple names for the camera dropdown
+        print(f"DEBUG CTRL: CameraController init with main_window (id={id(self.main_window)}):")
+        for name in ['camera_source_combo', 'camera_id_dropdown', 'camera_id']:
+            val = getattr(self.main_window, name, None)
+            if val is not None:
+                self._ui_dropdown = val
+                print(f"CameraController: Linked _ui_dropdown via main_window.{name}")
+                break
+        
+        if self._ui_dropdown is None and hasattr(self.main_window, 'findChild'):
+            try:
+                for name in ['camera_source_dropdown_widget', 'camera_source_dropdown', 'camera_id']:
+                    val = self.main_window.findChild(QComboBox, name)
+                    if val is not None:
+                        self._ui_dropdown = val
+                        print(f"CameraController: Linked _ui_dropdown via findChild('{name}')")
+                        break
+            except Exception as e:
+                print(f"DEBUG CTRL: findChild failed: {e}")
+        
+        if self._ui_dropdown is not None:
+            # Compatibility for other parts of the code that might still use this name
+            self.camera_select = self._ui_dropdown
+            print(f"CameraController: Successfully found camera dropdown: {self._ui_dropdown}")
+        else:
+            self.camera_select = None
+            print("CameraController: Error - Could not find camera dropdown widget on main_window!")
+        
         self.camera_label = getattr(self.main_window, 'camera_label', None)
         self.record_btn = getattr(self.main_window, 'record_btn', None)
 
@@ -94,6 +128,7 @@ class CameraController(QObject):
         # Current state
         self.is_connected = False
         self.is_recording = False
+        self.show_on_dashboard = True # Flag to control dashboard display
         self.current_frame = None
         self.should_reconnect = False
         
@@ -121,9 +156,21 @@ class CameraController(QObject):
         # Track previous motion detection state for edge detection
         self._last_motion_detected = False
         
+        # Timer for NDI source discovery
+        self.ndi_discovery_timer = QTimer()
+        self.ndi_discovery_timer.timeout.connect(self.discover_ndi_sources)
+        
+        # Initialize camera mode UI state
+        if self.camera_mode:
+            # Default to Local Camera (0)
+            self.camera_mode.blockSignals(True)
+            self.camera_mode.setCurrentIndex(0)
+            self.camera_mode.blockSignals(False)
+            self.refresh_camera_list()
+        
         # Initialize camera lazily after the event loop starts to keep the
         # main window paint fast.
-        QTimer.singleShot(0, self.init_camera)
+        QTimer.singleShot(1500, self.init_camera)
         
         # --- Initial Motion Detection Config --- START
         # Call handlers AFTER init_camera ensures thread exists and connections are made
@@ -309,10 +356,18 @@ class CameraController(QObject):
     # Dashboard preview toggle (called from main_window.switch_dashboard_camera_source)
     def set_dashboard_display(self, enabled: bool):
         """
-        No-op placeholder for dashboard camera preview selection.
-        Keeps compatibility with callers expecting this method.
+        Set whether the camera feed should be displayed on the dashboard.
         """
-        # If future dashboard-specific camera behavior is needed, implement it here.
+        self.show_on_dashboard = enabled
+        
+        # If disabling, clear the dashboard label
+        if not enabled and hasattr(self.main_window, 'dashboard_camera_label'):
+            replay_mode_active = getattr(self.main_window, 'replay_mode_enabled', False)
+            if not replay_mode_active:
+                self.main_window.dashboard_camera_label.setText("No camera connected")
+                empty_pixmap = QPixmap(320, 240)
+                empty_pixmap.fill(Qt.GlobalColor.black)
+                self.main_window.dashboard_camera_label.setPixmap(empty_pixmap)
         return
         
     def push_sensor_data_to_thread(self):
@@ -339,33 +394,43 @@ class CameraController(QObject):
                 self.camera_thread.update_sensor_overlay_data(overlay.sensor_name, value, unit)
 
     def init_camera(self):
-        """Initialize the camera"""
+        """Initialize the camera settings and populate the list"""
         try:
-            print("Initializing camera...")
-            # Create the camera thread
-            from app.core.direct_camera import DirectCameraThread
+            print("CameraController: init_camera starting...")
             
-            # Check if an existing thread is already running
-            if hasattr(self, 'camera_thread') and self.camera_thread:
-                # If thread is running, stop it
-                if self.camera_thread.isRunning():
-                    print("Stopping existing camera thread...")
-                    self.camera_thread.stop()
-                    
-                    # Wait for thread to finish
-                    if not self.camera_thread.wait(3000):  # 3 second timeout
-                        print("Thread did not stop in time, forcing termination...")
-                        self.camera_thread.terminate()
+            # Ensure we have the latest UI references
+            if getattr(self, 'camera_select', None) is None:
+                for name in ['camera_source_combo', 'camera_id_dropdown', 'camera_id']:
+                    val = getattr(self.main_window, name, None)
+                    if val is not None:
+                        self.camera_select = val
+                        print(f"CameraController: init_camera linked dropdown via '{name}'")
+                        break
             
-            print("Creating new camera thread...")
-            # Create new thread with reference to main window for sensor access
-            self.camera_thread = DirectCameraThread(main_window=self.main_window)
+            # Try to refresh the list immediately
+            self.refresh_camera_list()
             
-            # Connect signals
-            self.camera_thread.status_update.connect(self.handle_connection_status)
-            self.camera_thread.frame_captured.connect(self.update_frame_display)
-            self.camera_thread.recording_status_signal.connect(self.handle_recording_status)
-            self.camera_thread.motion_detected_signal.connect(self._update_motion_indicator)
+            # Create the camera thread if it doesn't exist
+            if not hasattr(self, 'camera_thread') or not self.camera_thread:
+                print("Creating new camera thread...")
+                from app.core.direct_camera import DirectCameraThread
+                self.camera_thread = DirectCameraThread(main_window=self.main_window)
+                # Connect signals
+                self.camera_thread.status_update.connect(self.handle_connection_status)
+                self.camera_thread.frame_captured.connect(self.update_frame_display)
+                self.camera_thread.recording_status_signal.connect(self.handle_recording_status)
+                if hasattr(self.camera_thread, 'motion_detected_signal'):
+                    self.camera_thread.motion_detected_signal.connect(self._update_motion_indicator)
+                print("CameraController: DirectCameraThread created and connected.")
+            
+            # Schedule a delayed refresh as well, because QMediaDevices can be slow
+            QTimer.singleShot(2500, self.refresh_camera_list)
+            
+            print("CameraController: init_camera routine complete.")
+        except Exception as e:
+            print(f"CameraController: Error in init_camera: {e}")
+            import traceback
+            traceback.print_exc()
             self.camera_thread.framerate_warning_signal.connect(self.handle_framerate_warning)
             
             print("Camera thread initialized")
@@ -390,7 +455,7 @@ class CameraController(QObject):
     
     def populate_camera_list(self):
         """Populate the camera selection dropdown"""
-        if not self.camera_select:
+        if self.camera_select is None:
             return
             
         try:
@@ -433,23 +498,213 @@ class CameraController(QObject):
             self.logger.log(f"Error toggling camera: {str(e)}", "ERROR")
             traceback.print_exc()
     
+    def _handle_camera_mode_changed(self, index):
+        """Handle change in camera mode (Local vs NDI)."""
+        # index 0: Local Camera, index 1: NDI Source
+        is_ndi_mode = (index == 1)
+        
+        # Disconnect current camera if running to prevent driver conflicts
+        if self.is_connected:
+            self.disconnect_camera()
+        
+        # Refresh the source list based on mode
+        self.refresh_camera_list()
+        
+        # Update discovery timer
+        if is_ndi_mode and NDI_AVAILABLE:
+            # Re-enable discovery for NDI mode
+            if "NDI_SKIP_LOCAL_SOURCES" in os.environ:
+                del os.environ["NDI_SKIP_LOCAL_SOURCES"]
+            
+            if not self.ndi_discovery_timer.isActive():
+                self.ndi_discovery_timer.start(5000)
+        else:
+            self.ndi_discovery_timer.stop()
+
+    def refresh_camera_list(self):
+        """Populate the camera selection dropdown with friendly names and filter virtual cameras."""
+        # Ensure we have the widget reference
+        if getattr(self, '_ui_dropdown', None) is None:
+            print(f"DEBUG REFRESH: Re-trying to find dropdown on main_window (id={id(self.main_window)})")
+            for name in ['camera_source_combo', 'camera_id_dropdown', 'camera_id']:
+                val = getattr(self.main_window, name, None)
+                if val is not None:
+                    self._ui_dropdown = val
+                    self.camera_select = val
+                    print(f"CameraController: Successfully re-linked _ui_dropdown via '{name}'")
+                    break
+            
+            if self._ui_dropdown is None and hasattr(self.main_window, 'findChild'):
+                print("DEBUG REFRESH: Trying findChild...")
+                for name in ['camera_source_dropdown_widget', 'camera_source_dropdown', 'camera_id']:
+                    val = self.main_window.findChild(QComboBox, name)
+                    if val is not None:
+                        self._ui_dropdown = val
+                        self.camera_select = val
+                        print(f"CameraController: Found _ui_dropdown via findChild('{name}')")
+                        break
+        
+        if self._ui_dropdown is None:
+            print("CameraController: refresh_camera_list failed - _ui_dropdown is still None")
+            return
+            
+        print("CameraController: Refreshing camera list...")
+        # Store current selection to restore it if possible
+        current_data = None
+        try:
+            current_data = self._ui_dropdown.currentData()
+        except Exception:
+            pass
+            
+        self._ui_dropdown.clear()
+        
+        # Determine mode
+        is_ndi_mode = False
+        if getattr(self.main_window, 'camera_mode', None) is not None:
+            is_ndi_mode = (self.main_window.camera_mode.currentIndex() == 1)
+            
+        if is_ndi_mode:
+            self._ui_dropdown.addItem("Searching for NDI sources...")
+            if NDI_AVAILABLE:
+                self.discover_ndi_sources()
+        else:
+            # Simplified indexing for reliability as requested
+            print("CameraController: Populating available camera indices...")
+            try:
+                from PyQt6.QtMultimedia import QMediaDevices
+                devices = QMediaDevices.videoInputs()
+                num_devices = len(devices)
+                print(f"CameraController: QMediaDevices found {num_devices} total inputs")
+                
+                # Show detected indices first
+                for i in range(max(num_devices, 1)):
+                    name = "Unknown Device"
+                    if i < len(devices):
+                        name = devices[i].description()
+                    
+                    display_text = f"Camera {i}"
+                    # Still keep the name in the tooltip so the user can at least see what it MIGHT be
+                    tip = f"Reported Name: {name}\nNote: Windows index mapping can be inconsistent."
+                    
+                    self._ui_dropdown.addItem(display_text, i)
+                    self._ui_dropdown.setItemData(self._ui_dropdown.count()-1, tip, Qt.ItemDataRole.ToolTipRole)
+                    print(f"CameraController: Added {display_text} (Name: {name})")
+                
+                # Add extra slots just in case detection missed something
+                self._ui_dropdown.insertSeparator(self._ui_dropdown.count())
+                for i in range(max(num_devices, 1), 10):
+                    self._ui_dropdown.addItem(f"Camera {i} (Unchecked)", i)
+                    self._ui_dropdown.setItemData(self._ui_dropdown.count()-1, "Direct access to index. Use if detection failed.", Qt.ItemDataRole.ToolTipRole)
+                    
+            except Exception as e:
+                print(f"CameraController: Error listing cameras: {e}")
+                # Ultimate fallback
+                for i in range(10):
+                    self._ui_dropdown.addItem(f"Camera {i}", i)
+            
+            # Restore selection
+            if current_data is not None:
+                idx = self._ui_dropdown.findData(current_data)
+                if idx >= 0:
+                    self._ui_dropdown.setCurrentIndex(idx)
+        
+        print(f"CameraController: Refresh complete. Final count: {self._ui_dropdown.count()}")
+
+    def discover_ndi_sources(self):
+        """Discover NDI sources on the network and update UI."""
+        if not NDI_AVAILABLE:
+            return
+            
+        # Only discover if we are in NDI mode
+        if self.camera_mode and self.camera_mode.currentIndex() != 1:
+            return
+            
+        if not hasattr(self, '_ndi_finder'):
+            self._ndi_finder = NDISourceFinder()
+            
+        sources = self._ndi_finder.get_sources()
+        
+        # Collect current NDI items in dropdown
+        ndi_items = {}
+        has_searching_msg = False
+        searching_msg_index = -1
+
+        selector = getattr(self, '_camera_selector', self.camera_select)
+        if selector is None:
+            return
+            
+        for i in range(selector.count()):
+            text = selector.itemText(i)
+            if text == "Searching for NDI sources...":
+                has_searching_msg = True
+                searching_msg_index = i
+            elif text.startswith("NDI:"):
+                ndi_items[text] = i
+        
+        # Track which NDI sources are still present
+        active_ndi_texts = set()
+        
+        new_sources_found = False
+        for s in sources:
+            source_name = getattr(s, 'ndi_name', str(s))
+            display_text = f"NDI: {source_name}"
+            active_ndi_texts.add(display_text)
+            
+            if display_text not in ndi_items:
+                # Add new NDI source
+                selector.addItem(display_text, s) # Store the source object as userData
+                self.logger.log(f"Discovered NDI source: {display_text}", "INFO")
+                new_sources_found = True
+        
+        # Remove "Searching..." message if we found sources or if we've been searching
+        if has_searching_msg and (new_sources_found or len(sources) > 0):
+            selector.removeItem(searching_msg_index)
+
     def connect_camera(self):
         """Connect to the camera"""
         try:
-            # Get camera settings from UI
-            camera_id = self.camera_select.value() if hasattr(self.camera_select, 'value') else 0
+            # Ensure we have the widget reference
+            if self.camera_select is None:
+                for name in ['camera_source_combo', 'camera_id_dropdown', 'camera_id']:
+                    val = getattr(self.main_window, name, None)
+                    if val is not None:
+                        self.camera_select = val
+                        break
+            
+            if self.camera_select is None:
+                print("CameraController: Cannot connect - camera_select is None")
+                return
+                
+            # Get camera selection from UI
+            if hasattr(self.camera_select, 'currentText'):
+                current_text = self.camera_select.currentText()
+                if current_text == "Searching for NDI sources..." or current_text == "" or current_text == "No physical cameras found":
+                    return
+                # Get index or NDI source object from userData
+                camera_id = self.camera_select.currentData()
+                if camera_id is None:
+                    camera_id = current_text
+            else:
+                # Fallback for generic widgets
+                camera_id = getattr(self.camera_select, 'value', lambda: 0)()
             
             # Check if camera is being used as an optical sensor
-            if hasattr(self.main_window, 'sensor_controller') and self.main_window.sensor_controller:
-                if self.main_window.sensor_controller.is_camera_used_as_sensor(camera_id):
-                    from PyQt6.QtWidgets import QMessageBox
-                    QMessageBox.warning(
-                        self.main_window,
-                        "Camera in Use",
-                        f"Camera {camera_id} is currently being used as an Optical Sensor.\n\n"
-                        "Please disconnect the optical sensor first, or select a different camera."
-                    )
-                    return
+            # (Only applies to local cameras with integer IDs)
+            try:
+                local_cam_id = int(camera_id)
+                if hasattr(self.main_window, 'sensor_controller') and self.main_window.sensor_controller:
+                    if self.main_window.sensor_controller.is_camera_used_as_sensor(local_cam_id):
+                        from PyQt6.QtWidgets import QMessageBox
+                        QMessageBox.warning(
+                            self.main_window,
+                            "Camera in Use",
+                            f"Camera {local_cam_id} is currently being used as an Optical Sensor.\n\n"
+                            "Please disconnect the optical sensor first, or select a different camera."
+                        )
+                        return
+            except (ValueError, TypeError):
+                # It's an NDI source or invalid ID, ignore sensor check for now
+                pass
             
             # Get settings with proper defaults
             resolution = self.settings.get_value('camera/resolution', "1280x720")
@@ -513,106 +768,24 @@ class CameraController(QObject):
             
             # Connect to camera
             print("Attempting camera connection...")
-            success = self.camera_thread.connect(camera_id, resolution, fps)
+            self.current_camera_id = camera_id  # Store for use in handle_connection_status
+            thread_started = self.camera_thread.connect(camera_id, resolution, fps)
             
-            if success:
-                # Add default timestamp overlay if it doesn't exist
-                timestamp_exists = any(getattr(o, 'get_type', lambda: '')() == 'timestamp' for o in self.overlays)
-                if not timestamp_exists:
-                    overlay_count = len(self.overlays) + 1
-                    overlay_name = f"Timestamp {overlay_count}"
-                    new_overlay = TimestampOverlay(overlay_count, overlay_name, "%Y-%m-%d %H:%M:%S")
-                    
-                    # Set requested defaults
-                    new_overlay.position = (0.70, 0.98)  # Adjusted for font scale 1.0 to avoid clipping
-                    new_overlay.font_scale = 1.0          # Set font scale to 1.0 as requested
-                    new_overlay.text_color = (255, 255, 255)  # White (BGR)
-                    new_overlay.bg_color = (0, 0, 0)      # Black (BGR)
-                    new_overlay.bg_alpha = 0.5            # 50% opacity
-                    
-                    self.overlays.append(new_overlay)
-                    self.update_overlay_selector()
-                    
-                    # Pass overlays to camera thread
-                    if self.camera_thread and hasattr(self.camera_thread, 'set_overlays'):
-                        self.camera_thread.set_overlays(self.overlays)
-                    
-                    self.logger.log(f"Added default timestamp overlay to camera {camera_id}")
-
-                # -- Apply Motion Detection Settings AFTER Successful Connect --
-                print("--> Entering Apply Motion Settings block in connect_camera") # LOG
-                try:
-                    # Read settings from SettingsModel
-                    enabled = self.settings.get_bool("motion_detection_enabled", False)
-                    sensitivity = self.settings.get_int("motion_detection_sensitivity", 20)
-                    min_area = self.settings.get_int("motion_detection_min_area", 500)
-                    print(f"    Read from SettingsModel: enabled={enabled}, sens={sensitivity}, area={min_area}") # LOG
-                    
-                    # Apply to thread
-                    if hasattr(self.camera_thread, 'set_motion_detection_enabled'):
-                        print(f"    Calling thread.set_motion_detection_enabled({enabled})") # LOG
-                        self.camera_thread.set_motion_detection_enabled(enabled)
-                        print("    Called thread.set_motion_detection_enabled") # LOG
-                    if hasattr(self.camera_thread, 'update_motion_detection_settings'):
-                        print(f"    Calling thread.update_motion_detection_settings({sensitivity}, {min_area})") # LOG
-                        self.camera_thread.update_motion_detection_settings(sensitivity, min_area)
-                        print("    Called thread.update_motion_detection_settings") # LOG
-                    
-                    # Update UI elements to match settings
-                    if self.motion_enabled_widget:
-                         # Block signals temporarily to prevent feedback loops
-                        print("    Blocking signals for motion_enabled_widget") # LOG
-                        self.motion_enabled_widget.blockSignals(True)
-                        print(f"    Calling motion_enabled_widget.setChecked({enabled})") # LOG
-                        self.motion_enabled_widget.setChecked(enabled)
-                        print("    Called motion_enabled_widget.setChecked") # LOG
-                        self.motion_enabled_widget.blockSignals(False)
-                        print("    Unblocked signals for motion_enabled_widget") # LOG
-                        # Manually update enabled state of other widgets
-                        if self.motion_sensitivity_widget: self.motion_sensitivity_widget.setEnabled(enabled)
-                        if self.motion_min_area_widget: self.motion_min_area_widget.setEnabled(enabled)
-                    
-                    # Set initial indicator state (green if enabled, gray if not)
-                    if self.motion_indicator:
-                        style = "background-color: gray; border-radius: 5px;"
-                        if enabled:
-                            style = "background-color: green; border-radius: 5px;"
-                        print(f"    Setting motion_indicator style: {style}") # LOG
-                        self.motion_indicator.setStyleSheet(style)
-                        print("    Set motion_indicator style") # LOG
-                            
-                    self.logger.log(f"Applied motion settings on connect: enabled={enabled}, sens={sensitivity}, area={min_area}", "DEBUG")
-                except Exception as motion_err:
-                    self.logger.log(f"Error applying motion settings on connect: {motion_err}", "ERROR")
-                print("<-- Exiting Apply Motion Settings block in connect_camera") # LOG
-                # -- End Motion Detection Apply --
-
-                # Update UI state
-                self.camera_connect_btn.setEnabled(True)
-                self.camera_connect_btn.setText("Disconnect")
-                self.camera_connect_btn.repaint()
-                
-                self.camera_select.setEnabled(False)
-                if hasattr(self, 'record_btn') and self.record_btn:
-                    self.record_btn.setEnabled(True)
-                
-                # Explicitly set connected state
-                self.is_connected = True
-                
-                # Update status
-                self.handle_connection_status(True, "Camera connected")
+            if thread_started:
+                # Thread started successfully; connection happens in the background.
+                # handle_connection_status will be called when connection is established.
+                self.logger.log(f"Starting background connection to camera {camera_id}...")
             else:
-                print("Failed to connect to camera")
+                print("Failed to start camera thread")
                 self.is_connected = False
-                self.handle_connection_status(False, "Failed to connect to camera")
+                self.handle_connection_status(False, "Failed to start camera thread")
                 
-                # Reset label text if connection failed
+                # Reset label text if thread failed to start
                 if self.camera_label:
                     self.camera_label.setText("No camera connected")
             
         except Exception as e:
-            print(f"Error connecting to camera: {str(e)}")
-            print("Full traceback:")
+            print(f"Error initiating camera connection: {str(e)}")
             traceback.print_exc()
             self.is_connected = False
             self.handle_connection_status(False, f"Error: {str(e)}")
@@ -685,8 +858,16 @@ class CameraController(QObject):
             
             # Log connection message
             print(f"Camera {'connected' if connected else 'disconnected'}: {message}")
-            print(f"Camera controller connection state updated to: {self.is_connected}")
             
+            if not connected and "black frame" in message.lower():
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.information(
+                    self.main_window,
+                    "Camera Signal Issue",
+                    "The selected camera is not sending a valid image. This can happen if the device is being used by another application.\n\n"
+                    "Please ensure your webcam is not in use elsewhere and try another source from the list if available."
+                )
+
             # Update UI
             if self.camera_connect_btn:
                 # Force update button text based on connection state
@@ -758,17 +939,95 @@ class CameraController(QObject):
                 if hasattr(self.main_window, 'apply_camera_focus_exposure'):
                     self.main_window.apply_camera_focus_exposure()
                 
-                # NOTE: Motion detection setup moved to connect_camera to avoid duplication
-                # and race conditions since this method is called by connect_camera.
-            
-            if not connected and self.camera_label:
-                # Set text for disconnected state
-                self.camera_label.setText("No camera connected")
+                # --- ASYNC SETUP: Move setup logic here since connect_camera is now async ---
+                camera_id = getattr(self, 'current_camera_id', 0)
                 
-                # Clear label with black pixmap
-                empty_pixmap = QPixmap(640, 480)
-                empty_pixmap.fill(Qt.GlobalColor.black)
-                self.camera_label.setPixmap(empty_pixmap)
+                # Add default timestamp overlay if it doesn't exist
+                timestamp_exists = any(getattr(o, 'get_type', lambda: '')() == 'timestamp' for o in self.overlays)
+                if not timestamp_exists:
+                    from app.core.overlay_manager import TimestampOverlay
+                    overlay_count = len(self.overlays) + 1
+                    overlay_name = f"Timestamp {overlay_count}"
+                    new_overlay = TimestampOverlay(overlay_count, overlay_name, "%Y-%m-%d %H:%M:%S")
+                    
+                    # Set requested defaults
+                    new_overlay.position = (0.70, 0.98)  # Adjusted for font scale 1.0 to avoid clipping
+                    new_overlay.font_scale = 1.0          # Set font scale to 1.0 as requested
+                    new_overlay.text_color = (255, 255, 255)  # White (BGR)
+                    new_overlay.bg_color = (0, 0, 0)      # Black (BGR)
+                    new_overlay.bg_alpha = 0.5            # 50% opacity
+                    
+                    self.overlays.append(new_overlay)
+                    self.update_overlay_selector()
+                    
+                    # Pass overlays to camera thread
+                    if self.camera_thread and hasattr(self.camera_thread, 'set_overlays'):
+                        self.camera_thread.set_overlays(self.overlays)
+                    
+                    self.logger.log(f"Added default timestamp overlay to camera {camera_id}")
+
+                # -- Apply Motion Detection Settings --
+                try:
+                    # Read settings from SettingsModel
+                    enabled = self.settings.get_bool("motion_detection_enabled", False)
+                    sensitivity = self.settings.get_int("motion_detection_sensitivity", 20)
+                    min_area = self.settings.get_int("motion_detection_min_area", 500)
+                    
+                    # Apply to thread
+                    if hasattr(self.camera_thread, 'set_motion_detection_enabled'):
+                        self.camera_thread.set_motion_detection_enabled(enabled)
+                    if hasattr(self.camera_thread, 'update_motion_detection_settings'):
+                        self.camera_thread.update_motion_detection_settings(sensitivity, min_area)
+                    
+                    # Update UI elements to match settings
+                    if hasattr(self, 'motion_enabled_widget') and self.motion_enabled_widget:
+                        self.motion_enabled_widget.blockSignals(True)
+                        self.motion_enabled_widget.setChecked(enabled)
+                        self.motion_enabled_widget.blockSignals(False)
+                        if hasattr(self, 'motion_sensitivity_widget') and self.motion_sensitivity_widget: 
+                            self.motion_sensitivity_widget.setEnabled(enabled)
+                        if hasattr(self, 'motion_min_area_widget') and self.motion_min_area_widget: 
+                            self.motion_min_area_widget.setEnabled(enabled)
+                    
+                    # Set initial indicator state
+                    if hasattr(self, 'motion_indicator') and self.motion_indicator:
+                        style = "background-color: gray; border-radius: 5px;"
+                        if enabled:
+                            style = "background-color: green; border-radius: 5px;"
+                        self.motion_indicator.setStyleSheet(style)
+                            
+                    self.logger.log(f"Applied motion settings on connect: enabled={enabled}, sens={sensitivity}, area={min_area}", "DEBUG")
+                except Exception as motion_err:
+                    self.logger.log(f"Error applying motion settings on connect: {motion_err}", "ERROR")
+
+                # Update camera select enabled state
+                if getattr(self, 'camera_select', None) is not None:
+                    self.camera_select.setEnabled(False)
+            
+            if not connected:
+                # Enable camera select when disconnected
+                if getattr(self, 'camera_select', None) is not None:
+                    self.camera_select.setEnabled(True)
+
+                if self.camera_label:
+                    # Set text for disconnected state
+                    self.camera_label.setText("No camera connected")
+                    
+                    # Clear label with black pixmap
+                    empty_pixmap = QPixmap(640, 480)
+                    empty_pixmap.fill(Qt.GlobalColor.black)
+                    self.camera_label.setPixmap(empty_pixmap)
+                
+                # Also clear dashboard camera label if it exists and we're currently showing on dashboard
+                if hasattr(self.main_window, 'dashboard_camera_label') and self.show_on_dashboard:
+                    # Check if replay mode is NOT active before clearing dashboard label
+                    replay_mode_active = getattr(self.main_window, 'replay_mode_enabled', False)
+                    if not replay_mode_active:
+                        self.main_window.dashboard_camera_label.setText("No camera connected")
+                        # Clear label with black pixmap
+                        empty_pixmap = QPixmap(320, 240)
+                        empty_pixmap.fill(Qt.GlobalColor.black)
+                        self.main_window.dashboard_camera_label.setPixmap(empty_pixmap)
                 
         except Exception as e:
             print(f"Error handling connection status: {str(e)}")
@@ -796,7 +1055,7 @@ class CameraController(QObject):
                 self.camera_label.setPixmap(scaled_pixmap)
                 
                 # Update the dashboard camera preview if it exists and replay is not active
-                if hasattr(self.main_window, 'dashboard_camera_label') and not replay_mode_active:
+                if hasattr(self.main_window, 'dashboard_camera_label') and not replay_mode_active and self.show_on_dashboard:
                     # Only scale and update if the dashboard label is actually visible (Optimization 3)
                     if self.main_window.dashboard_camera_label.isVisible():
                         # Create a smaller version for the dashboard
@@ -984,6 +1243,25 @@ class CameraController(QObject):
                 pass
             self.main_window.camera_connect_btn.clicked.connect(self.toggle_camera)
             
+        # Connect camera refresh button
+        if hasattr(self.main_window, 'camera_refresh_btn'):
+            print("CameraController: Connecting refresh button signal")
+            try:
+                self.main_window.camera_refresh_btn.clicked.disconnect()
+            except Exception:
+                pass
+            self.main_window.camera_refresh_btn.clicked.connect(self.refresh_camera_list)
+        else:
+            print("CameraController: Warning - main_window has no camera_refresh_btn attribute")
+
+        # Connect camera mode selection
+        if hasattr(self.main_window, 'camera_mode'):
+            try:
+                self.main_window.camera_mode.currentIndexChanged.disconnect()
+            except Exception:
+                pass
+            self.main_window.camera_mode.currentIndexChanged.connect(self._handle_camera_mode_changed)
+
         # Connect record button
         if hasattr(self.main_window, 'record_btn'):
             try:
@@ -1713,11 +1991,11 @@ class CameraController(QObject):
                 
                 # Get current camera ID for reconnect
                 camera_id = 0
-                if hasattr(self.main_window, 'camera_select') and hasattr(self.main_window.camera_select, 'currentData'):
-                     camera_id = self.main_window.camera_select.currentData() 
+                if self.camera_select is not None and hasattr(self.camera_select, 'currentData'):
+                     camera_id = self.camera_select.currentData() 
                      if camera_id is None: camera_id = 0 # Default if data is None
                 elif hasattr(self.main_window, 'camera_id'): # Fallback for older UI names
-                     camera_id = self.main_window.camera_id.value()
+                     camera_id = self.main_window.camera_id.currentIndex() if hasattr(self.main_window.camera_id, 'currentIndex') else 0
 
                 print(f"Applying settings to connected camera {camera_id}...")
                 print(f"Resolution: {resolution}, FPS: {fps}")
@@ -2602,7 +2880,7 @@ class CameraController(QObject):
             self.camera_connect_btn.repaint()
         
         # Enable camera selection
-        if self.camera_select:
+        if self.camera_select is not None:
             self.camera_select.setEnabled(True)
         
         # Disable camera-dependent buttons

@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import datetime
 import time
 from PyQt6.QtWidgets import QMainWindow, QMessageBox, QFileDialog, QTableWidgetItem, QDialog, QVBoxLayout, QGridLayout, QLabel, QComboBox, QDoubleSpinBox, QPushButton, QGroupBox, QLineEdit, QHBoxLayout, QSpinBox, QSlider, QCheckBox, QTextEdit, QDialogButtonBox, QTabWidget, QScrollArea, QSizePolicy, QFrame, QListWidget, QFormLayout, QTableWidget, QAbstractItemView, QColorDialog, QApplication
@@ -168,6 +169,11 @@ class DAQApp(QMainWindow):
         # Set sound player
         self.sound_player = sound_player
         
+        # Initialize virtual sensor lists early so they can be populated by load_settings
+        self.other_sensors = []
+        self.other_sequences = []
+        self.csv_configs = []
+        
         # Set application settings
         self.settings = QSettings("Artefakt", "DAQ")
         self.settings_model = SettingsModel(self.settings)
@@ -213,7 +219,9 @@ class DAQApp(QMainWindow):
         self.timelapse_format.addItems(["MP4 (H.264)", "AVI (MJPG)", "AVI (XVID)"]) # Default formats
         
         # Set up the UI
+        print(f"MAIN_WINDOW: Calling setup_ui on win (id={id(self)})")
         setup_ui(self)
+        print(f"MAIN_WINDOW: setup_ui complete. self.camera_id type: {type(getattr(self, 'camera_id', None))}")
         
         # Connect help button directly
         if hasattr(self, 'project_help_btn'):
@@ -260,7 +268,9 @@ class DAQApp(QMainWindow):
             self.video_player = self.dashboard_video_widget
         
         # Initialize controllers
+        print(f"MAIN_WINDOW: Initializing controllers for win (id={id(self)})")
         self.init_controllers()
+        print(f"MAIN_WINDOW: Controller init complete. self.camera_id type: {type(getattr(self, 'camera_id', None))}")
         
         # Initialize timers after controllers are created
         self.init_timers()
@@ -408,8 +418,6 @@ class DAQApp(QMainWindow):
             except Exception as e:
                 print(f"Auto-connect LabJack failed: {e}")
 
-        self.other_sensors = []  # Liste für virtuelle Sensoren
-        
         # Ensure the graph live update checkbox state is properly handled after all initialization
         # This fixes the issue where the checkbox is checked but the graph doesn't refresh on startup
         if hasattr(self, 'graph_controller'):
@@ -838,22 +846,43 @@ class DAQApp(QMainWindow):
             else:
                 # In live mode, prioritize current_value from sensor model
                 # as it's already corrected and filtered by the controllers
-                val = getattr(sensor, 'current_value', None)
+                
+                # Check for staleness first
+                is_stale = False
+                if hasattr(self, 'data_collection_controller'):
+                    dcc = self.data_collection_controller
+                    if sensor_key in dcc._last_sensor_update:
+                        last_ts = dcc._last_sensor_update[sensor_key]
+                        timeout_val = dcc._get_stale_timeout_for_key(sensor_key)
+                        if time.time() - last_ts > timeout_val:
+                            is_stale = True
+                    else:
+                        # If no update yet but has value, check if it's a CSV sensor
+                        # (which might have been pre-loaded or just connected)
+                        if getattr(sensor, 'interface_type', '') == "CSV":
+                             # We'll allow it for now until the first poll cycle
+                             is_stale = False
+                
+                if is_stale:
+                    val = None # Mark as None to show as empty/stale on card
+                else:
+                    val = getattr(sensor, 'current_value', None)
                 
                 # If current_value is None, try to find it in the provided data dict
-                if val is None:
+                if val is None and not is_stale:
                     val = data.get(sensor_key)
                     if val is None:
                         # Try unprefixed name as a fallback
                         unprefixed = sensor_key.split('_', 1)[1] if '_' in sensor_key else None
                         if unprefixed:
                             val = data.get(unprefixed)
-                        if val is None:
-                            val = data.get(sensor.name)
+                if val is None:
+                    val = data.get(sensor.name)
                 
-            if val is not None:
-                self.dashboard_metric_cards[sensor_key].update_value(val)
-
+            # Always call update_value, even if val is None, to ensure the card 
+            # clears itself (showing "---") when a sensor becomes stale.
+            self.dashboard_metric_cards[sensor_key].update_value(val)
+                
     def update_dashboard_header(self):
         """Update project and run info in the dashboard header"""
         try:
@@ -1273,6 +1302,15 @@ class DAQApp(QMainWindow):
             self.sidebar_ready_status.setStyleSheet("color: #FF4136;") # Red
         
         self.update_run_context_text()
+
+    def update_csv_interfaces(self, configs):
+        """Update the CSV interfaces when configurations change."""
+        self.csv_configs = configs
+        if hasattr(self, 'data_collection_controller'):
+            self.data_collection_controller.update_csv_interfaces(configs)
+        self.update_csv_status()
+        self._update_csv_virtual_sensors()
+        self.save_virtual_sensors()
 
     def update_run_context_text(self, mode=None, run_name=None):
         """Update the status bar run context label to show what the user is viewing."""
@@ -4089,6 +4127,116 @@ class DAQApp(QMainWindow):
         # Then trigger the toggle
         self.on_toggle_clicked()
         
+    def _apply_csv_configs(self):
+        """Apply the current CSV configurations to the controller and UI."""
+        if hasattr(self, 'data_collection_controller'):
+            self.data_collection_controller.update_csv_interfaces(self.csv_configs)
+        
+        self.update_csv_status()
+        
+        # Also ensure virtual sensors are correctly populated in sensor table
+        if hasattr(self, '_update_csv_virtual_sensors'):
+            self._update_csv_virtual_sensors()
+
+    def show_csv_settings_popup(self):
+        """Show the popup for managing CSV data interfaces"""
+        from app.ui.dialogs.csv_data_dialog import CSVDataDialog
+        
+        # Get existing configuration
+        configs = deepcopy(getattr(self, 'csv_configs', []))
+        
+        # Get global sampling rate
+        global_rate = 10.0
+        if hasattr(self, 'data_collection_controller'):
+            global_rate = self.data_collection_controller.sampling_rate
+        
+        # Show the dialog
+        dialog = CSVDataDialog(self, configs=configs, global_rate=global_rate)
+        
+        if dialog.exec():
+            # Update configs via the new centralized method
+            self.update_csv_interfaces(dialog.configs)
+            
+            # Update the sensor table
+            if hasattr(self, 'sensor_controller'):
+                self.sensor_controller.update_sensor_table()
+            
+            # Reinitialize the dashboard graph if data collection is active to show new sensors
+            if (hasattr(self, 'data_collection_controller') and 
+                getattr(self.data_collection_controller, 'collecting_data', False)):
+                
+                if (hasattr(self, 'graph_controller') and 
+                    getattr(self.graph_controller, 'live_plotting_active', False)):
+                    
+                    print("DEBUG: Reinitializing dashboard graph due to CSV config change")
+                    start_time = self.data_collection_controller.start_time
+                    if start_time is not None:
+                        self.graph_controller.start_live_dashboard_update(start_time)
+    
+    def _update_csv_virtual_sensors(self):
+        """Create or update virtual sensors based on CSV mappings."""
+        if not hasattr(self, 'sensor_controller'):
+            return
+            
+        # Collect all current CSV sensor names from mappings
+        active_csv_sensors = []
+        for cfg in self.csv_configs:
+            for mapping in cfg.get('mappings', []):
+                active_csv_sensors.append(mapping['sensor_name'])
+        
+        # Add new sensors or update existing ones
+        for name in active_csv_sensors:
+            # Check if sensor already exists
+            existing = next((s for s in self.sensor_controller.sensors if s.name == name), None)
+            
+            if not existing:
+                from app.models.sensor_model import SensorModel
+                new_sensor = SensorModel(
+                    name=name,
+                    interface_type="CSV",
+                    port=f"csv_{name}", # Use port field to store the prefixed key for matching
+                    enabled=True,
+                    show_in_graph=True,
+                    color="#00FF00", # Default green for CSV
+                    stale_timeout_factor=5.0 # Set stale factor to 5x sampling interval (default)
+                )
+                self.sensor_controller.add_sensor_to_list(new_sensor)
+            else:
+                # Ensure interface type and port are set correctly
+                existing.interface_type = "CSV"
+                existing.port = f"csv_{name}"
+                # Set stale factor to 5x sampling interval
+                existing.stale_timeout_factor = 5.0
+                # Ensure it's enabled by default when configured
+                if not hasattr(existing, 'enabled') or existing.enabled is None:
+                    existing.enabled = True
+
+    def update_csv_status(self):
+        """Update the CSV status label and device frame style"""
+        if not hasattr(self, 'csv_status'):
+            return
+            
+        configs = getattr(self, 'csv_configs', [])
+        enabled_count = sum(1 for c in configs if c.get('enabled', True))
+        
+        if not configs:
+            self.csv_status.setText("Not configured")
+            self.csv_status.setStyleSheet("color: grey; font-size: 9px; background-color: transparent; border: none;")
+            is_connected = False
+        elif enabled_count > 0:
+            self.csv_status.setText(f"{enabled_count} active")
+            self.csv_status.setStyleSheet("color: #4CAF50; font-size: 9px; background-color: transparent; border: none;")
+            is_connected = True
+        else:
+            self.csv_status.setText(f"{len(configs)} disabled")
+            self.csv_status.setStyleSheet("color: orange; font-size: 9px; background-color: transparent; border: none;")
+            is_connected = False
+            
+        # Update card style
+        csv_container = self.csv_status.parent()
+        if csv_container and hasattr(csv_container, 'setStyleSheet'):
+            csv_container.setStyleSheet(self._device_card_style(is_connected))
+
     def show_other_settings_popup(self):
         """Show the popup for managing COM port polling sequences"""
         # Create a dialog for managing sequences
@@ -5194,7 +5342,6 @@ class DAQApp(QMainWindow):
                     return None
                 # Sort by timestamp in folder name (format: Run_YYYY-MM-DD_HH-MM-SS)
                 def run_folder_key(name):
-                    import re
                     m = re.match(r"Run_(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})", name)
                     if not m:
                         return ""
@@ -5213,21 +5360,22 @@ class DAQApp(QMainWindow):
 
         # Priority 1: Try to load from current run directory first
         current_run_path = self.get_virtual_sensors_path()
-        if not is_startup_load and current_run_path != VIRTUAL_SENSORS_PATH and os.path.exists(current_run_path):
+        if current_run_path != VIRTUAL_SENSORS_PATH and os.path.exists(current_run_path):
             try:
                 with open(current_run_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 self.other_sensors = data.get("sensors", [])
                 self.other_sequences = data.get("sequences", [])
+                self.csv_configs = data.get("csv_configs", [])
                 self.logger.log(f"Loaded virtual sensors from current run: {current_run_path}")
+                self._apply_csv_configs()
                 self._connect_virtual_sensors()
                 return
             except Exception as e:
                 self.logger.log(f"Error loading virtual sensors from current run: {e}", "ERROR")
 
         # Priority 2: Try to load from newest run folder (only on first load)
-        if not is_startup_load and not hasattr(self, '_virtual_sensors_loaded_once'):
-            self._virtual_sensors_loaded_once = True
+        if is_startup_load:
             last_run_path = get_last_run_virtual_sensors_path()
             if last_run_path:
                 try:
@@ -5235,7 +5383,9 @@ class DAQApp(QMainWindow):
                         data = json.load(f)
                     self.other_sensors = data.get("sensors", [])
                     self.other_sequences = data.get("sequences", [])
+                    self.csv_configs = data.get("csv_configs", [])
                     self.logger.log(f"Loaded virtual sensors from last run: {last_run_path}")
+                    self._apply_csv_configs()
                     self._connect_virtual_sensors()
                     return
                 except Exception as e:
@@ -5248,16 +5398,20 @@ class DAQApp(QMainWindow):
                     data = json.load(f)
                 self.other_sensors = data.get("sensors", [])
                 self.other_sequences = data.get("sequences", [])
+                self.csv_configs = data.get("csv_configs", [])
                 self.logger.log(f"Loaded virtual sensors from fallback location: {VIRTUAL_SENSORS_PATH}")
+                self._apply_csv_configs()
                 self._connect_virtual_sensors()
             except Exception as e:
                 self.logger.log(f"Error loading virtual sensors from fallback location: {e}", "ERROR")
                 self.other_sensors = []
                 self.other_sequences = []
+                self.csv_configs = []
         else:
             # No virtual sensors file found anywhere
             self.other_sensors = []
             self.other_sequences = []
+            self.csv_configs = []
             self.logger.log("No virtual sensors file found, starting with empty configuration")
 
     def _connect_virtual_sensors(self):
@@ -5300,16 +5454,33 @@ class DAQApp(QMainWindow):
 
     def save_virtual_sensors(self):
         """Save virtual sensors and sequences to JSON file."""
+        # 1. Determine current run-specific path
         path = self.get_virtual_sensors_path()
-        # Only create directory if we're saving to a run directory (not the fallback path)
+        
+        # Data to save
+        save_data = {
+            "sensors": self.other_sensors, 
+            "sequences": getattr(self, "other_sequences", []),
+            "csv_configs": getattr(self, "csv_configs", [])
+        }
+        
+        # 2. Always save to the fallback/root path first to ensure persistence across restarts
+        try:
+            with open(VIRTUAL_SENSORS_PATH, "w", encoding="utf-8") as f:
+                json.dump(save_data, f, indent=2)
+            self.logger.log(f"Saved virtual sensors to root: {VIRTUAL_SENSORS_PATH}")
+        except Exception as e:
+            self.logger.log(f"Error saving virtual sensors to root: {e}", "ERROR")
+
+        # 3. If we are in a run directory, also save there for run-specific documentation
         if path != VIRTUAL_SENSORS_PATH:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({"sensors": self.other_sensors, "sequences": getattr(self, "other_sequences", [])}, f, indent=2)
-            self.logger.log(f"Saved virtual sensors to {path}")
-        except Exception as e:
-            self.logger.log(f"Error saving virtual sensors: {e}", "ERROR")
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(save_data, f, indent=2)
+                self.logger.log(f"Saved virtual sensors to run dir: {path}")
+            except Exception as e:
+                self.logger.log(f"Error saving virtual sensors to run dir: {e}", "ERROR")
 
     def get_virtual_sensors_path(self):
         """Return the path to the virtual_sensors.json file (run dir if active, else current dir)."""
