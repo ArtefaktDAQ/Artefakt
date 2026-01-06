@@ -2059,7 +2059,13 @@ def setup_ui(self):
     audio_container.mousePressEvent = lambda event: self.show_audio_sensor_popup()
     
     # Sensor Management section - modernized (matching theme)
-    sensor_container = QGroupBox("📊 Sensor Management")
+    # Wrap it in a container so we can put the help area below it on the right side only
+    sensor_right_wrapper = QWidget()
+    sensor_right_wrapper_layout = QVBoxLayout(sensor_right_wrapper)
+    sensor_right_wrapper_layout.setContentsMargins(0, 0, 0, 0)
+    sensor_right_wrapper_layout.setSpacing(10)
+
+    sensor_container = QGroupBox("Sensor Management")
     sensor_container.setStyleSheet(GroupBoxStyles.default())
     sensor_container_layout = QVBoxLayout(sensor_container)
     sensor_container_layout.setContentsMargins(10, 10, 10, 10)
@@ -2124,16 +2130,9 @@ def setup_ui(self):
     self.data_table.cellClicked.connect(self.select_sensor)
     self.data_table.cellDoubleClicked.connect(lambda row, col: self.sensor_controller.edit_sensor() if hasattr(self, 'sensor_controller') else None)
     
-    # Add sensor container to horizontal splitter (right side)
-    self.sensors_splitter.addWidget(sensor_container)
-    
-    # Set initial sizes for the sensors splitter (e.g., 200px for devices, remainder for table)
-    self.sensors_splitter.setSizes([200, 1000])
-    
-    # Add horizontal splitter to main vertical layout
-    sensors_main_layout.addWidget(self.sensors_splitter)
-    
-    # Bottom row with help button
+    sensor_right_wrapper_layout.addWidget(sensor_container)
+
+    # Bottom row with help button - now moved inside the right wrapper
     sensors_bottom_layout = QHBoxLayout()
     
     # Explanation text
@@ -2150,7 +2149,16 @@ def setup_ui(self):
     self.sensors_help_btn.setStyleSheet(ButtonStyles.get("secondary", size="small"))
     sensors_bottom_layout.addWidget(self.sensors_help_btn)
     
-    sensors_main_layout.addLayout(sensors_bottom_layout)
+    sensor_right_wrapper_layout.addLayout(sensors_bottom_layout)
+    
+    # Add sensor right wrapper to horizontal splitter (right side)
+    self.sensors_splitter.addWidget(sensor_right_wrapper)
+    
+    # Set initial sizes for the sensors splitter (e.g., 200px for devices, remainder for table)
+    self.sensors_splitter.setSizes([200, 1000])
+    
+    # Add horizontal splitter to main vertical layout
+    sensors_main_layout.addWidget(self.sensors_splitter)
     
     # Add main container to layout
     sensors_layout.addWidget(sensors_main_container)
@@ -2868,7 +2876,7 @@ def setup_ui(self):
     hero_title = QLabel("Project Management")
     hero_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #fff; background: transparent; border: none;")
     hero_text_layout.addWidget(hero_title)
-    hero_subtitle = QLabel("Create and organize your experiments • Each run saves data, settings & timestamps")
+    hero_subtitle = QLabel("Create and organize your data collection projects • Each run saves data, settings & timestamps")
     hero_subtitle.setStyleSheet("font-size: 12px; color: #aaa; background: transparent; border: none;")
     hero_text_layout.addWidget(hero_subtitle)
     hero_layout.addLayout(hero_text_layout)

@@ -76,18 +76,20 @@ class ToolsWindow(QWidget):
         
         # Header
         header_frame = QFrame()
+        header_frame.setFixedHeight(50)  # Match dashboard header height
         header_frame.setStyleSheet("""
             QFrame {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                     stop:0 #2E1F5E, stop:1 #1a1a2e);
                 border-radius: 8px;
-                padding: 10px;
+                padding: 0px 10px;
             }
         """)
         header_layout = QHBoxLayout(header_frame)
+        header_layout.setContentsMargins(15, 0, 15, 0)
         
         title_label = QLabel("🧰 Analysis Tools")
-        title_label.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
+        title_label.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
         title_label.setStyleSheet("color: #fff; background: transparent;")
         header_layout.addWidget(title_label)
         

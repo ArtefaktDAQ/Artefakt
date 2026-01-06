@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QLabel, QComboBox, QPushButton, QDoubleSpinBox,
     QGroupBox, QFrame, QTabWidget, QLineEdit,
     QTableWidget, QTableWidgetItem, QHeaderView,
-    QSpinBox, QRadioButton, QButtonGroup
+    QSpinBox, QRadioButton, QButtonGroup, QSizePolicy
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
@@ -81,6 +81,7 @@ class UnitConverterWidget(QWidget):
         # Conversion area
         conv_frame = QFrame()
         conv_frame.setStyleSheet(CardStyles.default())
+        conv_frame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         conv_layout = QGridLayout(conv_frame)
         conv_layout.setSpacing(10)
         
@@ -127,7 +128,6 @@ class UnitConverterWidget(QWidget):
             QTableWidget { background-color: #222; color: #ddd; border: none; }
             QHeaderView::section { background-color: #333; color: #fff; padding: 5px; }
         """)
-        self.ref_table.setMaximumHeight(200)
         layout.addWidget(self.ref_table)
     
     def _setup_conversions(self):
@@ -194,6 +194,10 @@ class UnitConverterWidget(QWidget):
     
     def _on_category_changed(self):
         """Handle category change"""
+        # Block signals to prevent _convert from being called with mismatched units
+        self.input_unit.blockSignals(True)
+        self.output_unit.blockSignals(True)
+        
         category = self.category_combo.currentText()
         conv = self.conversions.get(category, {})
         units = conv.get("units", [])
@@ -205,6 +209,9 @@ class UnitConverterWidget(QWidget):
         self.output_unit.addItems(units)
         if len(units) > 1:
             self.output_unit.setCurrentIndex(1)
+        
+        self.input_unit.blockSignals(False)
+        self.output_unit.blockSignals(False)
         
         self._convert()
     
