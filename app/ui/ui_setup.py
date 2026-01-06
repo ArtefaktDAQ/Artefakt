@@ -1747,27 +1747,15 @@ def setup_ui(self):
     sensors_layout.setContentsMargins(10, 10, 10, 10)
     sensors_layout.setSpacing(10)
     
-    # Center spacer left
-    sensors_layout.addStretch()
-    
-    # Main content container (centered)
-    sensors_main_container = QFrame()
-    sensors_main_container.setFixedWidth(1020)  # Width adjusted for devices on left and table on right
-    sensors_main_container.setStyleSheet(f"""
-        QFrame#sensors_main_container {{
-            background-color: {COLORS.BG_DARK};
-            border: 1px solid {COLORS.BORDER_DEFAULT};
-            border-radius: 8px;
-        }}
-    """)
-    sensors_main_container.setObjectName("sensors_main_container")
+    # Main content container
+    sensors_main_container = QWidget()
     sensors_main_layout = QVBoxLayout(sensors_main_container)
-    sensors_main_layout.setContentsMargins(10, 10, 10, 10)
+    sensors_main_layout.setContentsMargins(0, 0, 0, 0)
     sensors_main_layout.setSpacing(10)
     
     # Horizontal splitter for devices (left) and sensor management (right)
     self.sensors_splitter = QSplitter(Qt.Orientation.Horizontal)
-    self.sensors_splitter.setChildrenCollapsible(False)
+    self.sensors_splitter.setChildrenCollapsible(True)
     self.sensors_splitter.setHandleWidth(2)
     self.sensors_splitter.setStyleSheet(f"""
         QSplitter::handle {{
@@ -1890,6 +1878,7 @@ def setup_ui(self):
     
     # Set maximum width for devices section to prevent it from taking too much space
     devices_section.setMaximumWidth(200)
+    devices_section.setMinimumWidth(0) # Allow it to be collapsed completely
     devices_section.setMinimumHeight(100) # Allow it to shrink vertically
     
     # Add devices section to horizontal splitter (left side)
@@ -2202,9 +2191,6 @@ def setup_ui(self):
     
     self.sensors_help_btn.clicked.connect(toggle_sensors_help)
     self.sensors_help_panel.close_requested.connect(toggle_sensors_help)
-    
-    # Center spacer right
-    sensors_layout.addStretch()
     
     # Add sensors tab
     self.stacked_widget.addWidget(sensors_tab)
