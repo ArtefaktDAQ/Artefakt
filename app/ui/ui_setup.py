@@ -1191,7 +1191,7 @@ def setup_ui(self):
     camera_connection_group = QGroupBox("📹 Camera Connection")
     camera_connection_group.setStyleSheet(GroupBoxStyles.tight())
     camera_connection_layout = QGridLayout(camera_connection_group)
-    camera_connection_layout.setContentsMargins(12, 25, 12, 12)
+    camera_connection_layout.setContentsMargins(10, 10, 10, 10)
     camera_connection_layout.setSpacing(10)
     
     # Store the reference to the group box in the main window
@@ -1255,7 +1255,7 @@ def setup_ui(self):
     motion_status_group = QGroupBox("🔍 Motion Detection")
     motion_status_group.setStyleSheet(GroupBoxStyles.tight())
     motion_status_layout = QHBoxLayout(motion_status_group)
-    motion_status_layout.setContentsMargins(12, 22, 12, 12)
+    motion_status_layout.setContentsMargins(10, 10, 10, 10)
     
     motion_label = QLabel("Status:")
     motion_label.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY};")
@@ -1285,7 +1285,7 @@ def setup_ui(self):
     camera_controls_group = QGroupBox("🎛️ Camera Controls")
     camera_controls_group.setStyleSheet(GroupBoxStyles.tight())
     camera_controls_layout = QGridLayout(camera_controls_group)
-    camera_controls_layout.setContentsMargins(12, 25, 12, 12)
+    camera_controls_layout.setContentsMargins(10, 10, 10, 10)
     camera_controls_layout.setSpacing(10)
     
     # Modern slider style
@@ -1422,7 +1422,7 @@ def setup_ui(self):
     text_color_group = QGroupBox("Text Color")
     text_color_group.setStyleSheet(GroupBoxStyles.compact())
     text_color_layout = QHBoxLayout(text_color_group)
-    text_color_layout.setContentsMargins(8, 22, 8, 8)
+    text_color_layout.setContentsMargins(8, 10, 8, 8)
     self.text_color_preview = QFrame()
     self.text_color_preview.setFixedSize(50, 18)
     self.text_color_preview.setStyleSheet(f"background-color: rgb(0, 255, 0); border: 1px solid {COLORS.BORDER_HOVER}; border-radius: 4px;")
@@ -1438,7 +1438,7 @@ def setup_ui(self):
     bg_color_group = QGroupBox("Background Color")
     bg_color_group.setStyleSheet(GroupBoxStyles.compact())
     bg_color_layout = QVBoxLayout(bg_color_group)
-    bg_color_layout.setContentsMargins(8, 22, 8, 8)
+    bg_color_layout.setContentsMargins(8, 10, 8, 8)
     
     bg_top_row = QHBoxLayout()
     self.bg_color_preview = QFrame()
@@ -1543,7 +1543,7 @@ def setup_ui(self):
         QFrame {{
             background: {COLORS.BG_CARD};
             border: 2px solid {COLORS.BORDER_DEFAULT};
-            border-radius: 12px;
+            border-radius: 8px;
         }}
     """)
     camera_frame_layout = QVBoxLayout(camera_view_frame)
@@ -1574,7 +1574,7 @@ def setup_ui(self):
     camera_controls_bar.setStyleSheet("""
         QFrame {
             background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                stop:0 #252540, stop:1 #1e1e35);
+                stop:0 {COLORS.BG_ELEVATED}, stop:1 #1e1e35);
             border: 1px solid #3a3a5a;
             border-radius: 8px;
         }
@@ -1744,8 +1744,8 @@ def setup_ui(self):
     # Create Sensors Tab
     sensors_tab = QWidget()
     sensors_layout = QHBoxLayout(sensors_tab)
-    sensors_layout.setContentsMargins(20, 20, 20, 20)
-    sensors_layout.setSpacing(12)
+    sensors_layout.setContentsMargins(10, 10, 10, 10)
+    sensors_layout.setSpacing(10)
     
     # Center spacer left
     sensors_layout.addStretch()
@@ -1762,8 +1762,8 @@ def setup_ui(self):
     """)
     sensors_main_container.setObjectName("sensors_main_container")
     sensors_main_layout = QVBoxLayout(sensors_main_container)
-    sensors_main_layout.setContentsMargins(16, 16, 16, 16)
-    sensors_main_layout.setSpacing(12)
+    sensors_main_layout.setContentsMargins(10, 10, 10, 10)
+    sensors_main_layout.setSpacing(10)
     
     # Horizontal splitter for devices (left) and sensor management (right)
     self.sensors_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1780,9 +1780,9 @@ def setup_ui(self):
     
     # Device cards section with proper styling (matching automation tab)
     devices_section = QGroupBox("Interfaces")
-    devices_section.setStyleSheet(GroupBoxStyles.elevated())
+    devices_section.setStyleSheet(GroupBoxStyles.default())
     devices_section_layout = QVBoxLayout(devices_section)
-    devices_section_layout.setContentsMargins(12, 10, 12, 12)
+    devices_section_layout.setContentsMargins(10, 10, 10, 10)
     devices_section_layout.setSpacing(8)
     
     # Device cards container with vertical layout for stacking cards
@@ -2071,9 +2071,9 @@ def setup_ui(self):
     
     # Sensor Management section - modernized (matching theme)
     sensor_container = QGroupBox("📊 Sensor Management")
-    sensor_container.setStyleSheet(GroupBoxStyles.elevated())
+    sensor_container.setStyleSheet(GroupBoxStyles.default())
     sensor_container_layout = QVBoxLayout(sensor_container)
-    sensor_container_layout.setContentsMargins(12, 18, 12, 12)
+    sensor_container_layout.setContentsMargins(10, 10, 10, 10)
     sensor_container_layout.setSpacing(10)
     
     # Sensor data table with modern styling
@@ -2523,8 +2523,8 @@ def setup_ui(self):
     # Create Automation Tab
     automation_tab = QWidget()
     automation_layout = QHBoxLayout(automation_tab)
-    automation_layout.setContentsMargins(20, 20, 20, 20)
-    automation_layout.setSpacing(12)
+    automation_layout.setContentsMargins(10, 10, 10, 10)
+    automation_layout.setSpacing(10)
     
     # Center spacer left
     automation_layout.addStretch()
@@ -2540,14 +2540,15 @@ def setup_ui(self):
         }}
     """)
     automation_main_layout = QVBoxLayout(automation_main_container)
-    automation_main_layout.setContentsMargins(16, 16, 16, 16)
-    automation_main_layout.setSpacing(12)
+    automation_main_layout.setContentsMargins(10, 10, 10, 10)
+    automation_main_layout.setSpacing(10)
     
     # Automation sequences section
     automation_sequences_group = QGroupBox("Automation Sequences")
-    automation_sequences_group.setStyleSheet(GroupBoxStyles.elevated())
+    automation_sequences_group.setStyleSheet(GroupBoxStyles.default())
     automation_sequences_group.setMinimumHeight(100) # Allow vertical shrinking
     automation_sequences_layout = QVBoxLayout(automation_sequences_group)
+    automation_sequences_layout.setContentsMargins(10, 10, 10, 10)
     
     # Table to display defined automation sequences
     self.sequences_table = QTableWidget()
@@ -2861,7 +2862,7 @@ def setup_ui(self):
         QFrame {
             background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                 stop:0 #1a1a3a, stop:0.5 #2a2a5a, stop:1 #1a1a3a);
-            border-radius: 12px;
+            border-radius: 8px;
             border: 1px solid #3a3a6a;
         }
     """)
@@ -2930,7 +2931,7 @@ def setup_ui(self):
     project_group = QGroupBox("📁 Project")
     project_group_layout = QVBoxLayout(project_group)
     project_group_layout.setSpacing(8)
-    project_group_layout.setContentsMargins(12, 15, 12, 12)
+    project_group_layout.setContentsMargins(10, 10, 10, 10)
     
     # Store reference to the group box in the main window
     self.project_group = project_group
@@ -2990,7 +2991,7 @@ def setup_ui(self):
     test_series_group = QGroupBox("📋 Test Series")
     test_series_group_layout = QVBoxLayout(test_series_group)
     test_series_group_layout.setSpacing(8)
-    test_series_group_layout.setContentsMargins(12, 15, 12, 12)
+    test_series_group_layout.setContentsMargins(10, 10, 10, 10)
     
     # Store reference to the group box in the main window
     self.test_series_group = test_series_group
@@ -3034,7 +3035,7 @@ def setup_ui(self):
     run_group = QGroupBox("▶️ Run")
     run_group_layout = QVBoxLayout(run_group)
     run_group_layout.setSpacing(8)
-    run_group_layout.setContentsMargins(12, 15, 12, 12)
+    run_group_layout.setContentsMargins(10, 10, 10, 10)
     
     # Store reference to the group box in the main window
     self.run_group = run_group
@@ -3118,7 +3119,7 @@ def setup_ui(self):
     """)
     project_actions_layout = QHBoxLayout(project_actions_group)
     project_actions_layout.setSpacing(8)
-    project_actions_layout.setContentsMargins(12, 15, 12, 12)
+    project_actions_layout.setContentsMargins(10, 10, 10, 10)
     project_actions_group.setFont(sub_font)  # Reuse the same font
     
     # Modern button style
@@ -3188,26 +3189,7 @@ def setup_ui(self):
     
     # Project browser section
     project_browser_group = QGroupBox("📂 Project Browser")
-    project_browser_group.setStyleSheet("""
-        QGroupBox {
-            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                stop:0 #252550, stop:1 #1e1e40);
-            border: 1px solid #3a3a6a;
-            border-radius: 10px;
-            margin-top: 12px;
-            padding-top: 10px;
-            font-size: 13px;
-            font-weight: bold;
-            color: #fff;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            subcontrol-position: top left;
-            left: 15px;
-            padding: 0 8px;
-            color: #fff;
-        }
-    """)
+    project_browser_group.setStyleSheet(GroupBoxStyles.default())
     project_browser_group.setMinimumWidth(400) # Reduced from 750 to allow smaller window sizes
     project_browser_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
     project_browser_layout = QVBoxLayout(project_browser_group)
@@ -3415,7 +3397,7 @@ def setup_ui(self):
         }}
     """)
     notes_layout = QVBoxLayout(notes_tab)
-    notes_layout.setContentsMargins(15, 15, 15, 15)
+    notes_layout.setContentsMargins(10, 10, 10, 10)
     notes_layout.setSpacing(10)
     
     # HTML editor with modern theme styling
@@ -3427,7 +3409,7 @@ def setup_ui(self):
             font-size: 14px; 
             background: {COLORS.BG_CARD};
             color: {COLORS.TEXT_PRIMARY}; 
-            border-radius: 10px; 
+            border-radius: 8px; 
             padding: 12px;
             border: 1px solid {COLORS.BORDER_DEFAULT};
             selection-background-color: rgba(108, 92, 231, 0.45);

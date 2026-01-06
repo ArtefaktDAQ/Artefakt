@@ -27,12 +27,13 @@ class HelpSection(QFrame):
         self._setup_ui()
     
     def _setup_ui(self):
-        self.setStyleSheet("""
-            QFrame {
-                background-color: #252540;
-                border: 1px solid #3a3a5c;
-                border-radius: 6px;
-            }
+        from app.ui.theme import COLORS
+        self.setStyleSheet(f"""
+            QFrame {{
+                background-color: {COLORS.BG_CARD};
+                border: 1px solid {COLORS.BORDER_DEFAULT};
+                border-radius: 8px;
+            }}
         """)
         
         layout = QVBoxLayout(self)

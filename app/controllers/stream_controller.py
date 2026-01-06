@@ -508,7 +508,7 @@ class StreamController(QObject):
                         background: qlineargradient(x1:0, y1:0, x2:0.5, y2:1,
                             stop:0 rgba(33, 150, 243, 0.2),
                             stop:1 {base_bottom});
-                        border-radius: 12px;
+                        border-radius: 8px;
                         border: 2px solid {COLORS.INFO};
                     }}
                     QFrame:hover {{

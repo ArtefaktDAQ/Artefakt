@@ -197,7 +197,7 @@ class NotesController(QObject):
                 border: 1px solid {COLORS.BORDER_DEFAULT}; 
                 spacing: 6px; 
                 padding: 4px 8px; 
-                border-radius: 10px;
+                border-radius: 8px;
                 margin-bottom: 8px;
                 min-height: 32px;
             }}

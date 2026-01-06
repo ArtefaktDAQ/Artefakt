@@ -34,8 +34,8 @@ class Colors:
     # Hintergrundfarben (Dunkel-Theme)
     # -------------------------------------------------------------------------
     BG_DARK = "#0F0F1A"           # Haupthintergrund / Fenster
-    BG_CARD = "#1A1A2E"           # Karten, Panels, GroupBoxes
-    BG_ELEVATED = "#252540"       # Erhöhte Elemente, Hover-States
+    BG_CARD = "#141424"           # Karten, Panels, GroupBoxes
+    BG_ELEVATED = "#1A1A2E"       # Erhöhte Elemente, Hover-States
     BG_INPUT = "#2D2D44"          # Input-Felder, Dropdowns
     BG_SIDEBAR = "#1A022A"        # Sidebar-Basis
     
@@ -112,7 +112,7 @@ class SidebarTheme:
                 stop:0.5 rgba(18, 18, 30, 0.94),
                 stop:0.85 rgba(17, 17, 28, 0.96),
                 stop:1 rgba(15, 15, 26, 0.98));
-            border-radius: 14px;
+            border-radius: 8px;
             border: 1px solid rgba(255, 255, 255, 0.06);
         }}
         QLabel {{
@@ -176,7 +176,7 @@ class SidebarTheme:
             color: rgba(255, 255, 255, 0.6);
             background: transparent;
             border: none;
-            border-radius: 10px;
+            border-radius: 8px;
             margin: 3px 12px;
         }}
         QToolButton:hover {{
@@ -313,7 +313,7 @@ class NavigationStyles:
                     color: rgba(255, 255, 255, 0.6);
                     background: transparent;
                     border: none;
-                    border-radius: 10px;
+                    border-radius: 8px;
                     margin: 3px 12px;
                 }}
                 QToolButton:hover {{
@@ -839,7 +839,7 @@ class CardStyles:
             QFrame {{
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
                     stop:0 {COLORS.BG_ELEVATED}, stop:1 {COLORS.BG_CARD});
-                border-radius: 12px;
+                border-radius: 8px;
                 border: 1px solid {COLORS.BORDER_DEFAULT};
             }}
             QFrame:hover {{
@@ -860,7 +860,7 @@ class CardStyles:
                     stop:0 rgba(50, 50, 80, 0.95),
                     stop:0.5 rgba(40, 40, 65, 0.95),
                     stop:1 rgba(30, 30, 50, 0.95));
-                border-radius: 14px;
+                border-radius: 8px;
                 border: 1px solid rgba(255, 255, 255, 0.08);
             }}
             QFrame:hover {{
@@ -882,7 +882,7 @@ class CardStyles:
         return f"""
             QFrame {{
                 background: rgba(30, 30, 50, 0.7);
-                border-radius: 16px;
+                border-radius: 8px;
                 border: 1px solid rgba(255, 255, 255, 0.1);
             }}
             QFrame:hover {{
@@ -921,7 +921,7 @@ class CardStyles:
                 background: qlineargradient(x1:0, y1:0, x2:0.5, y2:1,
                     stop:0 {base_top},
                     stop:1 {base_bottom});
-                border-radius: 12px;
+                border-radius: 8px;
                 border: 2px solid {border_color};
             }}
             QFrame:hover {{
@@ -943,7 +943,7 @@ class CardStyles:
                 background: qlineargradient(x1:0, y1:0, x2:0.5, y2:1,
                     stop:0 rgba(50, 45, 75, 0.9),
                     stop:1 rgba(35, 35, 55, 0.85));
-                border-radius: 10px;
+                border-radius: 8px;
                 border: 1px solid rgba(255, 255, 255, 0.06);
             }}
             QFrame:hover {{
@@ -976,7 +976,7 @@ class CardStyles:
                     background: qlineargradient(x1:0, y1:0, x2:0.5, y2:1,
                         stop:0 rgba(76, 175, 80, 0.2),
                         stop:1 {base_bottom});
-                    border-radius: 12px;
+                    border-radius: 8px;
                     border: 2px solid {COLORS.SUCCESS};
                 }}
                 QFrame:hover {{
@@ -996,7 +996,7 @@ class CardStyles:
                     background: qlineargradient(x1:0, y1:0, x2:0.5, y2:1,
                         stop:0 {base_top},
                         stop:1 {base_bottom});
-                    border-radius: 12px;
+                    border-radius: 8px;
                     border: 2px solid {COLORS.TEXT_MUTED};
                 }}
                 QFrame:hover {{
@@ -1017,7 +1017,7 @@ class CardStyles:
         return f"""
             QFrame {{
                 background: {COLORS.BG_CARD};
-                border-radius: 16px;
+                border-radius: 8px;
                 border: 1px solid {COLORS.BORDER_DEFAULT};
             }}
             QLabel {{
@@ -1041,7 +1041,7 @@ class CardStyles:
                     stop:0 {COLORS.BG_ELEVATED},
                     stop:0.02 {COLORS.BG_ELEVATED},
                     stop:1 {COLORS.BG_CARD});
-                border-radius: 12px;
+                border-radius: 8px;
                 border: 1px solid {COLORS.BORDER_DEFAULT};
                 border-top: 3px solid {accent};
             }}
@@ -1343,9 +1343,9 @@ class GroupBoxStyles:
             QGroupBox {{
                 background-color: {COLORS.BG_CARD};
                 border: 1px solid {COLORS.BORDER_DEFAULT};
-                border-radius: 12px;
-                margin-top: 16px;
-                padding: 20px 15px 15px 15px;
+                border-radius: 8px;
+                margin-top: 8px;
+                padding: 10px 10px 10px 10px;
                 font-weight: bold;
             }}
             QGroupBox::title {{
@@ -1364,27 +1364,7 @@ class GroupBoxStyles:
     @staticmethod
     def tight() -> str:
         """Extra kompakte Variante für Platz-kritische Bereiche"""
-        return f"""
-            QGroupBox {{
-                background-color: {COLORS.BG_CARD};
-                border: 1px solid {COLORS.BORDER_DEFAULT};
-                border-radius: 8px;
-                margin-top: 8px;
-                padding: 10px 10px 10px 10px;
-                font-weight: bold;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                subcontrol-position: top left;
-                left: 10px;
-                padding: 3px 10px;
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 {COLORS.PRIMARY}, stop:1 {COLORS.PRIMARY_LIGHT});
-                border-radius: 5px;
-                color: white;
-                font-size: 11px;
-            }}
-        """
+        return GroupBoxStyles.default()
     
     @staticmethod
     def modern() -> str:
@@ -1398,9 +1378,9 @@ class GroupBoxStyles:
             QGroupBox {{
                 background-color: transparent;
                 border: 1px solid {COLORS.BORDER_DEFAULT};
-                border-radius: 12px;
-                margin-top: 16px;
-                padding: 20px 15px 15px 15px;
+                border-radius: 8px;
+                margin-top: 8px;
+                padding: 10px 10px 10px 10px;
                 font-weight: bold;
             }}
             QGroupBox::title {{
@@ -1446,9 +1426,9 @@ class GroupBoxStyles:
             QGroupBox {{
                 background-color: {COLORS.BG_CARD};
                 border: 2px solid {border_color};
-                border-radius: 12px;
-                margin-top: 16px;
-                padding: 20px 15px 15px 15px;
+                border-radius: 8px;
+                margin-top: 8px;
+                padding: 10px 10px 10px 10px;
                 font-weight: bold;
             }}
             QGroupBox::title {{
@@ -1471,9 +1451,9 @@ class GroupBoxStyles:
             QGroupBox {{
                 background-color: {COLORS.BG_ELEVATED};
                 border: 1px solid {COLORS.BORDER_HOVER};
-                border-radius: 14px;
-                margin-top: 18px;
-                padding: 22px 16px 16px 16px;
+                border-radius: 8px;
+                margin-top: 8px;
+                padding: 10px 10px 10px 10px;
                 font-weight: bold;
             }}
             QGroupBox::title {{
@@ -1501,8 +1481,8 @@ class GroupBoxStyles:
                 background-color: {COLORS.BG_CARD};
                 border: 1px solid {COLORS.BORDER_DEFAULT};
                 border-radius: 8px;
-                margin-top: 12px;
-                padding: 14px 10px 10px 10px;
+                margin-top: 8px;
+                padding: 10px 10px 10px 10px;
                 font-weight: bold;
             }}
             QGroupBox::title {{
@@ -1525,9 +1505,9 @@ class GroupBoxStyles:
             QGroupBox {{
                 background-color: {COLORS.BG_CARD};
                 border: 1px solid {COLORS.BORDER_DEFAULT};
-                border-radius: 16px;
-                margin-top: 20px;
-                padding: 24px 18px 18px 18px;
+                border-radius: 8px;
+                margin-top: 8px;
+                padding: 10px 10px 10px 10px;
                 font-weight: bold;
             }}
             QGroupBox::title {{
