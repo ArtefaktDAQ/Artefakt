@@ -327,11 +327,12 @@ class DataFlowWidget(QWidget):
     def _setup_ui(self):
         """Setup the main UI"""
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(20)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(10)
         
         # Title
         title_layout = QHBoxLayout()
+        title_layout.setContentsMargins(10, 5, 10, 5)
         
         title_label = QLabel("📊 DATA FLOW MONITOR")
         title_label.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
@@ -348,7 +349,41 @@ class DataFlowWidget(QWidget):
         
         main_layout.addLayout(title_layout)
         
-        # Main content area
+        # Create Scroll Area for the content
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                background: transparent;
+            }
+            QWidget#scroll_content {
+                background: transparent;
+            }
+            QScrollBar:vertical {
+                background-color: rgba(45, 45, 75, 0.3);
+                width: 10px;
+                border-radius: 5px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: rgba(85, 85, 125, 0.6);
+                border-radius: 5px;
+                min-height: 20px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+        """)
+        
+        scroll_content = QWidget()
+        scroll_content.setObjectName("scroll_content")
+        content_vlayout = QVBoxLayout(scroll_content)
+        content_vlayout.setContentsMargins(10, 10, 10, 10)
+        content_vlayout.setSpacing(20)
+        
+        # Main content area (Horizontal: Inputs | Manager | Outputs)
         content_layout = QHBoxLayout()
         content_layout.setSpacing(30)
         
@@ -414,6 +449,31 @@ class DataFlowWidget(QWidget):
         self.optical_card.add_stat_line("data_rate", "Data Rate:")
         self.optical_card.add_stat_line("total", "Total Samples:")
         sources_grid.addWidget(self.optical_card, 2, 1)
+
+        # Row 4: CSV Input, MQTT
+        # CSV Input card
+        self.csv_input_card = FlowCard("CSV Interface", "📂")
+        self.csv_input_card.add_stat_line("files", "Files:")
+        self.csv_input_card.add_stat_line("rate", "Sample Rate:")
+        self.csv_input_card.add_stat_line("data_rate", "Data Rate:")
+        self.csv_input_card.add_stat_line("total", "Total Samples:")
+        sources_grid.addWidget(self.csv_input_card, 3, 0)
+        
+        # MQTT card
+        self.mqtt_card = FlowCard("MQTT", "🌐")
+        self.mqtt_card.add_stat_line("topics", "Topics:")
+        self.mqtt_card.add_stat_line("rate", "Sample Rate:")
+        self.mqtt_card.add_stat_line("data_rate", "Data Rate:")
+        self.mqtt_card.add_stat_line("total", "Total Samples:")
+        sources_grid.addWidget(self.mqtt_card, 3, 1)
+
+        # Row 5: Remote DAQ
+        self.remote_daq_card = FlowCard("Remote DAQ", "📡")
+        self.remote_daq_card.add_stat_line("status", "Status:")
+        self.remote_daq_card.add_stat_line("sensors", "Sensors:")
+        self.remote_daq_card.add_stat_line("rate", "Sample Rate:")
+        self.remote_daq_card.add_stat_line("total", "Total Samples:")
+        sources_grid.addWidget(self.remote_daq_card, 4, 0, 1, 2) # Span across 2 columns
         
         left_column.addLayout(sources_grid)
         left_column.addStretch()
@@ -497,11 +557,22 @@ class DataFlowWidget(QWidget):
         right_column.addStretch()
         content_layout.addLayout(right_column)
         
-        main_layout.addLayout(content_layout)
+        content_vlayout.addLayout(content_layout)
         
         # BOTTOM: Command Log
         self.command_log = CommandLogWidget()
-        main_layout.addWidget(self.command_log)
+        content_vlayout.addWidget(self.command_log)
+        
+        scroll_area.setWidget(scroll_content)
+        main_layout.addWidget(scroll_area)
+        
+        # Apply dark theme
+        self.setStyleSheet("""
+            DataFlowWidget {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #1a1a2e, stop:0.5 #16213e, stop:1 #1a1a2e);
+            }
+        """)
         
         # Apply dark theme
         self.setStyleSheet("""
@@ -565,6 +636,33 @@ class DataFlowWidget(QWidget):
         self.optical_card.update_stat("rate", f"{optical['samples_per_sec']:.1f} Hz")
         self.optical_card.update_stat("data_rate", self.controller.format_rate(optical['bytes_per_sec']))
         self.optical_card.update_stat("total", str(optical['total_samples']))
+
+        # CSV Input
+        csv_in = stats['csv_input']
+        self.csv_input_card.set_active(csv_in['connected'])
+        self.csv_input_card.update_stat("files", str(csv_in['file_count']))
+        self.csv_input_card.update_stat("rate", f"{csv_in['samples_per_sec']:.1f} Hz")
+        self.csv_input_card.update_stat("data_rate", self.controller.format_rate(csv_in['bytes_per_sec']))
+        self.csv_input_card.update_stat("total", str(csv_in['total_samples']))
+        
+        # MQTT
+        mqtt = stats['mqtt']
+        self.mqtt_card.set_active(mqtt['connected'])
+        self.mqtt_card.update_stat("topics", str(mqtt['topic_count']))
+        self.mqtt_card.update_stat("rate", f"{mqtt['samples_per_sec']:.1f} Hz")
+        self.mqtt_card.update_stat("data_rate", self.controller.format_rate(mqtt['bytes_per_sec']))
+        self.mqtt_card.update_stat("total", str(mqtt['total_samples']))
+        
+        # Remote DAQ
+        remote = stats['remote_daq']
+        self.remote_daq_card.set_active(remote['connected'])
+        status_text = "Idle"
+        if remote['is_master']: status_text = "Streaming (Master)"
+        elif remote['is_client']: status_text = "Receiving (Client)"
+        self.remote_daq_card.update_stat("status", status_text)
+        self.remote_daq_card.update_stat("sensors", str(remote['sensor_count']))
+        self.remote_daq_card.update_stat("rate", f"{remote['samples_per_sec']:.1f} Hz")
+        self.remote_daq_card.update_stat("total", str(remote['total_samples']))
         
         # Data Manager
         dm = stats['data_manager']
@@ -633,7 +731,10 @@ class DataFlowWidget(QWidget):
             other['samples_per_sec'] > 0.1 or 
             camera['fps'] > 0.1 or
             audio['samples_per_sec'] > 0.1 or
-            optical['samples_per_sec'] > 0.1
+            optical['samples_per_sec'] > 0.1 or
+            csv_in['samples_per_sec'] > 0.1 or
+            mqtt['samples_per_sec'] > 0.1 or
+            remote['samples_per_sec'] > 0.1
         )
         self.graphs_card.set_active(any_data_flowing)
         self.graphs_card.update_stat("status", "Active" if any_data_flowing else "Idle")

@@ -196,20 +196,20 @@ class NotesController(QObject):
                     stop:0 {COLORS.BG_ELEVATED}, stop:1 {COLORS.BG_CARD});
                 border: 1px solid {COLORS.BORDER_DEFAULT}; 
                 spacing: 6px; 
-                padding: 8px 12px; 
+                padding: 4px 8px; 
                 border-radius: 10px;
-                margin-bottom: 10px;
-                min-height: 40px;
+                margin-bottom: 8px;
+                min-height: 32px;
             }}
             QToolButton {{
                 background: {COLORS.BG_INPUT};
                 color: {COLORS.TEXT_PRIMARY};
                 border: 1px solid {COLORS.BORDER_DEFAULT};
-                border-radius: 6px;
-                padding: 5px 8px;
+                border-radius: 5px;
+                padding: 3px 6px;
                 margin: 1px;
-                min-width: 28px;
-                min-height: 28px;
+                min-width: 24px;
+                min-height: 24px;
                 font-weight: 500;
             }}
             QToolButton:hover {{
@@ -224,9 +224,9 @@ class NotesController(QObject):
                 background: {COLORS.BG_INPUT};
                 color: {COLORS.TEXT_PRIMARY};
                 border: 1px solid {COLORS.BORDER_DEFAULT};
-                border-radius: 6px;
-                padding: 4px 8px;
-                min-height: 28px;
+                border-radius: 5px;
+                padding: 2px 6px;
+                min-height: 24px;
             }}
             QComboBox:hover {{
                 border-color: {COLORS.PRIMARY};
@@ -234,10 +234,10 @@ class NotesController(QObject):
             QComboBox::drop-down {{
                 subcontrol-origin: padding;
                 subcontrol-position: top right;
-                width: 18px;
+                width: 16px;
                 border-left: 1px solid {COLORS.BORDER_DEFAULT};
-                border-top-right-radius: 6px;
-                border-bottom-right-radius: 6px;
+                border-top-right-radius: 5px;
+                border-bottom-right-radius: 5px;
             }}
             QComboBox QAbstractItemView {{
                 background: {COLORS.BG_ELEVATED};
@@ -245,16 +245,16 @@ class NotesController(QObject):
                 selection-background-color: rgba(108, 92, 231, 0.45);
                 selection-color: {COLORS.TEXT_PRIMARY};
                 border: 1px solid {COLORS.BORDER_DEFAULT};
-                border-radius: 6px;
-                padding: 4px;
+                border-radius: 5px;
+                padding: 2px;
             }}
             QSpinBox {{
                 background: {COLORS.BG_INPUT};
                 color: {COLORS.TEXT_PRIMARY};
                 border: 1px solid {COLORS.BORDER_DEFAULT};
-                border-radius: 6px;
-                padding: 4px 8px;
-                min-height: 28px;
+                border-radius: 5px;
+                padding: 2px 6px;
+                min-height: 24px;
             }}
             QSpinBox:hover {{
                 border-color: {COLORS.PRIMARY};
@@ -262,7 +262,7 @@ class NotesController(QObject):
             QSpinBox::up-button, QSpinBox::down-button {{
                 background: {COLORS.BG_ELEVATED};
                 border: none;
-                width: 16px;
+                width: 14px;
             }}
             QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
                 background: {COLORS.PRIMARY_SUBTLE};

@@ -368,6 +368,10 @@ class StreamController(QObject):
     
     def process_remote_sensor_data(self, sensor_data):
         """Process received sensor data and add to local sensors"""
+        # Record in data flow controller
+        if self.main_window and hasattr(self.main_window, 'data_flow_controller'):
+            self.main_window.data_flow_controller.record_remote_daq_data(len(str(sensor_data)))
+
         # Create or update remote sensor
         remote_sensor = RemoteSensor(
             id=sensor_data.sensor_id,
@@ -387,6 +391,10 @@ class StreamController(QObject):
     
     def process_remote_video_frame(self, video_frame):
         """Process received video frame"""
+        # Record in data flow controller
+        if self.main_window and hasattr(self.main_window, 'data_flow_controller'):
+            self.main_window.data_flow_controller.record_remote_daq_data(len(video_frame.frame_data))
+
         # Convert bytes to numpy array
         import numpy as np
         import cv2

@@ -39,6 +39,9 @@ class DataFlowController(QObject):
             'camera': collections.deque(maxlen=100),
             'audio': collections.deque(maxlen=100),
             'optical': collections.deque(maxlen=100),
+            'csv_input': collections.deque(maxlen=100),
+            'remote_daq': collections.deque(maxlen=100),
+            'mqtt': collections.deque(maxlen=100),
         }
         self._byte_timestamps = {
             'arduino': collections.deque(maxlen=100),  # (timestamp, bytes) tuples
@@ -48,6 +51,9 @@ class DataFlowController(QObject):
             'audio': collections.deque(maxlen=100),
             'optical': collections.deque(maxlen=100),
             'csv': collections.deque(maxlen=100),
+            'csv_input': collections.deque(maxlen=100),
+            'remote_daq': collections.deque(maxlen=100),
+            'mqtt': collections.deque(maxlen=100),
         }
         
         # Rolling average buffers for smoothing (store last N rate values)
@@ -59,6 +65,9 @@ class DataFlowController(QObject):
             'camera': collections.deque(maxlen=self._rolling_window_size),
             'audio': collections.deque(maxlen=self._rolling_window_size),
             'optical': collections.deque(maxlen=self._rolling_window_size),
+            'csv_input': collections.deque(maxlen=self._rolling_window_size),
+            'remote_daq': collections.deque(maxlen=self._rolling_window_size),
+            'mqtt': collections.deque(maxlen=self._rolling_window_size),
         }
         self._rolling_byte_rates = {
             'arduino': collections.deque(maxlen=self._rolling_window_size),
@@ -68,6 +77,9 @@ class DataFlowController(QObject):
             'audio': collections.deque(maxlen=self._rolling_window_size),
             'optical': collections.deque(maxlen=self._rolling_window_size),
             'csv': collections.deque(maxlen=self._rolling_window_size),
+            'csv_input': collections.deque(maxlen=self._rolling_window_size),
+            'remote_daq': collections.deque(maxlen=self._rolling_window_size),
+            'mqtt': collections.deque(maxlen=self._rolling_window_size),
         }
         
         # Update timer (1 Hz for display updates)
@@ -126,6 +138,32 @@ class DataFlowController(QObject):
                 'total_samples': 0,
                 'last_update': None,
             },
+            'csv_input': {
+                'connected': False,
+                'file_count': 0,
+                'samples_per_sec': 0.0,
+                'bytes_per_sec': 0.0,
+                'total_samples': 0,
+                'last_update': None,
+            },
+            'remote_daq': {
+                'connected': False,
+                'is_client': False,
+                'is_master': False,
+                'sensor_count': 0,
+                'samples_per_sec': 0.0,
+                'bytes_per_sec': 0.0,
+                'total_samples': 0,
+                'last_update': None,
+            },
+            'mqtt': {
+                'connected': False,
+                'topic_count': 0,
+                'samples_per_sec': 0.0,
+                'bytes_per_sec': 0.0,
+                'total_samples': 0,
+                'last_update': None,
+            },
             'recorder': {
                 'recording': False,
                 'duration_sec': 0.0,
@@ -172,7 +210,7 @@ class DataFlowController(QObject):
         self._mutex.lock()
         try:
             # Calculate sample rates for each device
-            for key in ['arduino', 'labjack', 'other_serial']:
+            for key in ['arduino', 'labjack', 'other_serial', 'csv_input', 'remote_daq', 'mqtt']:
                 # Remove old timestamps outside the window
                 while (self._sample_timestamps[key] and 
                        current_time - self._sample_timestamps[key][0] > window_seconds):
@@ -346,7 +384,10 @@ class DataFlowController(QObject):
                 self.stats['labjack']['samples_per_sec'] +
                 self.stats['other_serial']['samples_per_sec'] +
                 self.stats['audio']['samples_per_sec'] +
-                self.stats['optical']['samples_per_sec']
+                self.stats['optical']['samples_per_sec'] +
+                self.stats['csv_input']['samples_per_sec'] +
+                self.stats['remote_daq']['samples_per_sec'] +
+                self.stats['mqtt']['samples_per_sec']
             )
             
         finally:
@@ -405,12 +446,18 @@ class DataFlowController(QObject):
                 other_sensors = len([s for s in sc.sensors if getattr(s, 'interface_type', '') == 'OtherSerial'])
                 audio_sensors = len([s for s in sc.sensors if getattr(s, 'interface_type', '') == 'AudioSensor'])
                 optical_sensors = len([s for s in sc.sensors if getattr(s, 'interface_type', '') == 'OpticalSensor'])
+                csv_input_sensors = len([s for s in sc.sensors if getattr(s, 'interface_type', '') == 'CSVInterface'])
+                remote_daq_sensors = len([s for s in sc.sensors if getattr(s, 'interface_type', '') == 'remote_stream'])
+                mqtt_sensors = len([s for s in sc.sensors if getattr(s, 'interface_type', '') == 'MQTT'])
                 
                 self.stats['arduino']['sensor_count'] = arduino_sensors
                 self.stats['labjack']['channel_count'] = labjack_sensors
                 self.stats['other_serial']['device_count'] = other_sensors
                 self.stats['audio']['sensor_count'] = audio_sensors
                 self.stats['optical']['sensor_count'] = optical_sensors
+                self.stats['csv_input']['file_count'] = csv_input_sensors
+                self.stats['remote_daq']['sensor_count'] = remote_daq_sensors
+                self.stats['mqtt']['topic_count'] = mqtt_sensors
                 
                 # Check if audio sensors are connected
                 if hasattr(sc, 'audio_sensor_interfaces') and sc.audio_sensor_interfaces:
@@ -427,6 +474,20 @@ class DataFlowController(QObject):
                     self.stats['optical']['connected'] = connected_optical > 0
                 else:
                     self.stats['optical']['connected'] = False
+
+            # MQTT & CSV Input Support
+            if hasattr(self.main_window, 'data_collection_controller'):
+                dcc = self.main_window.data_collection_controller
+                if hasattr(dcc, 'mqtt_thread') and dcc.mqtt_thread:
+                    self.stats['mqtt']['connected'] = getattr(dcc.mqtt_thread, 'connected', False)
+                else:
+                    self.stats['mqtt']['connected'] = False
+                
+                if hasattr(dcc, 'csv_thread') and dcc.csv_thread:
+                    # CSV thread is considered connected if it has any active interfaces
+                    self.stats['csv_input']['connected'] = len(dcc.csv_thread.interfaces) > 0
+                else:
+                    self.stats['csv_input']['connected'] = False
             
             # Camera Controller stats
             if hasattr(self.main_window, 'camera_controller'):
@@ -463,6 +524,10 @@ class DataFlowController(QObject):
                 self.stats['stream']['is_master'] = stream.is_master
                 self.stats['stream']['stream_name'] = stream.current_stream_name
                 # Client count would need to be tracked in the stream controller
+                
+                self.stats['remote_daq']['connected'] = stream.is_client or stream.is_master
+                self.stats['remote_daq']['is_client'] = stream.is_client
+                self.stats['remote_daq']['is_master'] = stream.is_master
             
             # Automation Controller stats
             if hasattr(self.main_window, 'automation_controller'):
@@ -565,6 +630,45 @@ class DataFlowController(QObject):
                 self._byte_timestamps['optical'].append((current_time, byte_size))
             self.stats['optical']['total_samples'] += 1
             self.stats['optical']['last_update'] = current_time
+        finally:
+            self._mutex.unlock()
+            
+    def record_csv_input_data(self, byte_size=0):
+        """Record data received from CSV input interface"""
+        current_time = time.time()
+        self._mutex.lock()
+        try:
+            self._sample_timestamps['csv_input'].append(current_time)
+            if byte_size > 0:
+                self._byte_timestamps['csv_input'].append((current_time, byte_size))
+            self.stats['csv_input']['total_samples'] += 1
+            self.stats['csv_input']['last_update'] = current_time
+        finally:
+            self._mutex.unlock()
+            
+    def record_remote_daq_data(self, byte_size=0):
+        """Record data received from remote DAQ stream"""
+        current_time = time.time()
+        self._mutex.lock()
+        try:
+            self._sample_timestamps['remote_daq'].append(current_time)
+            if byte_size > 0:
+                self._byte_timestamps['remote_daq'].append((current_time, byte_size))
+            self.stats['remote_daq']['total_samples'] += 1
+            self.stats['remote_daq']['last_update'] = current_time
+        finally:
+            self._mutex.unlock()
+            
+    def record_mqtt_data(self, byte_size=0):
+        """Record data received from MQTT topics"""
+        current_time = time.time()
+        self._mutex.lock()
+        try:
+            self._sample_timestamps['mqtt'].append(current_time)
+            if byte_size > 0:
+                self._byte_timestamps['mqtt'].append((current_time, byte_size))
+            self.stats['mqtt']['total_samples'] += 1
+            self.stats['mqtt']['last_update'] = current_time
         finally:
             self._mutex.unlock()
     

@@ -51,8 +51,8 @@ class DashMetricCard(QFrame):
         self.accent_color = color
         
         self.setStyleSheet(CardStyles.metric_card(color))
-        self.setMinimumHeight(80)
-        self.setMaximumHeight(100)
+        self.setMinimumHeight(70) # Reduced from 80
+        self.setMaximumHeight(90) # Reduced from 100
         
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
@@ -156,10 +156,21 @@ class DashMetricCard(QFrame):
 
 def setup_ui(self):
     """Set up the main user interface"""
+    # Create a scroll area to allow clipping when window is shrunk
+    # This allows the window to be smaller than the minimum size of its contents
+    scroll_area = QScrollArea()
+    scroll_area.setWidgetResizable(True)
+    scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+    # Hide vertical scrollbar but allow horizontal if needed for clipping
+    scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    self.setCentralWidget(scroll_area)
+
     # Create central widget with dark background
     central_widget = QWidget()
     central_widget.setStyleSheet(f"background-color: {COLORS.BG_DARK};")
-    self.setCentralWidget(central_widget)
+    scroll_area.setWidget(central_widget)
+    
     main_layout = QHBoxLayout(central_widget)
     main_layout.setSpacing(12)
     main_layout.setContentsMargins(12, 12, 12, 12)
@@ -231,8 +242,8 @@ def setup_ui(self):
     self.version_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
     sidebar_layout.addWidget(self.version_text)
     
-    # Add vertical spacing after the version text
-    self.sidebar_v_spacer1 = QSpacerItem(20, 15, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+    # Add vertical spacing after the version text - reduced
+    self.sidebar_v_spacer1 = QSpacerItem(20, 10, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
     sidebar_layout.addItem(self.sidebar_v_spacer1)
     
     # Add separator
@@ -248,10 +259,7 @@ def setup_ui(self):
     project_status_layout.setContentsMargins(5, 0, 5, 0)
     project_status_layout.setSpacing(1)
     
-    # Project status label
-    project_status_label = QLabel("Project Status")
-    project_status_label.setStyleSheet(SidebarTheme.STATUS_LABEL)
-    project_status_layout.addWidget(project_status_label)
+    # Project status label - removed as requested
     
     # Common style for labels (fixed width for alignment)
     label_style = "color: rgba(255, 255, 255, 0.5); font-size: 11px; background: transparent;"
@@ -326,6 +334,9 @@ def setup_ui(self):
     # Use navigation button style from theme
     tool_button_style = SidebarTheme.NAV_BUTTON
 
+    # Nav buttons fixed height - slightly increased to prevent text clipping
+    nav_btn_height = 70 
+    
     self.nav_buttons = []
     for button_name in nav_buttons:
         # Create a tool button with icon on top and text below
@@ -341,26 +352,26 @@ def setup_ui(self):
         # Load SVG icon and set it
         svg_path = resource_path(f"app/ui/{button_name}.svg")
         btn.setIcon(QIcon(svg_path))
-        btn.setIconSize(QSize(32, 32))
+        btn.setIconSize(QSize(28, 28)) # Slightly smaller icon
         
         # Set the tool button style to text under icon
         btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         
         # Fixed size to prevent layout recalculation on hover
-        btn.setFixedHeight(80)
+        btn.setFixedHeight(nav_btn_height)
         btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         
-        # Add spacing between specific buttons
+        # Add spacing between specific buttons - reduced
         if button_name == "Projects" or button_name == "Settings":
             sidebar_layout.addWidget(btn)
             # Add spacer after Projects (and before Camera)
             if button_name == "Projects":
-                spacer = QSpacerItem(20, 20, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+                spacer = QSpacerItem(20, 10, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
                 sidebar_layout.addItem(spacer)
         elif button_name == "Automation":
             sidebar_layout.addWidget(btn)
             # Add spacer after Automation (and before Dashboard)
-            spacer = QSpacerItem(20, 20, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+            spacer = QSpacerItem(20, 10, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
             sidebar_layout.addItem(spacer)
         else:
             sidebar_layout.addWidget(btn)
@@ -541,21 +552,22 @@ def setup_ui(self):
     # --- NEW: Dashboard Header (Status & Project Info) ---
     header_frame = QFrame()
     header_frame.setStyleSheet(f"background-color: {COLORS.BG_CARD}; border-radius: 8px; border: 1px solid {COLORS.BORDER_DEFAULT};")
-    header_frame.setFixedHeight(60)
+    header_frame.setFixedHeight(50) # Reduced from 60
     header_layout = QHBoxLayout(header_frame)
     header_layout.setContentsMargins(15, 0, 15, 0)
 
     # Status Indicators Group
     status_layout = QHBoxLayout()
-    status_layout.setSpacing(15)
+    status_layout.setSpacing(8) # Reduced from 15
     
     def create_status_indicator(label_text):
         container = QHBoxLayout()
+        container.setSpacing(4) # Tighter spacing
         led = QFrame()
-        led.setFixedSize(12, 12)
-        led.setStyleSheet(StatusIndicator.inactive(12))
+        led.setFixedSize(10, 10) # Slightly smaller LED
+        led.setStyleSheet(StatusIndicator.inactive(10))
         lbl = QLabel(label_text)
-        lbl.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 11px; font-weight: bold;")
+        lbl.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 10px; font-weight: bold;")
         container.addWidget(led)
         container.addWidget(lbl)
         return container, led
@@ -584,19 +596,19 @@ def setup_ui(self):
     status_layout.addLayout(auto_cont)
     
     header_layout.addLayout(status_layout)
-    header_layout.addSpacing(30)
+    header_layout.addSpacing(10) # Reduced from 15
     
     # Project Summary info
     project_info_layout = QHBoxLayout()
-    project_info_layout.setSpacing(20)
+    project_info_layout.setSpacing(8) # Reduced from 12
     
     def create_info_item(label, value_placeholder):
         layout = QVBoxLayout()
         layout.setSpacing(0)
         lbl = QLabel(label)
-        lbl.setStyleSheet(f"color: {COLORS.TEXT_MUTED}; font-size: 10px; text-transform: uppercase;")
+        lbl.setStyleSheet(f"color: {COLORS.TEXT_MUTED}; font-size: 9px; text-transform: uppercase;")
         val = QLabel(value_placeholder)
-        val.setStyleSheet(f"color: {COLORS.TEXT_PRIMARY}; font-size: 13px; font-weight: bold;")
+        val.setStyleSheet(f"color: {COLORS.TEXT_PRIMARY}; font-size: 11px; font-weight: bold;")
         layout.addWidget(lbl)
         layout.addWidget(val)
         return layout, val
@@ -622,48 +634,48 @@ def setup_ui(self):
     self.dashboard_timespan = QComboBox()
     self.dashboard_timespan.addItems(["10s", "30s", "1min", "5min", "15min", "30min", "1h", "3h", "6h", "12h", "24h", "All"])
     self.dashboard_timespan.setCurrentText("All")
-    self.dashboard_timespan.setMinimumWidth(80)
-    self.dashboard_timespan.setStyleSheet(f"color: {COLORS.TEXT_PRIMARY}; font-size: 13px; font-weight: bold;")
+    self.dashboard_timespan.setMinimumWidth(60) # Reduced from 80
+    self.dashboard_timespan.setStyleSheet(f"color: {COLORS.TEXT_PRIMARY}; font-size: 11px; font-weight: bold;")
     timespan_layout.addWidget(self.dashboard_timespan)
     project_info_layout.addLayout(timespan_layout)
     
     header_layout.addLayout(project_info_layout)
-    header_layout.addSpacing(20)
+    header_layout.addSpacing(10) # Reduced from 20
     
     # Display Options Checkboxes (arranged in two rows)
     display_options_layout = QVBoxLayout()
-    display_options_layout.setSpacing(5)
+    display_options_layout.setSpacing(2) # Reduced from 5
     display_options_layout.setContentsMargins(0, 0, 0, 0)
     
     # First row
     first_row = QHBoxLayout()
-    first_row.setSpacing(15)
+    first_row.setSpacing(10) # Reduced from 15
     first_row.setContentsMargins(0, 0, 0, 0)
     
-    self.checkbox_automation_status = QCheckBox("Automation Status\u00A0")
+    self.checkbox_automation_status = QCheckBox("Auto Status") # Shortened
     self.checkbox_automation_status.setChecked(True)
     self.checkbox_automation_status.setStyleSheet(f"""
         QCheckBox {{
             color: {COLORS.TEXT_SECONDARY};
-            font-size: 11px;
+            font-size: 10px;
         }}
         QCheckBox::indicator {{
-            width: 14px;
-            height: 14px;
+            width: 12px;
+            height: 12px;
         }}
     """)
     first_row.addWidget(self.checkbox_automation_status)
     
-    self.checkbox_recent_events = QCheckBox("Recent System Events")
+    self.checkbox_recent_events = QCheckBox("Events") # Shortened
     self.checkbox_recent_events.setChecked(True)
     self.checkbox_recent_events.setStyleSheet(f"""
         QCheckBox {{
             color: {COLORS.TEXT_SECONDARY};
-            font-size: 11px;
+            font-size: 10px;
         }}
         QCheckBox::indicator {{
-            width: 14px;
-            height: 14px;
+            width: 12px;
+            height: 12px;
         }}
     """)
     first_row.addWidget(self.checkbox_recent_events)
@@ -672,7 +684,7 @@ def setup_ui(self):
     
     # Second row
     second_row = QHBoxLayout()
-    second_row.setSpacing(15)
+    second_row.setSpacing(10) # Reduced from 15
     second_row.setContentsMargins(0, 0, 0, 0)
     
     self.checkbox_image = QCheckBox("Image")
@@ -680,27 +692,27 @@ def setup_ui(self):
     self.checkbox_image.setStyleSheet(f"""
         QCheckBox {{
             color: {COLORS.TEXT_SECONDARY};
-            font-size: 11px;
+            font-size: 10px;
         }}
         QCheckBox::indicator {{
-            width: 14px;
-            height: 14px;
+            width: 12px;
+            height: 12px;
         }}
     """)
     # Set maximum width to constrain the checkbox text space and ensure proper alignment
-    self.checkbox_image.setMaximumWidth(70)
+    self.checkbox_image.setMaximumWidth(60)
     second_row.addWidget(self.checkbox_image)
     
-    self.checkbox_camera_preview = QCheckBox("Camera Preview")
+    self.checkbox_camera_preview = QCheckBox("Camera") # Renamed from "Preview"
     self.checkbox_camera_preview.setChecked(True)
     self.checkbox_camera_preview.setStyleSheet(f"""
         QCheckBox {{
             color: {COLORS.TEXT_SECONDARY};
-            font-size: 11px;
+            font-size: 10px;
         }}
         QCheckBox::indicator {{
-            width: 14px;
-            height: 14px;
+            width: 12px;
+            height: 12px;
         }}
     """)
     second_row.addWidget(self.checkbox_camera_preview)
@@ -805,7 +817,7 @@ def setup_ui(self):
     
     # Main content splitter
     self.dashboard_splitter = QSplitter(Qt.Orientation.Vertical)
-    self.dashboard_splitter.setChildrenCollapsible(False)
+    self.dashboard_splitter.setChildrenCollapsible(True) # Allow sliding to hide sections entirely
     self.dashboard_splitter.setStyleSheet(f"""
         QSplitter::handle {{
             background-color: {COLORS.BORDER_DEFAULT};
@@ -918,6 +930,7 @@ def setup_ui(self):
 
     # --- ADDED --- New table for detailed status
     self.dashboard_automation_table = QTableWidget()
+    self.dashboard_automation_table.setMinimumHeight(80) # Reduced from default
     self.dashboard_automation_table.setColumnCount(5)
     self.dashboard_automation_table.setHorizontalHeaderLabels(["Sequence", "Status", "Current Step", "Next Step", "Time/Trigger"])
     # Allow columns to resize, make Sequence name stretch
@@ -931,7 +944,7 @@ def setup_ui(self):
     self.dashboard_automation_table.setAlternatingRowColors(True)
     dashboard_automation_layout.addWidget(self.dashboard_automation_table)
 
-    self.dashboard_automation_group.setMinimumWidth(350) # Give it a slightly wider minimum width for the table
+    self.dashboard_automation_group.setMinimumWidth(200) # Reduced from 350 to allow better window shrinking
 
     # Add automation group to the splitter
     lower_splitter.addWidget(self.dashboard_automation_group)
@@ -962,7 +975,7 @@ def setup_ui(self):
     self.dashboard_snapshot_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
     self.dashboard_snapshot_label.setStyleSheet(f"background-color: #222; color: {COLORS.TEXT_SECONDARY}; border: 1px solid {COLORS.BORDER_DEFAULT};")
     # Small minimum size so it doesn't block layout shrinking
-    self.dashboard_snapshot_label.setMinimumSize(80, 80)
+    self.dashboard_snapshot_label.setMinimumSize(50, 50) # Reduced from 80, 80
     # Use Ignored policy so the label's size hint (from the pixmap) doesn't force the layout to expand.
     # The label will instead take the space provided by the layout.
     self.dashboard_snapshot_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
@@ -992,7 +1005,7 @@ def setup_ui(self):
     lower_splitter.addWidget(self.dashboard_snapshot_group)
 
     # Camera preview group box (Right side)
-    self.dashboard_camera_group = QGroupBox("Camera Preview")
+    self.dashboard_camera_group = QGroupBox("Camera") # Renamed from "Camera Preview"
     self.dashboard_camera_group.setStyleSheet(GroupBoxStyles.default())
     dashboard_camera_layout = QVBoxLayout(self.dashboard_camera_group)
     
@@ -1031,14 +1044,15 @@ def setup_ui(self):
 
     # Dashboard video audio controls
     camera_source_layout.addSpacing(12)
-    camera_source_layout.addWidget(QLabel("Volume:"))
+    camera_source_layout.addWidget(QLabel("Vol.:"))
     self.dashboard_volume_slider = QSlider(Qt.Orientation.Horizontal)
     self.dashboard_volume_slider.setRange(0, 100)
     self.dashboard_volume_slider.setValue(100)
-    self.dashboard_volume_slider.setFixedWidth(120)
+    self.dashboard_volume_slider.setFixedWidth(100) # Slightly reduced
     self.dashboard_volume_slider.setEnabled(True)
     camera_source_layout.addWidget(self.dashboard_volume_slider)
-    self.dashboard_mute_checkbox = QCheckBox("Mute")
+    self.dashboard_mute_checkbox = QCheckBox("🔇")
+    self.dashboard_mute_checkbox.setToolTip("Mute")
     self.dashboard_mute_checkbox.setEnabled(True)
     camera_source_layout.addWidget(self.dashboard_mute_checkbox)
     
@@ -1049,12 +1063,12 @@ def setup_ui(self):
     self.dashboard_camera_label = QLabel("No camera connected")
     self.dashboard_camera_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
     self.dashboard_camera_label.setStyleSheet("background-color: #222; color: white;")
-    self.dashboard_camera_label.setMinimumHeight(150)
+    self.dashboard_camera_label.setMinimumHeight(80) # Reduced from 150
     dashboard_camera_layout.addWidget(self.dashboard_camera_label)
 
     # Video playback widget for review mode (hidden by default)
     self.dashboard_video_widget = QVideoWidget()
-    self.dashboard_video_widget.setMinimumHeight(150)
+    self.dashboard_video_widget.setMinimumHeight(80) # Reduced from 150
     self.dashboard_video_widget.hide()
     dashboard_camera_layout.addWidget(self.dashboard_video_widget)
     
@@ -1543,7 +1557,7 @@ def setup_ui(self):
         font-size: 16px;
         border-radius: 8px;
     """)
-    self.camera_label.setMinimumSize(640, 480)
+    self.camera_label.setMinimumSize(320, 240) # Reduced from 640, 480 to allow window shrinking
     
     # Enable mouse tracking for overlay dragging
     self.camera_label.setMouseTracking(True)
@@ -1593,14 +1607,15 @@ def setup_ui(self):
     camera_controls.addWidget(self.add_overlay_btn)
 
     # Audio controls for camera/replay
-    camera_controls.addWidget(QLabel("Volume:"))
+    camera_controls.addWidget(QLabel("Vol.:"))
     self.camera_volume_slider = QSlider(Qt.Orientation.Horizontal)
     self.camera_volume_slider.setRange(0, 100)
     self.camera_volume_slider.setValue(100)
-    self.camera_volume_slider.setFixedWidth(140)
+    self.camera_volume_slider.setFixedWidth(120) # Slightly reduced from 140
     self.camera_volume_slider.setEnabled(True)
     camera_controls.addWidget(self.camera_volume_slider)
-    self.camera_mute_checkbox = QCheckBox("Mute")
+    self.camera_mute_checkbox = QCheckBox("🔇")
+    self.camera_mute_checkbox.setToolTip("Mute")
     self.camera_mute_checkbox.setEnabled(True)
     camera_controls.addWidget(self.camera_mute_checkbox)
 
@@ -1669,7 +1684,7 @@ def setup_ui(self):
     
     # Video display area
     self.video_display = QVideoWidget()
-    self.video_display.setMinimumHeight(400)
+    self.video_display.setMinimumHeight(200) # Reduced from 400 to allow window shrinking
     self.video_display.setStyleSheet("background-color: #222; border: 1px solid #444;")
     video_player_layout.addWidget(self.video_display)
     
@@ -1692,16 +1707,17 @@ def setup_ui(self):
     video_controls_layout.addWidget(self.stop_video_btn)
 
     # Volume controls
-    self.video_volume_label = QLabel("Volume:")
+    self.video_volume_label = QLabel("Vol.:")
     video_controls_layout.addWidget(self.video_volume_label)
     
     self.video_volume_slider = QSlider(Qt.Orientation.Horizontal)
     self.video_volume_slider.setRange(0, 100)
     self.video_volume_slider.setValue(100)
-    self.video_volume_slider.setFixedWidth(140)
+    self.video_volume_slider.setFixedWidth(120) # Slightly reduced from 140
     video_controls_layout.addWidget(self.video_volume_slider)
     
-    self.video_mute_checkbox = QCheckBox("Mute")
+    self.video_mute_checkbox = QCheckBox("🔇")
+    self.video_mute_checkbox.setToolTip("Mute")
     video_controls_layout.addWidget(self.video_mute_checkbox)
     
     video_player_layout.addLayout(video_controls_layout)
@@ -1749,9 +1765,18 @@ def setup_ui(self):
     sensors_main_layout.setContentsMargins(16, 16, 16, 16)
     sensors_main_layout.setSpacing(12)
     
-    # Horizontal layout for devices (left) and sensor management (right)
-    sensors_content_layout = QHBoxLayout()
-    sensors_content_layout.setSpacing(12)
+    # Horizontal splitter for devices (left) and sensor management (right)
+    self.sensors_splitter = QSplitter(Qt.Orientation.Horizontal)
+    self.sensors_splitter.setChildrenCollapsible(False)
+    self.sensors_splitter.setHandleWidth(2)
+    self.sensors_splitter.setStyleSheet(f"""
+        QSplitter::handle {{
+            background-color: {COLORS.BORDER_DEFAULT};
+        }}
+        QSplitter::handle:hover {{
+            background-color: {COLORS.PRIMARY};
+        }}
+    """)
     
     # Device cards section with proper styling (matching automation tab)
     devices_section = QGroupBox("Interfaces")
@@ -1770,8 +1795,8 @@ def setup_ui(self):
     # Modern card style for devices - matching theme system
     device_card_style = CardStyles.device_card(connected=False)
     
-    # Card size
-    card_width, card_height = 100, 85
+    # Card size - reduced to allow better height compression
+    card_width, card_height = 100, 78 
     
     # Arduino container
     arduino_container = QFrame()
@@ -1849,18 +1874,26 @@ def setup_ui(self):
     # Add stretch to push cards to top
     devices_cards_layout.addStretch()
     
+    # Wrap device cards in a scroll area to prevent height blocking
+    devices_scroll = QScrollArea()
+    devices_scroll.setWidgetResizable(True)
+    devices_scroll.setFrameShape(QFrame.Shape.NoFrame)
+    # Remove stylesheet that was forcing transparency on children
+    devices_scroll.setWidget(devices_cards_container)
+    
     # Store reference for StreamController to add Remote DAQ button
     self.devices_cards_layout = devices_cards_layout
     self.device_card_style = device_card_style
     self.device_card_size = (card_width, card_height)
     
-    devices_section_layout.addWidget(devices_cards_container)
+    devices_section_layout.addWidget(devices_scroll)
     
     # Set maximum width for devices section to prevent it from taking too much space
     devices_section.setMaximumWidth(200)
+    devices_section.setMinimumHeight(100) # Allow it to shrink vertically
     
-    # Add devices section to horizontal layout (left side)
-    sensors_content_layout.addWidget(devices_section, 0)  # No stretch, fixed size
+    # Add devices section to horizontal splitter (left side)
+    self.sensors_splitter.addWidget(devices_section)
 
     # Card content styles (smaller for compact cards)
     card_label_style = "font-size: 10px; font-weight: bold; color: #fff; border: none; background-color: transparent;"
@@ -2059,7 +2092,7 @@ def setup_ui(self):
     self.data_table.setStyleSheet(TableStyles.default())
     
     # Allow table to fit within its container and scroll horizontally if needed
-    self.data_table.setMinimumHeight(200)
+    self.data_table.setMinimumHeight(100) # Reduced from 200 to allow shrinking
     self.data_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
     self.data_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
     self.data_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -2102,11 +2135,14 @@ def setup_ui(self):
     self.data_table.cellClicked.connect(self.select_sensor)
     self.data_table.cellDoubleClicked.connect(lambda row, col: self.sensor_controller.edit_sensor() if hasattr(self, 'sensor_controller') else None)
     
-    # Add sensor container to horizontal layout (right side) with stretch to allow expansion
-    sensors_content_layout.addWidget(sensor_container, 1)  # Stretch factor 1 to allow expansion
+    # Add sensor container to horizontal splitter (right side)
+    self.sensors_splitter.addWidget(sensor_container)
     
-    # Add horizontal content layout to main vertical layout
-    sensors_main_layout.addLayout(sensors_content_layout)
+    # Set initial sizes for the sensors splitter (e.g., 200px for devices, remainder for table)
+    self.sensors_splitter.setSizes([200, 1000])
+    
+    # Add horizontal splitter to main vertical layout
+    sensors_main_layout.addWidget(self.sensors_splitter)
     
     # Bottom row with help button
     sensors_bottom_layout = QHBoxLayout()
@@ -2182,11 +2218,25 @@ def setup_ui(self):
     graphs_splitter = QSplitter(Qt.Orientation.Horizontal)
     graphs_layout.addWidget(graphs_splitter)
     
-    # Left side - Graph controls and info
+    # Left side - Graph controls and info - wrapped in scroll area for small screens
+    graph_controls_scroll = QScrollArea()
+    graph_controls_scroll.setWidgetResizable(True)
+    graph_controls_scroll.setFrameShape(QFrame.Shape.NoFrame)
+    graph_controls_scroll.setMinimumWidth(250)
+    graph_controls_scroll.setMaximumWidth(400)
+    # Only horizontal scrollbar when necessary for the graph controls
+    graph_controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    graph_controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    
     graph_controls_widget = QWidget()
+    graph_controls_widget.setObjectName("graph_controls_widget")
+    # Set a minimum width to ensure horizontal scrollbar appears when shrunk
+    graph_controls_widget.setMinimumWidth(280) 
     graph_controls_layout = QVBoxLayout(graph_controls_widget)
-    graph_controls_widget.setMinimumWidth(300)
-    graph_controls_widget.setMaximumWidth(400)
+    graph_controls_layout.setContentsMargins(0, 0, 10, 0)
+    graph_controls_widget.setMinimumHeight(100)
+    
+    graph_controls_scroll.setWidget(graph_controls_widget)
     
     # Graph type selection
     graph_type_group = QGroupBox("Graph Type")
@@ -2463,7 +2513,7 @@ def setup_ui(self):
     graph_display_layout.addWidget(self.graph_widget)
     
     # Add widgets to splitter
-    graphs_splitter.addWidget(graph_controls_widget)
+    graphs_splitter.addWidget(graph_controls_scroll)
     graphs_splitter.addWidget(graph_display_widget)
     graphs_splitter.setSizes([400, 800])  # Initial sizes
     
@@ -2479,7 +2529,7 @@ def setup_ui(self):
     # Center spacer left
     automation_layout.addStretch()
     
-    # Main content container (centered, fixed width)
+    # Main content container (restored fixed width)
     automation_main_container = QFrame()
     automation_main_container.setFixedWidth(700)
     automation_main_container.setStyleSheet(f"""
@@ -2496,6 +2546,7 @@ def setup_ui(self):
     # Automation sequences section
     automation_sequences_group = QGroupBox("Automation Sequences")
     automation_sequences_group.setStyleSheet(GroupBoxStyles.elevated())
+    automation_sequences_group.setMinimumHeight(100) # Allow vertical shrinking
     automation_sequences_layout = QVBoxLayout(automation_sequences_group)
     
     # Table to display defined automation sequences
@@ -2506,7 +2557,7 @@ def setup_ui(self):
     self.sequences_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
     self.sequences_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
     self.sequences_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-    self.sequences_table.setMinimumHeight(200)
+    self.sequences_table.setMinimumHeight(100) # Reduced from 200 to allow shrinking
     automation_sequences_layout.addWidget(self.sequences_table)
     
     # Sequence control buttons
@@ -2794,16 +2845,15 @@ def setup_ui(self):
     projects_tab.setObjectName("projects_tab")
     projects_layout = QVBoxLayout(projects_tab)
     
-    # Create a fixed-width container for project content
+    # Create a container for project content - no fixed minimum width to allow full compression
     project_container = QWidget()
-    project_container.setMinimumWidth(1200)  # Use minimum width instead of fixed to allow expansion
     project_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)  # Allow expansion
     project_container_layout = QVBoxLayout(project_container)
-    project_container_layout.setContentsMargins(10, 15, 20, 15)  # Slightly reduced margins
-    project_container_layout.setSpacing(12)  # Slightly reduced spacing
+    project_container_layout.setContentsMargins(10, 5, 10, 5)  # Reduced margins
+    project_container_layout.setSpacing(8)  # Reduced spacing
     
-    # Center the container in the tab
-    projects_layout.addWidget(project_container, 0, Qt.AlignmentFlag.AlignCenter)
+    # Add container to tab with stretch factor to fill space
+    projects_layout.addWidget(project_container, 1)
     
     # Modern hero section at the top
     hero_section = QFrame()
@@ -2816,8 +2866,9 @@ def setup_ui(self):
         }
     """)
     hero_layout = QHBoxLayout(hero_section)
-    hero_layout.setContentsMargins(20, 15, 20, 15)
+    hero_layout.setContentsMargins(15, 8, 15, 8) # Reduced margins
     hero_layout.setSpacing(15)
+    hero_section.setFixedHeight(60) # Compact fixed height
     
     # Icon/logo area
     hero_icon = QLabel("📁")
@@ -2846,13 +2897,34 @@ def setup_ui(self):
     
     project_container_layout.addWidget(hero_section)
     
-    # Create a horizontal layout for the main content
-    main_content_layout = QHBoxLayout()
-    main_content_layout.setSpacing(20)  # Further reduced spacing between columns for more space
+    # Create a horizontal splitter for the main content (replaces QHBoxLayout)
+    self.projects_splitter = QSplitter(Qt.Orientation.Horizontal)
+    self.projects_splitter.setChildrenCollapsible(False) # Prevent hiding columns completely
+    self.projects_splitter.setHandleWidth(2)
+    self.projects_splitter.setStyleSheet(f"""
+        QSplitter::handle {{
+            background-color: {COLORS.BORDER_DEFAULT};
+        }}
+        QSplitter::handle:hover {{
+            background-color: {COLORS.PRIMARY};
+        }}
+    """)
     
-    # Left column for project structure
-    left_column_layout = QVBoxLayout()
+    # Left column for project structure - wrapped in scroll area for small screens
+    left_scroll_area = QScrollArea()
+    left_scroll_area.setWidgetResizable(True)
+    left_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+    # Remove stylesheet that was forcing transparency on children
+    
+    left_column_widget = QWidget()
+    left_column_widget.setObjectName("left_column_widget")
+    # Explicitly apply input styles to ensure fields remain visible inside the scroll area
+    left_column_widget.setStyleSheet(InputStyles.default())
+    left_column_layout = QVBoxLayout(left_column_widget)
+    left_column_layout.setContentsMargins(0, 0, 10, 0) # Small right margin for scrollbar
     left_column_layout.setSpacing(15)  # Increased spacing
+    
+    left_scroll_area.setWidget(left_column_widget)
     
     # Project section (directly in left column, no outer groupbox)
     project_group = QGroupBox("📁 Project")
@@ -2903,12 +2975,13 @@ def setup_ui(self):
     # Project description
     project_desc_layout = QVBoxLayout()
     project_desc_label = QLabel("Description:")
+    project_desc_label.setFixedHeight(20) # Fixed height to prevent label stretching
     project_desc_layout.addWidget(project_desc_label)
     self.project_description = QTextEdit()
-    self.project_description.setMaximumHeight(80)
+    self.project_description.setMinimumHeight(60)
     self.project_description.setPlaceholderText("Enter a description for this project")
-    project_desc_layout.addWidget(self.project_description)
-    project_group_layout.addLayout(project_desc_layout)
+    project_desc_layout.addWidget(self.project_description, 1) # Allow to grow
+    project_group_layout.addLayout(project_desc_layout, 1) # Description takes extra space
     
     # Add project group directly to left column
     left_column_layout.addWidget(project_group)
@@ -2946,12 +3019,13 @@ def setup_ui(self):
     # Test series description
     test_series_desc_layout = QVBoxLayout()
     test_series_desc_label = QLabel("Description:")
+    test_series_desc_label.setFixedHeight(20) # Fixed height to prevent label stretching
     test_series_desc_layout.addWidget(test_series_desc_label)
     self.test_series_description = QTextEdit()
-    self.test_series_description.setMaximumHeight(80)
+    self.test_series_description.setMinimumHeight(60)
     self.test_series_description.setPlaceholderText("Enter a description for this test series")
-    test_series_desc_layout.addWidget(self.test_series_description)
-    test_series_group_layout.addLayout(test_series_desc_layout)
+    test_series_desc_layout.addWidget(self.test_series_description, 1) # Allow to grow
+    test_series_group_layout.addLayout(test_series_desc_layout, 1) # Description takes extra space
     
     # Add test series group directly to left column
     left_column_layout.addWidget(test_series_group)
@@ -3009,12 +3083,13 @@ def setup_ui(self):
     # Run description
     run_desc_layout = QVBoxLayout()
     run_desc_label = QLabel("Description:")
+    run_desc_label.setFixedHeight(20) # Fixed height to prevent label stretching
     run_desc_layout.addWidget(run_desc_label)
     self.run_description = QTextEdit()
-    self.run_description.setMaximumHeight(80)
+    self.run_description.setMinimumHeight(60)
     self.run_description.setPlaceholderText("Enter a description for this run")
-    run_desc_layout.addWidget(self.run_description)
-    run_group_layout.addLayout(run_desc_layout)
+    run_desc_layout.addWidget(self.run_description, 1) # Allow to grow
+    run_group_layout.addLayout(run_desc_layout, 1) # Description takes extra space
     
     # Add run group directly to left column
     left_column_layout.addWidget(run_group)
@@ -3106,11 +3181,9 @@ def setup_ui(self):
     
     project_actions_layout.addStretch()
     
-    # Add left column to main content layout
-    main_content_layout.addLayout(left_column_layout)
-    
     # Right column for project browser
-    right_column_layout = QVBoxLayout()
+    right_column_widget = QWidget()
+    right_column_layout = QVBoxLayout(right_column_widget)
     right_column_layout.setContentsMargins(0, 0, 0, 0)  # Remove extra margins to move left
     
     # Project browser section
@@ -3135,7 +3208,7 @@ def setup_ui(self):
             color: #fff;
         }
     """)
-    project_browser_group.setMinimumWidth(750)
+    project_browser_group.setMinimumWidth(400) # Reduced from 750 to allow smaller window sizes
     project_browser_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
     project_browser_layout = QVBoxLayout(project_browser_group)
     project_browser_layout.setContentsMargins(10, 18, 10, 10)
@@ -3148,7 +3221,7 @@ def setup_ui(self):
     
     # Project tree view with improved styling
     self.project_tree = QTreeView()
-    self.project_tree.setMinimumHeight(350)
+    self.project_tree.setMinimumHeight(150) # Reduced from 350 to allow more height compression
     
     # Get paths for branch arrows
     arrow_right = resource_path("app/ui/arrow_right.svg").replace("\\", "/")
@@ -3229,11 +3302,19 @@ def setup_ui(self):
     # Add project browser group to right column
     right_column_layout.addWidget(project_browser_group)
     
-    # Add right column to main content layout
-    main_content_layout.addLayout(right_column_layout)
+    # Add right column to the splitter
+    self.projects_splitter.addWidget(left_scroll_area)
+    self.projects_splitter.addWidget(right_column_widget)
     
-    # Add main content layout to container
-    project_container_layout.addLayout(main_content_layout)
+    # Set stretch factors - Project Browser (right) takes more space
+    self.projects_splitter.setStretchFactor(0, 0) # Config panel takes minimum
+    self.projects_splitter.setStretchFactor(1, 1) # Browser takes remainder
+    
+    # Set initial sizes for the horizontal splitter (increased left side width to 480px)
+    self.projects_splitter.setSizes([480, 720])
+    
+    # Add the splitter to the container
+    project_container_layout.addWidget(self.projects_splitter)
     
     # Add projects tab to stacked widget
     self.stacked_widget.addWidget(projects_tab)

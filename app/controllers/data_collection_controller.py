@@ -1260,6 +1260,10 @@ class DataCollectionController(QObject):
         # Also emit individual data received signal
         self.data_received_signal.emit(data)
 
+        # Record in data flow controller
+        if self.main_window and hasattr(self.main_window, 'data_flow_controller'):
+            self.main_window.data_flow_controller.record_mqtt_data(len(str(data)))
+
         # Process the data through SensorController for UI updates
         if self.main_window and hasattr(self.main_window, 'sensor_controller'):
             self.main_window.sensor_controller.update_sensor_data(data)
@@ -1303,6 +1307,10 @@ class DataCollectionController(QObject):
         # Emit signal with prefixed keys so SensorController/etc can find it
         prefixed_data = {f"csv_{k}" if k != 'timestamp' else k: v for k, v in data.items()}
         self.data_received_signal.emit(prefixed_data)
+
+        # Record in data flow controller
+        if self.main_window and hasattr(self.main_window, 'data_flow_controller'):
+            self.main_window.data_flow_controller.record_csv_input_data(len(str(data)))
 
         # Process the data through SensorController for UI updates
         if self.main_window and hasattr(self.main_window, 'sensor_controller'):

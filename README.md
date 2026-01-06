@@ -21,7 +21,8 @@ A comprehensive Data Acquisition (DAQ) system built with Python and PyQt6.
 
 ### System Requirements
 - Windows 10/11 (primary)
-- Python 3.8 or higher
+- Python 3.10.x (Recommended)
+  - *Note: While Python 3.8+ is supported, Python 3.10.x is highly recommended for NDI features to avoid manual compilation of `ndi-python`. Higher versions may require a C++ compiler and significant effort to install.*
 - Minimum 4GB RAM
 - USB ports for device connections
 
