@@ -13,6 +13,48 @@ from app.core.interfaces.base_interface import BaseInterface
 class ArduinoInterface(BaseInterface):
     """Interface for Arduino devices"""
     
+    DISPLAY_NAME = "Arduino"
+    DESCRIPTION = "Standard Arduino communication over Serial"
+    ICON = "Arduino.png"
+    
+    HELP_TEXT = """
+    <h3>Arduino Interface</h3>
+    <p>Handles communication with Arduino devices over Serial.</p>
+    <p><b>How to use:</b></p>
+    <ol>
+        <li>Upload the provided Arduino example code to your board.</li>
+        <li>Connect via USB and select the correct COM port and baud rate.</li>
+        <li>Data format: <code>SensorName1:value;SensorName2:value;...</code></li>
+    </ol>
+    """
+    
+    CONFIG_SCHEMA = {
+        "port": {
+            "type": "list", 
+            "label": "Serial Port", 
+            "options_cmd": "list_ports",
+            "required": True
+        },
+        "baud_rate": {
+            "type": "list", 
+            "label": "Baud Rate", 
+            "options": [9600, 19200, 38400, 57600, 115200],
+            "default": 9600
+        },
+        "mode": {
+            "type": "list",
+            "label": "Mode",
+            "options": ["continuous", "polled"],
+            "default": "polled"
+        },
+        "poll_interval": {
+            "type": "number",
+            "label": "Poll Interval (s)",
+            "default": 1.0,
+            "condition": {"mode": "polled"} # Only show if mode is polled
+        }
+    }
+
     # Connection lost callback - can be set by parent thread
     on_connection_lost = None
     
@@ -28,13 +70,20 @@ class ArduinoInterface(BaseInterface):
         """
         super().__init__(name="Arduino")
         self.port = port
-        self.baud_rate = baud_rate
+        self.baud_rate = int(baud_rate) if baud_rate else 9600
         self.mode = mode
         self.poll_interval = float(poll_interval)
         self.serial = None
         self.last_poll_time = 0
         self._consecutive_errors = 0
         self._max_consecutive_errors = 3  # Disconnect after this many consecutive errors
+    
+    @classmethod
+    def get_ui_options(cls, field_name):
+        """Provide dynamic options for the UI"""
+        if field_name == "port":
+            return cls.list_ports()
+        return []
         
     def connect(self, wait_for_reset=True):
         """
@@ -82,12 +131,19 @@ class ArduinoInterface(BaseInterface):
             return True
             
         except serial.SerialException as e:
-            self.error_message = f"Serial error connecting to Arduino: {e}"
+            err_str = str(e)
+            if "FileNotFoundError" in err_str or "system cannot find the file specified" in err_str:
+                self.error_message = f"Port {self.port} not found. Please check if the Arduino is connected and you selected the correct port."
+            elif "PermissionError" in err_str or "Access is denied" in err_str:
+                self.error_message = f"Access to {self.port} denied. The port might be in use by another program."
+            else:
+                self.error_message = f"Serial error: {err_str}"
+            
             self.connected = False
             self.serial = None
             return False
         except Exception as e:
-            self.error_message = f"Failed to connect to Arduino: {e}"
+            self.error_message = f"Failed to connect: {str(e)}"
             self.connected = False
             self.serial = None
             return False

@@ -42,6 +42,52 @@ class LabJackInterface(BaseInterface):
     bounded queues, and optional auto-reconnect behavior.
     """
     
+    DISPLAY_NAME = "LabJack"
+    DESCRIPTION = "LabJack T-series devices (T4, T7) via LJM"
+    ICON = "Labjack.png"
+    
+    HELP_TEXT = """
+    <h3>LabJack Interface</h3>
+    <p>Handles communication with LabJack T-series devices (T4, T7) via LJM.</p>
+    <p><b>How to use:</b></p>
+    <ol>
+        <li>Select your device type (T4, T7, or ANY).</li>
+        <li>Select connection type (USB, TCP, etc.).</li>
+        <li>Set the identifier (Serial Number or IP address) or use 'ANY'.</li>
+        <li>Once connected, AIN0-AIN13 and any configured EF channels will be available.</li>
+    </ol>
+    """
+    
+    CONFIG_SCHEMA = {
+        "device_type": {
+            "type": "list",
+            "label": "Device Type",
+            "options": ["T7", "T4", "ANY"],
+            "default": "T7"
+        },
+        "connection_type": {
+            "type": "list",
+            "label": "Connection Type",
+            "options": ["USB", "TCP", "ETHERNET", "WIFI", "ANY"],
+            "default": "ANY"
+        },
+        "port": {
+            "type": "string",
+            "label": "Identifier (e.g. Serial # or IP)",
+            "default": "ANY"
+        },
+        "sampling_rate": {
+            "type": "number",
+            "label": "Sampling Rate (Hz)",
+            "default": 100.0
+        },
+        "auto_reconnect": {
+            "type": "boolean",
+            "label": "Auto-reconnect (on connection loss)",
+            "default": False
+        }
+    }
+
     # Maximum queue sizes to prevent memory exhaustion
     MAX_STATUS_QUEUE_SIZE = 100
     MAX_DATA_QUEUE_SIZE = 1000
@@ -181,18 +227,28 @@ class LabJackInterface(BaseInterface):
                 self._tc_channels_cache = []
                 self._tc_cache_time = 0
                 
+                # Mark as connected
+                self.connected = True
+                
                 logger.info(f"LabJack Connected: {self.device_info}")
                 return True
                 
             except ljm.LJMError as e:
-                self.error_message = f"Failed to connect to LabJack: {e}"
+                err_str = str(e)
+                if "LJME_DEVICE_NOT_FOUND" in err_str or "1224" in err_str:
+                    self.error_message = f"LabJack device not found ({self.port}). Please check USB/Network connections."
+                elif "LJME_LABJACK_NOT_FOUND" in err_str or "1227" in err_str:
+                    self.error_message = "No LabJack devices found. Ensure the device is powered on."
+                else:
+                    self.error_message = f"LabJack error: {err_str}"
+                
                 self.connected = False
                 self._handle = None
                 self.device_info = {}
                 logger.error(f"LabJack Connection Error: {e}")
                 return False
             except Exception as e:
-                self.error_message = f"Unexpected error: {e}"
+                self.error_message = f"Unexpected error: {str(e)}"
                 self.connected = False
                 self._handle = None
                 self.device_info = {}
@@ -411,8 +467,8 @@ class LabJackInterface(BaseInterface):
         Args:
             rate: Sampling rate in Hz
         """
-        if rate > 0:
-            self.sampling_rate = rate
+        if rate is not None and float(rate) > 0:
+            self.sampling_rate = float(rate)
             logger.info(f"LabJack sampling rate set to {rate} Hz")
             return True
         return False

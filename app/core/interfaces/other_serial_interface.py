@@ -40,13 +40,25 @@ class SendCommandStep(SerialStep):
         for var_name, var_value in variables.items():
             command = command.replace(f"{{{var_name}}}", str(var_value))
             
-        # Add line ending
-        if self.line_ending == "CR (\\r)":
-            command += "\r"
-        elif self.line_ending == "LF (\\n)":
-            command += "\n"
-        elif self.line_ending == "CRLF (\\r\\n)":
+        # Add line ending (handle both escaped and unescaped forms)
+        le = self.line_ending.lower() if self.line_ending else ""
+        if "cr" in le and "lf" in le:
+            # CRLF
             command += "\r\n"
+        elif "lf" in le or le == "\\n" or le == "\n":
+            command += "\n"
+        elif "cr" in le or le == "\\r" or le == "\r":
+            command += "\r"
+        # else: "None" or empty -> no line ending added
+        
+        print(f"DEBUG SendCommandStep: Sending command '{repr(command)}' with line_ending='{self.line_ending}'")
+        
+        # Flush input buffer before sending to clear any stale data
+        if hasattr(interface, 'serial') and interface.serial:
+            try:
+                interface.serial.reset_input_buffer()
+            except Exception:
+                pass
             
         # Send the command
         return interface.write_data(command)
@@ -62,6 +74,7 @@ class WaitStep(SerialStep):
     def execute(self, interface, variables):
         """Wait for the specified time, but allow interruption via interface.should_stop"""
         total_wait = self.wait_time / 1000.0
+        print(f"DEBUG WaitStep: Waiting for {self.wait_time}ms ({total_wait}s)...")
         waited = 0
         interval = 0.05  # 50 ms
         while waited < total_wait:
@@ -70,6 +83,10 @@ class WaitStep(SerialStep):
                 return False
             time.sleep(interval)
             waited += interval
+        # Check if any data arrived during the wait
+        if hasattr(interface, 'serial') and interface.serial:
+            in_waiting = interface.serial.in_waiting
+            print(f"DEBUG WaitStep: Wait completed. Bytes in buffer after wait: {in_waiting}")
         return True
 
 
@@ -85,12 +102,17 @@ class ReadResponseStep(SerialStep):
     def execute(self, interface, variables):
         """Read from the serial device, but allow interruption via interface.should_stop"""
         if not interface.is_connected():
+            print("DEBUG ReadResponseStep: Interface not connected!")
             return False
             
         try:
             # Set the timeout
             if hasattr(interface, 'serial'):
                 interface.serial.timeout = self.timeout / 1000.0
+                print(f"DEBUG ReadResponseStep: Set timeout to {self.timeout}ms, read_type='{self.read_type}', result_var='{self.result_var}'")
+                # Check if there's any data waiting
+                in_waiting = interface.serial.in_waiting
+                print(f"DEBUG ReadResponseStep: Bytes in buffer before read: {in_waiting}")
             
             # Read based on type
             if self.read_type == "Read Line":
@@ -137,6 +159,7 @@ class ReadResponseStep(SerialStep):
                 
             # Store result in variables
             variables[self.result_var] = response
+            print(f"DEBUG ReadResponseStep: Read completed. response='{repr(response)}', stored in '{self.result_var}'")
             return True
         except Exception as e:
             print(f"Error reading from serial: {e}")
@@ -273,10 +296,14 @@ class SerialSequence:
         self.steps = steps or []
         
     def execute(self, interface):
-        """Execute all steps in the sequence"""
+        """Execute all steps in the sequence.
+        
+        Returns:
+            dict: Published outputs collected from PublishValueStep targets (target -> value)
+            None: If the sequence fails or produces no usable output
+        """
         variables = {}  # Dictionary to store variables
-        result = None
-        published_value = None
+        published_outputs = {}  # target -> value
         
         print(f"DEBUG SerialSequence: Executing sequence '{self.name}' with {len(self.steps)} steps")
         
@@ -291,22 +318,23 @@ class SerialSequence:
                 # For debugging, print all variables
                 print(f"DEBUG SerialSequence: Variables after step {i+1}: {variables}")
                 
-                # If this is a publish step, get the published value
-                if step.step_type == "publish":
-                    if isinstance(step, PublishValueStep) and step.target in variables:
-                        published_value = variables[step.target]
-                        print(f"DEBUG SerialSequence: Found published value in step {i+1}: {published_value}")
+                # Collect outputs from publish steps. A sequence may publish multiple variables.
+                if step.step_type == "publish" and isinstance(step, PublishValueStep):
+                    if step.target in variables:
+                        published_outputs[step.target] = variables[step.target]
+                        print(f"DEBUG SerialSequence: Published output '{step.target}': {variables[step.target]}")
             
-            # Return the published value if one was set, otherwise try to use a value variable
-            if published_value is not None:
-                result = published_value
-            else:
-                # If no explicit publish, use the 'value' variable as a fallback
-                result = variables.get("value", None)
-                print(f"DEBUG SerialSequence: Using default 'value' variable: {result}")
-                
-            print(f"DEBUG SerialSequence: Sequence '{self.name}' completed with result: {result}")
-            return result
+            # If nothing explicitly published, fall back to 'value' if present.
+            if not published_outputs and "value" in variables:
+                published_outputs["value"] = variables.get("value")
+                print(f"DEBUG SerialSequence: No explicit publish; using fallback 'value': {variables.get('value')}")
+
+            if not published_outputs:
+                print(f"DEBUG SerialSequence: Sequence '{self.name}' produced no outputs")
+                return None
+
+            print(f"DEBUG SerialSequence: Sequence '{self.name}' completed with outputs: {published_outputs}")
+            return published_outputs
             
         except Exception as e:
             print(f"ERROR SerialSequence: Error executing sequence '{self.name}': {e}")
@@ -407,8 +435,35 @@ class SerialSequence:
 class OtherSerialInterface(BaseInterface):
     """Interface for other serial devices with custom sequences"""
     
+    DISPLAY_NAME = "Serial"
+    DESCRIPTION = "Custom serial device with communication sequences"
+    ICON = "Other.png"
+    
+    HELP_TEXT = """
+    <h3>Custom Serial Interface</h3>
+    <p>Connects to any serial device and executes a sequence of commands to read data.</p>
+    <p><b>How to use:</b></p>
+    <ol>
+        <li>Select the COM port and baud rate.</li>
+        <li>Configure the communication sequence (Send Command, Wait, Read, Parse).</li>
+        <li>The sequence will be executed periodically based on the poll interval.</li>
+    </ol>
+    """
+    
+    CONFIG_SCHEMA = {
+        "port": {"type": "list", "label": "Serial Port", "options_cmd": "list_ports"},
+        "baud_rate": {"type": "list", "label": "Baud Rate", "options": [9600, 19200, 38400, 57600, 115200], "default": 9600},
+        "poll_interval": {"type": "number", "label": "Poll Interval (s)", "default": 1.0}
+    }
+
+    @classmethod
+    def get_ui_options(cls, field_name):
+        if field_name == "port":
+            return cls.list_ports()
+        return []
+
     def __init__(self, port="COM4", baud_rate=9600, data_bits=8, parity="None", 
-                 stop_bits=1, poll_interval=1.0, sequence=None):
+                 stop_bits=1, poll_interval=1.0, sequence=None, sequences=None):
         """
         Initialize the interface
         
@@ -419,7 +474,8 @@ class OtherSerialInterface(BaseInterface):
             parity: Parity ("None", "Even", "Odd", "Mark", "Space")
             stop_bits: Stop bits (1, 1.5, 2)
             poll_interval: Polling interval in seconds
-            sequence: SerialSequence to execute
+            sequence: SerialSequence to execute (single sequence mode)
+            sequences: Optional list of SerialSequence objects (multi sequence mode)
         """
         super().__init__(name="OtherSerial")
         self.port = port
@@ -429,6 +485,7 @@ class OtherSerialInterface(BaseInterface):
         self.stop_bits = stop_bits
         self.poll_interval = float(poll_interval)
         self.sequence = sequence or SerialSequence()
+        self.sequences = sequences or None
         
         self.serial = None
         self.last_poll_time = 0
@@ -465,19 +522,24 @@ class OtherSerialInterface(BaseInterface):
             parity_value = parity_map.get(self.parity, serial.PARITY_NONE)
             stop_bits_value = stop_bits_map.get(str(self.stop_bits), serial.STOPBITS_ONE)
             
-            # Use a shorter timeout for faster connection
+            # Use timeout=2 to match the Test dialog behavior
             self.serial = serial.Serial(
                 port=self.port,
                 baudrate=self.baud_rate,
                 bytesize=self.data_bits,
                 parity=parity_value,
                 stopbits=stop_bits_value,
-                timeout=0.5  # Reduced from 1 second
+                timeout=2.0  # Match Test dialog's timeout=2
             )
             
             # No sleep - just check if the port is actually open
             if not self.serial.is_open:
                 self.serial.open()
+            
+            # Wait for Arduino to reset after DTR toggle (opening port resets Arduino)
+            # This matches what happens in the Test dialog when user clicks through steps
+            print("DEBUG OtherSerialInterface: Waiting 2s for Arduino to boot after reset...")
+            time.sleep(2.0)
                 
             # Quick test to see if the port is responding
             try:
@@ -494,12 +556,18 @@ class OtherSerialInterface(BaseInterface):
             self.should_stop = False  # Reset on connect
             return True
         except serial.SerialException as e:
-            self.error_message = f"Serial error: {e}"
+            err_str = str(e)
+            if "FileNotFoundError" in err_str or "system cannot find the file specified" in err_str:
+                self.error_message = f"Port {self.port} not found. Please check connections and port selection."
+            elif "PermissionError" in err_str or "Access is denied" in err_str:
+                self.error_message = f"Access to {self.port} denied. Port might be in use."
+            else:
+                self.error_message = f"Serial error: {err_str}"
             print(f"DEBUG OtherSerialInterface: Serial exception: {self.error_message}")
             self.connected = False
             return False
         except Exception as e:
-            self.error_message = f"Failed to connect to serial device: {e}"
+            self.error_message = f"Failed to connect: {str(e)}"
             print(f"DEBUG OtherSerialInterface: Connection error: {self.error_message}")
             self.connected = False
             return False
@@ -540,11 +608,20 @@ class OtherSerialInterface(BaseInterface):
         Returns:
             Dictionary with sensor value or None if failed
         """
-        if not self.is_connected() or not self.sequence:
+        def _has_steps(seq_obj):
+            try:
+                return bool(getattr(seq_obj, "steps", []))
+            except Exception:
+                return False
+
+        sequences_to_run = self.sequences if self.sequences else ([self.sequence] if self.sequence else [])
+        has_any_steps = any(_has_steps(s) for s in sequences_to_run)
+
+        if not self.is_connected() or not has_any_steps:
             if not self.is_connected():
                 print("DEBUG OtherSerialInterface.read_data: Not connected, returning None")
-            elif not self.sequence:
-                print("DEBUG OtherSerialInterface.read_data: No sequence defined, returning None")
+            elif not has_any_steps:
+                print("DEBUG OtherSerialInterface.read_data: No sequence steps defined, returning None")
             return None
         
         # Check if it's time to poll
@@ -555,33 +632,48 @@ class OtherSerialInterface(BaseInterface):
             
         self.last_poll_time = current_time
         
-        # Execute the sequence
+        # Execute the sequence(s)
         try:
-            print(f"DEBUG OtherSerialInterface.read_data: Executing sequence {self.sequence.name} at time {current_time}")
-            result = self.sequence.execute(self)
-            
-            if result is not None:
-                print(f"DEBUG OtherSerialInterface.read_data: Sequence returned value: {result}")
-                
-                # Find the PublishValueStep to get the target name
-                target_name = None
-                for step in self.sequence.steps:
-                    if isinstance(step, PublishValueStep):
-                        target_name = step.target
-                        print(f"DEBUG OtherSerialInterface.read_data: Found PublishValueStep with target: {target_name}")
-                        break
-                
-                # If no PublishValueStep found or target is "value", use sequence name as fallback
-                if not target_name or target_name == "value":
-                    target_name = self.sequence.name
-                    print(f"DEBUG OtherSerialInterface.read_data: Using sequence name as target: {target_name}")
-                
-                # Return a dictionary with the target name as key
-                return {
-                    target_name: result
-                }
-            else:
-                print(f"DEBUG OtherSerialInterface.read_data: Sequence returned None")
+            merged = {}
+
+            for seq in sequences_to_run:
+                if not seq or not _has_steps(seq):
+                    continue
+
+                print(f"DEBUG OtherSerialInterface.read_data: Executing sequence {seq.name} at time {current_time}")
+                result = seq.execute(self)
+
+                if not result:
+                    print(f"DEBUG OtherSerialInterface.read_data: Sequence {getattr(seq, 'name', 'Unnamed')} returned no data")
+                    continue
+
+                # `SerialSequence.execute` returns a dict of published targets (target -> value).
+                # Prefix keys with "SequenceName:" so multiple sequences and multiple targets don't collide.
+                if isinstance(result, dict):
+                    outputs = result
+                else:
+                    # Legacy safety: map scalar to first publish target or to the sequence name.
+                    target_name = None
+                    for step in getattr(seq, "steps", []):
+                        if isinstance(step, PublishValueStep):
+                            target_name = step.target
+                            break
+                    if not target_name or target_name == "value":
+                        target_name = seq.name
+                    outputs = {target_name: result}
+
+                for key, value in outputs.items():
+                    if key is None:
+                        continue
+                    key_str = str(key)
+                    if ":" not in key_str:
+                        key_str = f"{seq.name}:{key_str}"
+                    merged[key_str] = value
+
+            if merged:
+                return merged
+            print("DEBUG OtherSerialInterface.read_data: No sequence produced data")
+            return None
         except Exception as e:
             self.error_message = f"Error reading from serial device: {e}"
             print(f"DEBUG OtherSerialInterface.read_data: Error: {self.error_message}")
@@ -645,6 +737,7 @@ class OtherSerialThread(QThread):
         
         self.interface = None
         self.running = True  # Start with running=True to avoid thread stopping prematurely
+        self._was_connected = False
         self.poll_interval = 1.0  # Default polling interval in seconds
         self.collecting_data = False
         self.paused = False
@@ -665,6 +758,11 @@ class OtherSerialThread(QThread):
             try:
                 # Handle reconnection if needed
                 if not self.paused and self.interface and not self.interface.is_connected():
+                    if self._was_connected:
+                        print("OtherSerialThread: Connection lost!")
+                        self.connection_status_signal.emit(False, "Connection lost")
+                        self._was_connected = False
+
                     if self.auto_reconnect:
                         current_time = time.time()
                         if current_time - self._last_reconnect_attempt >= self._reconnect_interval:
@@ -721,27 +819,45 @@ class OtherSerialThread(QThread):
                 
         print("DEBUG OtherSerialThread: Thread exiting")
             
-    def connect(self, port, baud_rate=9600, data_bits=8, parity="None", 
-                stop_bits=1, poll_interval=1.0, sequence=None):
+    def connect(self, port=None, baud_rate=9600, data_bits=8, parity="None", 
+                stop_bits=1, poll_interval=1.0, sequence=None, sequences=None):
         """Connect to a serial device"""
         try:
-            print(f"DEBUG OtherSerialThread: Attempting to connect to serial device on {port} with poll_interval={poll_interval}")
+            # Handle case where no port is provided (e.g. from harmonized dialog)
+            if port is None:
+                # Try to use previously set port or config
+                if hasattr(self, 'port'):
+                    port = self.port
+                elif self.interface:
+                    port = self.interface.port
+                else:
+                    # Look for it in sequences if available
+                    if sequences and len(sequences) > 0:
+                        port = sequences[0].get('port', 'COM1')
+                    else:
+                        raise ValueError("No port specified for serial connection")
+            else:
+                self.port = port
+
+            # Update other attributes if provided
+            if baud_rate: self.baud_rate = baud_rate
+            if poll_interval: self.poll_interval = float(poll_interval)
+            
+            print(f"DEBUG OtherSerialThread: Attempting to connect to serial device on {port} with poll_interval={self.poll_interval}")
             
             # Send immediate feedback that connection is in progress
             self.connection_status_signal.emit(False, f"Connecting to {port}...")
             
-            # Store the poll_interval
-            self.poll_interval = float(poll_interval)
-            
-            # Create the interface
+            # Create the interface if it doesn't exist or parameters changed
             self.interface = OtherSerialInterface(
                 port=port,
-                baud_rate=baud_rate,
+                baud_rate=getattr(self, 'baud_rate', baud_rate),
                 data_bits=data_bits,
                 parity=parity,
                 stop_bits=stop_bits,
                 poll_interval=self.poll_interval,
-                sequence=sequence
+                sequence=sequence,
+                sequences=sequences
             )
             
             # Try to connect
@@ -750,6 +866,7 @@ class OtherSerialThread(QThread):
             if success:
                 print(f"DEBUG OtherSerialThread: Successfully connected to serial device on {port}")
                 self.connection_status_signal.emit(True, f"Connected to serial device on {port}")
+                self._was_connected = True
                 
                 # Reset the last poll time to ensure immediate reading
                 self.last_poll_time = 0

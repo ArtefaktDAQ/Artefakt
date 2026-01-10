@@ -14,6 +14,7 @@ import numpy as np
 import csv # <-- Add import for csv module
 import glob
 import json
+import inspect
 from app.utils.power_management import PowerManagement
 
 from app.core.interfaces.arduino_master_slave import ArduinoMasterSlaveThread
@@ -21,6 +22,8 @@ from app.core.interfaces.other_serial_interface import OtherSerialThread, Serial
 from app.core.interfaces.csv_interface import CSVThread
 from app.core.interfaces.labjack_data_thread import LabJackDataThread
 from app.core.interfaces.mqtt_thread import MQTTDataThread
+from app.core.interfaces.interface_registry import InterfaceRegistry
+from app.core.interfaces.plugin_polling_thread import PluginPollingThread
 
 # Import LabJackInterface from the app.core.interfaces package
 try:
@@ -49,6 +52,21 @@ class DataCollectionController(QObject):
     def labjack_connected(self):
         """Check if LabJack is connected"""
         return self.interfaces.get('labjack', {}).get('connected', False)
+
+    @property
+    def arduino_connected(self):
+        """Check if Arduino is connected"""
+        return self.interfaces.get('arduino', {}).get('connected', False)
+
+    @property
+    def other_serial_connected(self):
+        """Check if Other Serial interface is connected"""
+        return self.interfaces.get('other_serial', {}).get('connected', False)
+
+    @property
+    def mqtt_connected(self):
+        """Check if MQTT is connected"""
+        return self.interfaces.get('mqtt', {}).get('connected', False)
 
     def __init__(self, main_window=None):
         """Initialize the data collection controller"""
@@ -136,7 +154,12 @@ class DataCollectionController(QObject):
         # Default to 100 Hz if settings not available yet (will be updated in connect_labjack)
         initial_labjack_rate = 100.0
         if main_window and hasattr(main_window, 'settings'):
-            initial_labjack_rate = float(main_window.settings.value("labjack_internal_rate", "100.0"))
+            val = main_window.settings.value("labjack_internal_rate", "100.0")
+            try:
+                if val is not None and str(val).lower() != 'none':
+                    initial_labjack_rate = float(val)
+            except (ValueError, TypeError):
+                initial_labjack_rate = 100.0
         self.labjack_thread = LabJackDataThread(sampling_rate=initial_labjack_rate)
         # Initialize averaging window size based on initial LabJack rate
         self._update_averaging_window_size(initial_labjack_rate)
@@ -177,6 +200,86 @@ class DataCollectionController(QObject):
             # Keep data collection running even if metadata write fails
             pass
         
+    def _clear_interface_sensor_values(self, interface_type):
+        """Set all sensor values for a specific interface type to None (Harmonized)."""
+        if hasattr(self.main_window, 'sensor_controller'):
+            # Handle case-insensitive comparison and multiple naming conventions
+            it_lower = interface_type.lower()
+            cleared_count = 0
+            
+            # 1. Clear actual sensor objects
+            for sensor in self.main_window.sensor_controller.sensors:
+                sit_lower = getattr(sensor, 'interface_type', '').lower()
+                
+                # Check for various matches
+                match = False
+                if sit_lower == it_lower:
+                    match = True
+                elif it_lower == 'other' and sit_lower in ('serial', 'otherserial'):
+                    match = True
+                elif it_lower == 'serial' and sit_lower == 'otherserial':
+                    match = True
+                elif it_lower == 'optical' and sit_lower == 'opticalsensor':
+                    match = True
+                elif it_lower == 'audio' and sit_lower == 'audiosensor':
+                    match = True
+                
+                if match:
+                    sensor.current_value = None
+                    cleared_count += 1
+            
+            # 2. ALSO CLEAR the data from combined_data and averaging_buffers to prevent 
+            # the next emit_combined_data cycle from re-populating the cleared values.
+            self.combined_data_mutex.lock()
+            try:
+                # Find all keys in combined_data and averaging_buffers that belong to this interface
+                keys_to_clear = []
+                
+                # Check combined_data keys
+                for key in list(self.combined_data.keys()):
+                    if key == 'timestamp': continue
+                    
+                    # Keys are usually prefixed with interface name (e.g., 'arduino_...', 'labjack_...')
+                    k_lower = key.lower()
+                    if k_lower.startswith(it_lower + "_"):
+                        keys_to_clear.append(key)
+                    elif it_lower == 'other' and k_lower.startswith('other_serial_'):
+                        keys_to_clear.append(key)
+                    elif it_lower == 'serial' and k_lower.startswith('other_serial_'):
+                        keys_to_clear.append(key)
+                
+                # Check averaging_buffers keys
+                for key in list(self.averaging_buffers.keys()):
+                    k_lower = key.lower()
+                    if k_lower.startswith(it_lower + "_"):
+                        if key not in keys_to_clear:
+                            keys_to_clear.append(key)
+                    elif it_lower == 'other' and k_lower.startswith('other_serial_'):
+                        if key not in keys_to_clear:
+                            keys_to_clear.append(key)
+                    elif it_lower == 'serial' and k_lower.startswith('other_serial_'):
+                        if key not in keys_to_clear:
+                            keys_to_clear.append(key)
+
+                # Clear the identified keys
+                for key in keys_to_clear:
+                    if key in self.combined_data:
+                        del self.combined_data[key]
+                    if key in self.averaging_buffers:
+                        del self.averaging_buffers[key]
+                    if key in self._last_sensor_update:
+                        del self._last_sensor_update[key]
+                        
+                if keys_to_clear:
+                    print(f"DEBUG: Also cleared {len(keys_to_clear)} keys from combined_data/buffers for '{interface_type}'")
+                    
+            finally:
+                self.combined_data_mutex.unlock()
+            
+            if cleared_count > 0:
+                print(f"DEBUG: Cleared {cleared_count} sensor values for interface '{interface_type}'")
+                self.main_window.sensor_controller.update_sensor_values()
+
     def initialize(self, load_historical=True):
         """Initialize the controller.
         Heavy I/O like historical CSV load is deferred with QTimer to keep
@@ -228,19 +331,25 @@ class DataCollectionController(QObject):
         # Disconnect all interfaces
         self.disconnect_all_interfaces()
             
-    def connect_arduino(self, port, baud_rate=9600, poll_interval=None):
+    def connect_arduino(self, port=None, baud_rate=None, poll_interval=None):
         """
         Connect to Arduino device
         
         Args:
-            port: Serial port
-            baud_rate: Baud rate
+            port: Serial port (if None, use settings)
+            baud_rate: Baud rate (if None, use settings)
             poll_interval: Polling interval in seconds (deprecated, uses global sampling rate if None)
             
         Returns:
             True if connected successfully, False otherwise
         """
         try:
+            # Use settings if parameters are None
+            if port is None and self.main_window:
+                port = self.main_window.settings.value("arduino_port", "COM3")
+            if baud_rate is None and self.main_window:
+                baud_rate = int(self.main_window.settings.value("arduino_baud", 9600))
+            
             # Use global sampling rate if poll_interval is None
             if poll_interval is None:
                 # Convert Hz to seconds
@@ -339,14 +448,14 @@ class DataCollectionController(QObject):
         except Exception as e:
             self.log(f"Error disconnecting from Arduino: {str(e)}", "ERROR")
             
-    def connect_other_serial(self, port, baud_rate=9600, data_bits=8, parity="None", 
-                            stop_bits=1, poll_interval=1.0, sequence=None):
+    def connect_other_serial(self, port=None, baud_rate=None, data_bits=8, parity="None", 
+                            stop_bits=1, poll_interval=None, sequence=None, sequences=None):
         """
         Connect to Other Serial device
         
         Args:
-            port: Serial port
-            baud_rate: Baud rate
+            port: Serial port (if None, use settings)
+            baud_rate: Baud rate (if None, use settings)
             data_bits: Data bits
             parity: Parity setting
             stop_bits: Stop bits
@@ -357,6 +466,27 @@ class DataCollectionController(QObject):
             True if connected successfully, False otherwise
         """
         try:
+            # Use defaults from first sequence if port/baud are None
+            if port is None and sequences and len(sequences) > 0:
+                # Use standard dictionary keys or attribute
+                s = sequences[0]
+                if isinstance(s, dict):
+                    port = s.get("port")
+                    if baud_rate is None: baud_rate = int(s.get("baud", 9600))
+                    if poll_interval is None: poll_interval = float(s.get("poll_interval", 1.0))
+                else:
+                    # It's an object
+                    port = getattr(s, "port", None)
+                    if baud_rate is None: baud_rate = int(getattr(s, "baud", 9600))
+                    if poll_interval is None: poll_interval = float(getattr(s, "poll_interval", 1.0))
+
+            if port is None and self.main_window:
+                port = self.main_window.settings.value("other_port", "COM1")
+            if baud_rate is None:
+                baud_rate = 9600
+            if poll_interval is None:
+                poll_interval = 1.0
+
             # Check if manually disconnected and this is an auto-reconnect attempt
             if self.other_serial_manually_disconnected and not getattr(self, '_explicit_reconnect', False):
                 print("DEBUG connect_other_serial: Skipping auto-reconnect because of manual disconnect")
@@ -370,7 +500,12 @@ class DataCollectionController(QObject):
                 self._explicit_reconnect = False
             
             # Debug: Print sequence details before connecting
-            if sequence is not None:
+            if sequences:
+                print(f"DEBUG connect_other_serial: {len(sequences)} sequences provided")
+                for s in sequences:
+                    steps = getattr(s, 'steps', None) or getattr(s, 'actions', None)
+                    print(f"DEBUG connect_other_serial: - {getattr(s, 'name', 'Unnamed')}, steps: {len(steps) if steps is not None else 'N/A'}")
+            elif sequence is not None:
                 steps = getattr(sequence, 'steps', None) or getattr(sequence, 'actions', None)
                 print(f"DEBUG connect_other_serial: Sequence to be used: {getattr(sequence, 'name', 'Unnamed')}, steps: {steps}")
                 if steps is not None:
@@ -395,7 +530,8 @@ class DataCollectionController(QObject):
                 parity=parity,
                 stop_bits=stop_bits,
                 poll_interval=poll_interval,
-                sequence=sequence
+                sequence=sequence,
+                sequences=sequences
             )
             
             if success:
@@ -483,7 +619,7 @@ class DataCollectionController(QObject):
                 # Set all OtherSerial sensor values to None
                 if hasattr(self.main_window, 'sensor_controller'):
                     for sensor in self.main_window.sensor_controller.sensors:
-                        if getattr(sensor, 'interface_type', '') == 'OtherSerial':
+                        if getattr(sensor, 'interface_type', '') in ('OtherSerial', 'Serial'):
                             # Set current_value to None so it displays as "--"
                             sensor.current_value = None
                     # Force update of sensor values in UI
@@ -549,7 +685,7 @@ class DataCollectionController(QObject):
             # Reset OtherSerial sensor values to show "--"
             if hasattr(self, 'main_window') and hasattr(self.main_window, 'sensor_controller'):
                 for sensor in self.main_window.sensor_controller.sensors:
-                    if getattr(sensor, 'interface_type', '') == 'OtherSerial':
+                    if getattr(sensor, 'interface_type', '') in ('OtherSerial', 'Serial'):
                         # Set current_value to None so it displays as "--"
                         sensor.current_value = None
                 # Force update of sensor values in UI
@@ -598,7 +734,7 @@ class DataCollectionController(QObject):
         # Reset OtherSerial sensor values to show "--"
         if hasattr(self, 'main_window') and hasattr(self.main_window, 'sensor_controller'):
             for sensor in self.main_window.sensor_controller.sensors:
-                if getattr(sensor, 'interface_type', '') == 'OtherSerial':
+                if getattr(sensor, 'interface_type', '') in ('OtherSerial', 'Serial'):
                     # Set current_value to None so it displays as "--"
                     sensor.current_value = None
             # Force update of sensor values in UI
@@ -717,34 +853,53 @@ class DataCollectionController(QObject):
             # Create the sequence
             sequence = SerialSequence(name=name)
             sequence.steps = []  # Explicitly initialize steps list
+            last_read_var = "response"  # Track the most recent ReadResponse target for parse defaults
             
             # Add steps based on the actions
             for i, action in enumerate(actions):
                 action_type = action.get('type', '')
                 print(f"DEBUG create_serial_sequence: Processing action {i+1}: type={action_type}")
                 
-                if action_type == 'send':
+                # Support both legacy UI schema and harmonized engine schema
+                # Legacy UI schema types: send/wait/read/parse/publish
+                # Engine schema types: SendCommand/Wait/ReadResponse/ParseValue/publish
+                if action_type in ('send', 'SendCommand'):
+                    # The sequence editor's "Test" tool always appends '\n' after send.
+                    # For backward compatibility, if no line_ending is specified, default to LF.
+                    cmd = action.get('command', '')
+                    line_ending = action.get('line_ending')
+                    if not line_ending:
+                        # If the command already contains a newline, keep "None" to avoid double terminators.
+                        if isinstance(cmd, str) and (cmd.endswith("\n") or cmd.endswith("\r")):
+                            line_ending = "None"
+                        else:
+                            line_ending = "LF (\\n)"
                     step = SendCommandStep(
-                        command=action.get('command', ''),
-                        line_ending=action.get('line_ending', 'None')
+                        command=cmd,
+                        line_ending=line_ending
                     )
                     sequence.steps.append(step)
                     print(f"DEBUG create_serial_sequence: Added SendCommandStep with command '{action.get('command', '')}'")
                     
-                elif action_type == 'wait':
-                    wait_ms = int(action.get('ms', 1000))
+                elif action_type in ('wait', 'Wait'):
+                    wait_ms = int(action.get('ms', action.get('wait_time', 1000)))
                     step = WaitStep(wait_time=wait_ms)
                     sequence.steps.append(step)
                     print(f"DEBUG create_serial_sequence: Added WaitStep with {wait_ms}ms")
                     
-                elif action_type == 'read':
+                elif action_type in ('read', 'ReadResponse'):
+                    result_var = action.get('target', action.get('result_var', 'response')) or 'response'
+                    # Default to "Read Line" to match the Test dialog behavior (which uses readline()).
+                    # Use 1000ms timeout (1 second) - user confirmed 500ms works in test.
+                    read_type = action.get('read_type') or 'Read Line'
                     step = ReadResponseStep(
-                        read_type=action.get('read_type', 'Read Line'),
+                        read_type=read_type,
                         timeout=int(action.get('timeout', 1000)),
-                        result_var=action.get('target', 'response')
+                        result_var=result_var
                     )
                     sequence.steps.append(step)
                     print(f"DEBUG create_serial_sequence: Added ReadResponseStep to store in '{action.get('target', 'response')}'")
+                    last_read_var = result_var
                     
                 elif action_type == 'parse':
                     # Get parse mode and parameters
@@ -766,8 +921,10 @@ class DataCollectionController(QObject):
                     else:  # entire
                         parse_method = 'Entire Response'
                     
+                    # If the user didn't explicitly select a source, default to the last ReadResponse target.
+                    parse_source = action.get('source') or last_read_var or 'response'
                     step = ParseValueStep(
-                        source_var=action.get('source', 'response'),
+                        source_var=parse_source,
                         parse_method=parse_method,
                         start_marker=start_marker,
                         end_marker=end_marker,
@@ -775,11 +932,25 @@ class DataCollectionController(QObject):
                         result_var=action.get('target', 'value')
                     )
                     sequence.steps.append(step)
-                    print(f"DEBUG create_serial_sequence: Added ParseValueStep from '{action.get('source', 'response')}' to '{action.get('target', 'value')}'")
+                    print(f"DEBUG create_serial_sequence: Added ParseValueStep from '{parse_source}' to '{action.get('target', 'value')}'")
+
+                elif action_type == 'ParseValue':
+                    # Engine schema already matches ParseValueStep parameters
+                    parse_source = action.get('source_var') or last_read_var or 'response'
+                    step = ParseValueStep(
+                        source_var=parse_source,
+                        parse_method=action.get('parse_method', 'Entire Response'),
+                        start_marker=action.get('start_marker', ''),
+                        end_marker=action.get('end_marker', ''),
+                        result_type=action.get('result_type', 'Number (Float)'),
+                        result_var=action.get('result_var', 'value')
+                    )
+                    sequence.steps.append(step)
+                    print(f"DEBUG create_serial_sequence: Added ParseValueStep (engine schema) from '{parse_source}' to '{action.get('result_var', 'value')}'")
                     
                 elif action_type == 'publish':
                     step = PublishValueStep(
-                        source_var=action.get('source', 'value'),
+                        source_var=action.get('source', action.get('source_var', 'value')),
                         target=action.get('target', 'output')
                     )
                     sequence.steps.append(step)
@@ -857,6 +1028,7 @@ class DataCollectionController(QObject):
             if 'mqtt' in self.interfaces and self.interfaces['mqtt']['connected']:
                 self.mqtt_thread.disconnect()
                 self.interfaces['mqtt']['connected'] = False
+                self._clear_interface_sensor_values('mqtt')
                 self.interface_status_signal.emit('mqtt', False)
                 
                 if self.main_window:
@@ -883,6 +1055,7 @@ class DataCollectionController(QObject):
                 return True
             else:
                 # print("DEBUG: No enabled CSV configs, thread NOT started")
+                self._clear_interface_sensor_values('csv')
                 self.log("Stopped all CSV data monitoring")
                 return True
         except Exception as e:
@@ -899,6 +1072,7 @@ class DataCollectionController(QObject):
         self.disconnect_mqtt()
         if hasattr(self, 'csv_thread'):
             self.csv_thread.stop()
+            self._clear_interface_sensor_values('csv')
         self.log("Disconnected all interfaces.")
         
     def start_data_collection(self, run_dir):
@@ -912,6 +1086,10 @@ class DataCollectionController(QObject):
             True if data collection started successfully, False otherwise
         """
         try:
+            # Force update of all status indicators at start
+            if self.main_window and hasattr(self.main_window, 'sensor_controller'):
+                self.main_window.sensor_controller.update_sensor_table()
+            
             # Make sure run directory exists
             if not os.path.exists(run_dir):
                 os.makedirs(run_dir)
@@ -985,6 +1163,12 @@ class DataCollectionController(QObject):
             # Determine header from enabled sensors in SensorController
             # Sensors with show_in_graph=False are excluded from both graphs and CSV recording per user requirement
             self.csv_header = ['timestamp', 'arduino_timestamp', 'labjack_timestamp', 'other_serial_timestamp', 'audio_timestamp', 'mqtt_timestamp'] # Global tick + per-interface timestamps
+            
+            # PERSISTENCE: Save a snapshot of virtual sensors for this run
+            if self.main_window and hasattr(self.main_window, 'save_virtual_sensors'):
+                self.main_window.save_virtual_sensors()
+                self.log("Saved configuration snapshot to run directory")
+            
             sensor_controller = getattr(self.main_window, 'sensor_controller', None)
             enabled_sensor_ids = []
             if sensor_controller:
@@ -1146,6 +1330,11 @@ class DataCollectionController(QObject):
             # --- Close CSV File --- 
             self._close_csv_file()
             self.log("Data collection stopped.")
+
+            # Stop the combined data timer
+            if hasattr(self, 'combined_data_timer') and self.combined_data_timer.isActive():
+                self.combined_data_timer.stop()
+                self.log("Stopped combined data timer.")
             
             # Update run metadata with duration
             if self.start_time:
@@ -1225,6 +1414,9 @@ class DataCollectionController(QObject):
     @pyqtSlot(dict)
     def handle_mqtt_data(self, data):
         """Handle data received from MQTT"""
+        if not self.mqtt_connected:
+            return
+            
         # Discard data for storage if collection is not active, but allow monitoring for UI updates
         store_data = self.collecting_data
         
@@ -1323,6 +1515,7 @@ class DataCollectionController(QObject):
         if is_connected:
             self.log(f"MQTT Connected: {message}")
         else:
+            self._clear_interface_sensor_values('mqtt')
             self.log(f"MQTT Disconnected: {message}", "WARNING")
 
     def handle_mqtt_error(self, message):
@@ -1332,6 +1525,9 @@ class DataCollectionController(QObject):
 
     def handle_arduino_data(self, data):
         """Handle data received from Arduino"""
+        if not self.arduino_connected:
+            return
+            
         # print(f"DEBUG: handle_arduino_data called with keys: {list(data.keys())}") # Verbose
 
         # Track data flow for monitoring
@@ -1368,7 +1564,17 @@ class DataCollectionController(QObject):
             if key == 'timestamp':
                 continue # Skip timestamp
 
+            # Try direct match first
             sensor = sensors_found.get(key)
+            
+            # Try case-insensitive match if not found
+            if not sensor:
+                key_lower = key.lower()
+                for name, s in sensors_found.items():
+                    if name.lower() == key_lower:
+                        sensor = s
+                        break
+            
             if sensor:
                 try:
                     # Get offset and conversion factor from the sensor model
@@ -1463,7 +1669,9 @@ class DataCollectionController(QObject):
         print(f"DataCollectionController: Emitting interface_status_signal('arduino', {connected})")
         self.interface_status_signal.emit('arduino', connected)
         
-        if connected:
+        if not connected:
+            self._clear_interface_sensor_values('arduino')
+        else:
             self._ensure_timers_running()
         
         # Direct UI update
@@ -1486,7 +1694,7 @@ class DataCollectionController(QObject):
         Args:
             data (dict): Data received from the OtherSerial interface
         """
-        if not data:
+        if not self.other_serial_connected or not data:
             return
         
         # Track data flow for monitoring
@@ -1511,7 +1719,7 @@ class DataCollectionController(QObject):
         # Access sensors through main_window instead of directly
         if hasattr(self, 'main_window') and hasattr(self.main_window, 'sensor_controller'):
             for sensor in self.main_window.sensor_controller.sensors:
-                if getattr(sensor, 'interface_type', '') == 'OtherSerial':
+                if getattr(sensor, 'interface_type', '') in ('OtherSerial', 'Serial'):
                     mapping = getattr(sensor, 'mapping', None) or getattr(sensor, 'published_variable', None)
                     other_serial_sensors.append(sensor)
                     print(f"DEBUG DataCollectionController: Found OtherSerial sensor '{sensor.name}' with mapping '{mapping}'")
@@ -1591,9 +1799,9 @@ class DataCollectionController(QObject):
             self.main_window.sensor_controller.update_other_serial_data(corrected_data)
             print("DEBUG DataCollectionController: Completed sensor_controller.update_other_serial_data call")
             # Also update the sensor values in the UI
-            print("DEBUG DataCollectionController: Calling sensor_controller.update_sensor_values()")
-            self.main_window.sensor_controller.update_sensor_values()
-            print("DEBUG DataCollectionController: Completed sensor_controller.update_sensor_values() call")
+            # print("DEBUG DataCollectionController: Calling sensor_controller.update_sensor_values()")
+            # self.main_window.sensor_controller.update_sensor_values()
+            # print("DEBUG DataCollectionController: Completed sensor_controller.update_sensor_values() call")
         else:
             print("ERROR: sensor_controller not found on main_window in handle_other_serial_data")
         
@@ -1625,7 +1833,9 @@ class DataCollectionController(QObject):
         # Use 'other' not 'other_serial' to match what MainWindow expects
         self.interface_status_signal.emit('other', connected)
         
-        if connected:
+        if not connected:
+            self._clear_interface_sensor_values('other')
+        else:
             self._ensure_timers_running()
         
         # Direct UI update
@@ -1823,6 +2033,323 @@ class DataCollectionController(QObject):
             self.log(f"Error in control_device: {str(e)}", "ERROR")
             return False
         
+    def add_sensor_from_config(self, config, persist=True):
+        """
+        Add a sensor based on a unified configuration dictionary.
+        This is the entry point for the dynamic plugin system.
+        
+        Args:
+            config: Configuration dictionary
+            persist: Whether to save this configuration to virtual_sensors.json
+        """
+        from app.models.sensor_model import SensorModel
+        
+        device_type = config.get("type")
+        name = config.get("name")
+        unit = config.get("unit", "")
+        
+        # 1. Check if sensor already exists to avoid duplicates (and renaming to _1, _2)
+        if hasattr(self.main_window, 'sensor_controller'):
+            existing = self.main_window.sensor_controller.get_sensor_by_name(name)
+            if existing:
+                # If it's the same interface type, we just update it
+                if getattr(existing, 'interface_type', '') == device_type:
+                    self.log(f"Sensor '{name}' already exists for interface '{device_type}'. Skipping addition.")
+                    # For plugins, we still need to make sure the thread is running
+                    success = True 
+                    # ... but we skip the actual add_sensor_to_list call later
+                else:
+                    self.log(f"Sensor '{name}' exists but for a different interface. Renaming will occur.")
+            
+        self.log(f"Adding sensor '{name}' of type '{device_type}' from config (persist={persist})")
+        
+        success = False
+        port = config.get("port", "")
+        
+        # Handle built-in types with existing specialized logic for CONNECTION
+        if device_type == "Arduino":
+            success = self.connect_arduino(
+                port=config.get("port"),
+                baud_rate=config.get("baud_rate", 9600)
+            )
+            # For Arduino, we often use empty port to match by name
+            # if the name is one of the available sensors
+            port = "" 
+        elif device_type == "LabJack":
+            success = self.connect_labjack(
+                device_type=config.get("device_type", "T7"),
+                connection_type=config.get("connection_type", "ANY"),
+                identifier=config.get("port", "ANY")
+            )
+            port = config.get("port")
+        elif device_type in ("Serial", "OtherSerial"):
+            # Serial is backed by the OtherSerial thread/sequence system.
+            # Adding a sensor should NOT require an active connection; users can connect later.
+            success = True
+            port = config.get("port", "")
+        else:
+            # Handle generic plugins from InterfaceRegistry
+            interface_class = InterfaceRegistry.get_interface_class(device_type)
+            if interface_class:
+                try:
+                    # Filter out non-config keys for instantiation
+                    interface_kwargs = {k: v for k, v in config.items() if k not in ["name", "type", "unit", "measurement", "poll_rate"]}
+                    
+                    # Robust instantiation: only pass arguments that the constructor actually accepts
+                    sig = inspect.signature(interface_class.__init__)
+                    valid_params = sig.parameters.keys()
+                    # Only filter if the class doesn't accept **kwargs
+                    if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                        interface_kwargs = {k: v for k, v in interface_kwargs.items() if k in valid_params}
+                    
+                    # For plugins, we reuse the instance if it already exists
+                    if device_type in self.interfaces and 'instance' in self.interfaces[device_type]:
+                        interface_instance = self.interfaces[device_type]['instance']
+                        # Check if it's already connected or try to reconnect
+                        success = getattr(interface_instance, 'connected', False)
+                        if not success:
+                            success = interface_instance.connect()
+                        
+                        if success:
+                            # Re-emit status to ensure UI reflects it
+                            self.interface_status_signal.emit(device_type, True)
+                            
+                            # Ensure thread is running
+                            if device_type not in self.interface_threads or not self.interface_threads[device_type].isRunning():
+                                # Get poll rate from config if available, default to 10Hz
+                                poll_rate = float(config.get("poll_rate", 10.0))
+                                thread = PluginPollingThread(interface_instance, device_type, poll_rate_hz=poll_rate)
+                                thread.data_received_signal.connect(lambda data, n=device_type: self.handle_plugin_data(n, data))
+                                # Connect status signal to trigger UI updates and value clearing
+                                thread.connection_status_signal.connect(self.handle_plugin_status)
+                                thread.start()
+                                self.interface_threads[device_type] = thread
+                                self.log(f"Started polling thread for {device_type} at {poll_rate}Hz")
+                    else:
+                        # Instantiate the interface class with the filtered arguments
+                        interface_instance = interface_class(**interface_kwargs)
+                        if interface_instance.connect():
+                            self.log(f"Connected to custom interface: {device_type}")
+                            if device_type not in self.interfaces:
+                                self.interfaces[device_type] = {}
+                            self.interfaces[device_type]['connected'] = True
+                            self.interfaces[device_type]['instance'] = interface_instance
+                            self.interface_status_signal.emit(device_type, True)
+                            
+                            # Create and start the polling thread for this plugin
+                            # Following the blueprint for threading
+                            poll_rate = float(config.get("poll_rate", 10.0))
+                            thread = PluginPollingThread(interface_instance, device_type, poll_rate_hz=poll_rate)
+                            thread.data_received_signal.connect(lambda data, n=device_type: self.handle_plugin_data(n, data))
+                            thread.start()
+                            self.interface_threads[device_type] = thread
+                            self.log(f"Started polling thread for {device_type} at {poll_rate}Hz")
+                            
+                            success = True
+                        else:
+                            self.log(f"Failed to connect to custom interface: {device_type}", "ERROR")
+                    
+                    # --- CRITICAL: Ensure success is TRUE for plugins to trigger SensorModel creation ---
+                    if success:
+                        print(f"DEBUG: Plugin {device_type} connection successful, preparing sensor creation")
+                except Exception as e:
+                    self.log(f"Error instantiating custom interface {device_type}: {e}", "ERROR")
+            else:
+                self.log(f"Interface class not found for type: {device_type}", "ERROR")
+            
+            port = config.get("port", "")
+
+        # If connection (or registration) was successful, create the SensorModel
+        if success:
+            # Check again if we should add to the list (to avoid duplicates and suffixing like _1, _2)
+            existing = None
+            if hasattr(self.main_window, 'sensor_controller'):
+                existing = self.main_window.sensor_controller.get_sensor_by_name(name)
+            
+            if existing and getattr(existing, 'interface_type', '') == device_type:
+                # Sensor already exists in list, just ensure it's enabled
+                existing.enabled = bool(config.get("enabled", True))
+                if "auto_connect" in config:
+                    existing.auto_connect = bool(config.get("auto_connect", existing.auto_connect))
+                
+                # Update global QSettings for this interface type
+                if self.main_window and hasattr(self.main_window, 'settings'):
+                    settings_key = device_type.lower().replace(" ", "_")
+                    self.main_window.settings.setValue(f"{settings_key}_enabled", "true" if existing.enabled else "false")
+                    self.main_window.settings.setValue(f"{settings_key}_auto_connect", "true" if existing.auto_connect else "false")
+                
+                self.log(f"Updated existing sensor '{name}'")
+            else:
+                sensor = SensorModel(
+                    name=name,
+                    interface_type=device_type,
+                    port=port,
+                    unit=unit,
+                    enabled=bool(config.get("enabled", True)),
+                    auto_connect=bool(config.get("auto_connect", False))
+                )
+                
+                # Store the specific measurement sub-key if provided
+                if config.get("measurement"):
+                    sensor.mapping = config.get("measurement")
+                
+                if hasattr(self.main_window, 'sensor_controller'):
+                    # Add to sensor controller's list
+                    # Use sensors.append directly if we want to avoid the suffixing logic in add_sensor_to_list
+                    # but only if we are SURE it's not a duplicate
+                    if not any(s.name == name for s in self.main_window.sensor_controller.sensors):
+                        self.main_window.sensor_controller.add_sensor_to_list(sensor)
+                    else:
+                        # Find the existing one and update it instead of adding a new one with a suffix
+                        existing = self.main_window.sensor_controller.get_sensor_by_name(name)
+                        if existing:
+                            existing.interface_type = device_type
+                            existing.port = port
+                            existing.unit = unit
+                            existing.enabled = True
+                            if config.get("measurement"):
+                                existing.mapping = config.get("measurement")
+            
+            # PERSISTENCE: Save to virtual_sensors.json if requested
+            if persist and hasattr(self.main_window, 'other_sensors'):
+                # 1. Look for existing entry to update
+                found = False
+                for i, c in enumerate(self.main_window.other_sensors):
+                    if c.get('name') == name and c.get('type') == device_type:
+                        # Update the existing config with the new one
+                        # (Merging ensures we preserve keys that might not be in the new config)
+                        self.main_window.other_sensors[i].update(config)
+                        found = True
+                        break
+                
+                # 2. If not found, append new config
+                if not found:
+                    self.main_window.other_sensors.append(config)
+                
+                # 3. Always save to ensure persistence
+                self.main_window.save_virtual_sensors()
+                self.log(f"Persisted sensor '{name}' configuration to virtual_sensors.json")
+            
+            return True
+        
+        return False
+
+    def handle_plugin_data(self, name, data):
+        """Handle data received from a plugin interface thread."""
+        if not self.interfaces.get(name, {}).get('connected', False) or not data:
+            return
+            
+        ts = time.time()
+        self.combined_data_mutex.lock()
+        try:
+            for key, value in data.items():
+                # Prefix keys to avoid collisions, e.g. "Simulated Power Meter_Voltage"
+                prefixed_key = f"{name}_{key}"
+                self.combined_data[prefixed_key] = value
+                self._last_sensor_update[prefixed_key] = ts
+            
+            # Update interface timestamp
+            self.combined_data[f"{name}_timestamp"] = ts
+            if 'timestamp' not in self.combined_data or ts > self.combined_data['timestamp']:
+                self.combined_data['timestamp'] = ts
+        finally:
+            self.combined_data_mutex.unlock()
+            
+        if not self.collecting_data:
+            # Use a global emit time to ensure synchronized updates at the sampling rate
+            # across all plugin interfaces, avoiding "double frequency" look.
+            last_emit = getattr(self, '_last_monitoring_emit_time', 0)
+            
+            # Respect the global sampling rate even in monitoring mode
+            # Default to 1Hz if sampling_rate is too low or invalid
+            min_interval = 1.0 / max(0.1, self.sampling_rate)
+            if ts - last_emit >= min_interval:
+                self.emit_combined_data()
+                self._last_monitoring_emit_time = ts
+
+    def connect_plugin_interface(self, device_type):
+        """Manually connect a plugin interface based on its registered type (Harmonized)."""
+        # 1. Try to find a configuration for this device type in other_sensors
+        config = None
+        if hasattr(self.main_window, 'other_sensors'):
+            for c in self.main_window.other_sensors:
+                if c.get("type") == device_type:
+                    config = c
+                    break
+        
+        # 2. If not found, try to reconstruct from MainWindow settings
+        if not config and self.main_window and hasattr(self.main_window, 'settings'):
+            interface_class = InterfaceRegistry.get_interface_class(device_type)
+            if interface_class:
+                config = {"type": device_type, "name": f"{device_type} Interface"}
+                settings_key = device_type.lower().replace(" ", "_")
+                schema = getattr(interface_class, "CONFIG_SCHEMA", {})
+                for key, field_cfg in schema.items():
+                    val = self.main_window.settings.value(f"{settings_key}_{key}")
+                    if val is not None:
+                        # Convert type if needed
+                        if field_cfg.get("type") == "number":
+                            try: val = float(val)
+                            except: pass
+                        elif field_cfg.get("type") == "boolean":
+                            val = val == "true"
+                        config[key] = val
+                    else:
+                        config[key] = field_cfg.get("default")
+        
+        if not config:
+            # 3. Try to find an existing instance to reconnect
+            if device_type in self.interfaces and 'instance' in self.interfaces[device_type]:
+                instance = self.interfaces[device_type]['instance']
+                if instance.connect():
+                    self.interfaces[device_type]['connected'] = True
+                    self.interface_status_signal.emit(device_type, True)
+                    
+                    # Ensure thread is running
+                    if device_type not in self.interface_threads or not self.interface_threads[device_type].isRunning():
+                        thread = PluginPollingThread(instance, device_type, poll_rate_hz=10.0)
+                        thread.data_received_signal.connect(lambda data, n=device_type: self.handle_plugin_data(n, data))
+                        thread.connection_status_signal.connect(self.handle_plugin_status)
+                        thread.start()
+                        self.interface_threads[device_type] = thread
+                    return True
+            
+            self.log(f"No configuration found to connect plugin: {device_type}", "ERROR")
+            return False
+            
+        # Use existing add_sensor_from_config logic
+        return self.add_sensor_from_config(config, persist=False)
+
+    def disconnect_plugin_interface(self, name):
+        """Properly shut down a plugin interface and its polling thread."""
+        if name in self.interface_threads:
+            thread = self.interface_threads[name]
+            thread.stop()
+            thread.wait(1000)
+            del self.interface_threads[name]
+            self.log(f"Stopped polling thread for plugin: {name}")
+            
+        if name in self.interfaces:
+            if 'instance' in self.interfaces[name]:
+                try:
+                    self.interfaces[name]['instance'].disconnect()
+                except:
+                    pass
+            self.interfaces[name]['connected'] = False
+            self._clear_interface_sensor_values(name)
+            self.interface_status_signal.emit(name, False)
+            self.log(f"Disconnected plugin interface: {name}")
+
+    def handle_plugin_status(self, name, connected):
+        """Handle connection status updates for generic plugin interfaces."""
+        if name in self.interfaces:
+            self.interfaces[name]['connected'] = connected
+        
+        if not connected:
+            self._clear_interface_sensor_values(name)
+            
+        self.interface_status_signal.emit(name, connected)
+
     def log(self, message, level="INFO"):
         """Log a message with a specified level"""
         if level not in ["INFO", "WARNING", "ERROR", "DEBUG"]:
@@ -2058,13 +2585,22 @@ class DataCollectionController(QObject):
         elif prefixed_key.startswith('csv_'):
             iface = "CSV"
             base_key = prefixed_key[len('csv_'):]
+        else:
+            # Handle generic plugins: "Interface Name_Measurement"
+            if "_" in prefixed_key:
+                iface_name, measurement = prefixed_key.split("_", 1)
+                # Check if this interface name exists in registry
+                if InterfaceRegistry.get_interface_class(iface_name):
+                    iface = iface_name
+                    base_key = measurement
 
         found_sensor = None
         for sensor in sc.sensors:
             sensor_iface = getattr(sensor, 'interface_type', '')
             if iface and sensor_iface.lower() != iface.lower():
                 continue
-            # LabJack matches on port
+            
+            # Match logic
             if iface and iface.lower() == "labjack":
                 sensor_port = getattr(sensor, 'port', None)
                 if sensor_port and base_key:
@@ -2076,13 +2612,24 @@ class DataCollectionController(QObject):
                        (s_port.startswith(b_key) and "_EF_READ_" in s_port):
                         found_sensor = sensor
                         break
-            else:
-                # Exact name match
+            elif iface:
+                # For plugins and others with an identified interface
+                # First check mapping (measurement name)
+                mapping = getattr(sensor, 'mapping', None)
+                if mapping == base_key:
+                    found_sensor = sensor
+                    break
+                # Fallback to name match if no mapping or mapping doesn't match
                 if getattr(sensor, 'name', None) == base_key:
                     found_sensor = sensor
                     break
-                # For derived audio fields (e.g., name_rms), allow prefix match
-                if iface and iface.lower() == "audiosensor" and getattr(sensor, 'name', None) and base_key.startswith(getattr(sensor, 'name')):
+            else:
+                # Last resort: Exact name match on the whole prefixed key
+                if getattr(sensor, 'name', None) == prefixed_key:
+                    found_sensor = sensor
+                    break
+                # Or just the base key
+                if getattr(sensor, 'name', None) == base_key:
                     found_sensor = sensor
                     break
         
@@ -2204,6 +2751,16 @@ class DataCollectionController(QObject):
             elif interface_type.lower() == 'opticalsensor' and sensor_name:
                 key = f"optical_{sensor_name}"
                 self._averaging_enabled_cache[key] = averaging_enabled
+            else:
+                # Handle generic plugins and other types
+                # Use the same key generation logic as get_historical_buffer_key
+                mapping = getattr(sensor, 'mapping', None)
+                if mapping:
+                    key = f"{interface_type}_{mapping}"
+                    self._averaging_enabled_cache[key] = averaging_enabled
+                elif sensor_name:
+                    key = f"{interface_type}_{sensor_name}"
+                    self._averaging_enabled_cache[key] = averaging_enabled
         
         # Initialize buffers for all sensors with averaging enabled
         # Remove buffers for sensors with averaging disabled
@@ -2268,7 +2825,7 @@ class DataCollectionController(QObject):
             self.combined_data_mutex.unlock()
 
     def _get_stale_timeout_for_key(self, prefixed_key):
-        """Compute stale timeout (seconds) for a given sensor key, honoring per-sensor factor."""
+        """Compute stale timeout (seconds) for a given sensor key, honoring per-sensor factor and interface rates."""
         current_time = time.time()
         
         # Check timeout cache first
@@ -2277,8 +2834,22 @@ class DataCollectionController(QObject):
             if current_time < expiry:
                 return timeout
 
+        # Start with the expected sample interval based on global sampling rate
         base_interval = self._expected_sample_interval
-        timeout_val = self.stale_timeout_seconds # Default fallback
+        
+        # Ensure base interval is at least 0.2s to prevent over-aggressive staleness 
+        # when UI update rate (often 10Hz or 1Hz) is slower than sampling rate
+        base_interval = max(base_interval, 0.2)
+        
+        # Adjust base interval if the interface has a specific slower rate
+        if prefixed_key.startswith('arduino_'):
+            # Arduino often has a 1s poll interval
+            base_interval = max(base_interval, 1.0)
+        elif prefixed_key.startswith('other_serial_') or prefixed_key.startswith('serial_'):
+            # Other serial devices might be slow
+            base_interval = max(base_interval, 1.0)
+            
+        timeout_val = base_interval * self.stale_timeout_factor
 
         sensor = self._get_sensor_for_prefixed_key(prefixed_key)
         if sensor and hasattr(sensor, 'stale_timeout_factor') and sensor.stale_timeout_factor is not None:
@@ -2338,9 +2909,9 @@ class DataCollectionController(QObject):
         finally:
             self.historical_buffer_mutex.unlock()
         
-    def connect_labjack(self, device_type="ANY", connection_type="ANY"):
+    def connect_labjack(self, device_type=None, connection_type=None, port=None):
         """Connect to LabJack device using LabJackDataThread"""
-        print(f"DEBUG: connect_labjack called with device='{device_type}', connection='{connection_type}'")
+        print(f"DEBUG: connect_labjack called with device='{device_type}', connection='{connection_type}', port='{port}'")
         
         if not LabJackInterface:
             self.log("LabJackInterface library not imported successfully.", "ERROR")
@@ -2351,20 +2922,44 @@ class DataCollectionController(QObject):
                 self.log("LabJack already connected")
                 return True
 
+            # Use settings if parameters are None or "ANY"
+            if self.main_window and hasattr(self.main_window, 'settings'):
+                if device_type is None or device_type == "ANY":
+                    device_type = self.main_window.settings.value("labjack_type", "ANY")
+                if connection_type is None or connection_type == "ANY":
+                    connection_type = self.main_window.settings.value("labjack_connection", "ANY")
+                if port is None or port == "ANY":
+                    port = self.main_window.settings.value("labjack_port", "ANY")
+            
+            # Default to "ANY" if still None
+            device_type = device_type or "ANY"
+            connection_type = connection_type or "ANY"
+            port = port or "ANY"
+
             # --- Use LabJackDataThread --- 
             # 1. Create the actual interface object
-            # Use the setting for auto_reconnect
+            # Use the setting for auto_reconnect (broken connection handling)
             auto_reconnect_setting = False
             if self.main_window and hasattr(self.main_window, 'settings'):
-                auto_reconnect_setting = self.main_window.settings.value("labjack_auto_connect", "false") == "true"
+                auto_reconnect_setting = self.main_window.settings.value("labjack_auto_reconnect", "false") == "true"
             
-            lj_interface = LabJackInterface(device_type, connection_type, auto_reconnect=auto_reconnect_setting)
+            lj_interface = LabJackInterface(
+                port=port, 
+                device_type=device_type, 
+                connection_type=connection_type, 
+                auto_reconnect=auto_reconnect_setting
+            )
             
             # 2. Set the interface and hardware sampling rate for the thread
             # Use the internal rate for high-speed hardware polling
             internal_rate = 100.0
             if self.main_window and hasattr(self.main_window, 'settings'):
-                internal_rate = float(self.main_window.settings.value("labjack_internal_rate", "100.0"))
+                val = self.main_window.settings.value("labjack_internal_rate", "100.0")
+                try:
+                    if val is not None and str(val).lower() != 'none':
+                        internal_rate = float(val)
+                except (ValueError, TypeError):
+                    internal_rate = 100.0
             
             self.labjack_thread.set_interface(lj_interface)
             self.labjack_thread.set_sampling_rate(internal_rate)
@@ -2514,7 +3109,6 @@ class DataCollectionController(QObject):
             return False
             
     # --- Handlers for LabJackDataThread signals --- 
-    @pyqtSlot(bool, str)
     def _ensure_timers_running(self):
         """Ensure monitoring timers are running even if not collecting data."""
         if not self.update_timer.isActive():
@@ -2528,7 +3122,16 @@ class DataCollectionController(QObject):
     def handle_labjack_status(self, connected, message):
         """Handle LabJack connection status updates from the thread."""
         print(f"DEBUG: handle_labjack_status received: connected={connected}, message='{message}'")
-        self._handle_labjack_connection_result(connected, self.labjack_thread._labjack_interface if connected else None, message)
+        
+        # Determine the interface object to pass. 
+        # If we are connected, try to use the one from the thread, or fall back to the one we already have.
+        interface_obj = None
+        if connected:
+            interface_obj = getattr(self.labjack_thread, '_labjack_interface', None)
+            if not interface_obj:
+                interface_obj = self.interfaces.get('labjack', {}).get('interface')
+        
+        self._handle_labjack_connection_result(connected, interface_obj, message)
         
     def _handle_labjack_connection_result(self, connected, interface_obj, message):
         """Centralized logic to update state based on connection result."""
@@ -2538,6 +3141,12 @@ class DataCollectionController(QObject):
                 'connected': True,
                 'thread': self.labjack_thread
             }
+            
+            # Ensure SensorController also has a reference to the interface
+            if self.main_window and hasattr(self.main_window, 'sensor_controller'):
+                self.main_window.sensor_controller.labjack_interface = interface_obj
+                print("DEBUG: Set labjack_interface reference in SensorController")
+                
             device_info_str = str(getattr(interface_obj, 'device_info', 'N/A'))
             self.log(f"LabJack connection successful. Info: {device_info_str}")
             self.status_update_signal.emit(f"LabJack connected: {device_info_str}", "INFO")
@@ -2547,6 +3156,7 @@ class DataCollectionController(QObject):
             if 'labjack' in self.interfaces:
                 self.interfaces['labjack']['connected'] = False
                 # Don't nullify interface here, disconnect should handle it via thread
+            self._clear_interface_sensor_values('labjack')
             self.log(f"LabJack disconnected or connection failed: {message}", "INFO" if message == "Disconnected by user" else "ERROR")
             self.status_update_signal.emit(f"LabJack disconnected: {message}", "ERROR")
 
@@ -2561,6 +3171,10 @@ class DataCollectionController(QObject):
     
     def handle_labjack_data(self, data):
         """Handle data received from LabJack thread"""
+        # Guard: Ignore data if interface is not connected
+        if not self.interfaces.get('labjack', {}).get('connected', False):
+            return
+            
         # --- ADDED: Log signal reception ---
         # print(f"DEBUG DataCollectionController: handle_labjack_data SLOT TRIGGERED with keys: {list(data.keys())}") # Verbose
         # ---------------------------------
@@ -2597,11 +3211,24 @@ class DataCollectionController(QObject):
                 for s in sensor_controller.sensors:
                     if getattr(s, 'interface_type', '') == 'LabJack':
                         s_port = s.port.strip().upper() if s.port else ""
-                        if s_port == key_upper or \
-                           (key_upper.startswith(s_port) and "_EF_READ_" in key_upper) or \
+                        # 1. Exact match
+                        if s_port == key_upper:
+                            sensor = s
+                            break
+                        # 2. EF variant match
+                        if (key_upper.startswith(s_port) and "_EF_READ_" in key_upper) or \
                            (s_port.startswith(key_upper) and "_EF_READ_" in s_port):
                             sensor = s
                             break
+                        # 3. Base channel match (e.g., "AIN0" in "AIN0 - Analog Input 0")
+                        if key_upper in s_port or s_port in key_upper:
+                            import re
+                            base_pattern = r'([A-Z]+\d+)'
+                            k_base = re.search(base_pattern, key_upper)
+                            s_base = re.search(base_pattern, s_port)
+                            if k_base and s_base and k_base.group(1) == s_base.group(1):
+                                sensor = s
+                                break
 
             if sensor:
                 try:
@@ -2627,6 +3254,16 @@ class DataCollectionController(QObject):
         # Use the corrected data dictionary from now on
         data = corrected_data
         # ------------------------------------------
+
+        # Track that we've seen these sensors (for staleness checks in UI)
+        sample_ts = data.get('timestamp', time.time())
+        self.combined_data_mutex.lock()
+        try:
+            for key in data:
+                if key != 'timestamp':
+                    self._last_sensor_update[f"labjack_{key}"] = sample_ts
+        finally:
+            self.combined_data_mutex.unlock()
 
         # --- Averaging Logic ---
         # If averaging is enabled for a sensor, we buffer it here instead of updating combined_data immediately.
@@ -2742,6 +3379,10 @@ class DataCollectionController(QObject):
         finally:
             self.combined_data_mutex.unlock()
             
+        # Update the UI with the corrected data (CRITICAL for live values when not collecting)
+        if hasattr(self, 'main_window') and hasattr(self.main_window, 'sensor_controller'):
+            self.main_window.sensor_controller.update_sensor_data(data)
+            
         # --- DISABLED IMMEDIATE EMISSION ---
         # To respect the global sampling rate, we no longer emit LabJack data immediately at full internal rate.
         # Data will instead be emitted by the combined_data_timer in emit_combined_data at the global sampling rate.
@@ -2812,13 +3453,6 @@ class DataCollectionController(QObject):
         """
         # ----------------------------------------------------
     
-        # Process the non-averaged data through SensorController for immediate UI updates (latest value)
-        if len(remaining_data) > 1 and self.main_window and hasattr(self.main_window, 'sensor_controller'):
-            try:
-                self.main_window.sensor_controller.update_labjack_data(remaining_data)
-            except Exception as e:
-                 print(f"ERROR calling sensor_controller.update_labjack_data: {e}")
-        
         # --- DISABLED IMMEDIATE STORAGE ---
         # LabJack data is now stored in historical buffer at global sampling rate in emit_combined_data
         """
@@ -2957,13 +3591,9 @@ class DataCollectionController(QObject):
             # Update UI for averaged sensors
             if len(averaged_data_for_ui) > 1 and self.main_window and hasattr(self.main_window, 'sensor_controller'):
                 try:
-                    self.main_window.sensor_controller.update_labjack_data(averaged_data_for_ui)
+                    self.main_window.sensor_controller.update_sensor_data(averaged_data_for_ui)
                 except Exception as e:
                     print(f"ERROR updating UI for averaged data: {e}")
-
-            # Do not emit or log to CSV if collection is not active
-            if not self.collecting_data:
-                return
 
             # Make a copy of the combined data to emit
             combined_data_copy = self.combined_data.copy()
@@ -2984,11 +3614,23 @@ class DataCollectionController(QObject):
             other_serial_keys = [k for k in combined_data_copy.keys() if k.startswith('other_serial_') and not k.endswith('_timestamp')]
             audio_keys = [k for k in combined_data_copy.keys() if k.startswith('audio_') and not k.endswith('_timestamp')]
             csv_keys = [k for k in combined_data_copy.keys() if k.startswith('csv_') and not k.endswith('_timestamp')]
-            # print(f"DEBUG: Arduino data keys: {arduino_keys}") # <<< COMMENTED OUT
-            # print(f"DEBUG: LabJack data keys: {labjack_keys}") # <<< COMMENTED OUT
-            # print(f"DEBUG: OtherSerial data keys: {other_serial_keys}") # <<< COMMENTED OUT
             
-            keys_to_unprefix = arduino_keys + labjack_keys + other_serial_keys + audio_keys + csv_keys
+            # Find plugin keys (all other prefixed keys)
+            # Plugin keys are formatted as "Interface Name_Measurement"
+            plugin_keys = []
+            known_prefixes = ['arduino_', 'labjack_', 'other_serial_', 'audio_', 'csv_', 'mqtt_']
+            for k in combined_data_copy.keys():
+                if k == 'timestamp' or k.endswith('_timestamp'):
+                    continue
+                is_known = False
+                for kp in known_prefixes:
+                    if k.startswith(kp):
+                        is_known = True
+                        break
+                if not is_known:
+                    plugin_keys.append(k)
+            
+            keys_to_unprefix = arduino_keys + labjack_keys + other_serial_keys + audio_keys + csv_keys + plugin_keys
             for prefixed_key in keys_to_unprefix:
                 unprefixed_key = None
                 if prefixed_key.startswith('arduino_'):
@@ -3001,6 +3643,20 @@ class DataCollectionController(QObject):
                     unprefixed_key = prefixed_key[len('audio_'):]
                 elif prefixed_key.startswith('csv_'):
                     unprefixed_key = prefixed_key[len('csv_'):]
+                else:
+                    # For plugins, we need to find which interface it belongs to
+                    # The format is "Interface Name_Measurement"
+                    # But the unprefixed key for the sensor should match its mapping
+                    # Actually, if we just want to unprefix it for the graph/CSV,
+                    # we should probably use the measurement part.
+                    if '_' in prefixed_key:
+                        parts = prefixed_key.split('_')
+                        # We don't know the exact split point, but we know the mapping
+                        # Let's try to match it against registered interfaces
+                        for interface_name in self.interfaces.keys():
+                            if prefixed_key.startswith(f"{interface_name}_"):
+                                unprefixed_key = prefixed_key[len(interface_name)+1:]
+                                break
                     
                 if unprefixed_key and unprefixed_key not in combined_data_copy:
                      if prefixed_key in combined_data_copy: 
@@ -3010,31 +3666,52 @@ class DataCollectionController(QObject):
                         # print(f"DEBUG WARNING: Prefixed key '{prefixed_key}' not found in combined_data_copy during unprefixing.") # <<< COMMENTED OUT
                         pass # Keep quiet in release
             # Replace stale values with NaN so graphs show gaps instead of flat lines
-            stale_keys = self._apply_stale_timeout(combined_data_copy, current_emit_time)
-
-            # Also record the NaN points into historical buffer so the main graph shows gaps
-            # Use prefixed keys (e.g., arduino_temp) that match historical_buffer keys
-            self._record_stale_history(stale_keys, current_emit_time)
-
-            # --- ADDED: Store non-smoothed LabJack data in historical buffer ---
-            # Smoothed LabJack data is already stored during the averaging loop above.
-            # We now store non-smoothed LabJack data here at the global sampling rate.
+            # ONLY apply during active collection; during monitoring, we want to see the last value
             if self.collecting_data:
+                stale_keys = self._apply_stale_timeout(combined_data_copy, current_emit_time)
+
+                # Also record the NaN points into historical buffer so the main graph shows gaps
+                # Use prefixed keys (e.g., arduino_temp) that match historical_buffer keys
+                self._record_stale_history(stale_keys, current_emit_time)
+            else:
+                stale_keys = []
+
+            # Store non-smoothed LabJack data and Plugin data in historical buffer
+            if self.collecting_data:
+                # Handle LabJack keys
                 for key in labjack_keys:
-                    # Skip if it was already handled as a smoothed sensor
                     if key in self.averaging_buffers and self._averaging_enabled_cache.get(key, False):
                         continue
-                    
                     val = combined_data_copy.get(key)
                     if val is not None:
                         try:
                             float_val = float(val)
-                            # Use QMutexLocker for safety
                             with QMutexLocker(self.historical_buffer_mutex):
                                 self.historical_buffer[key].append((current_emit_time, float_val))
                         except (ValueError, TypeError):
                             pass
-            # ------------------------------------------------------------------
+                
+                # Handle Plugin keys
+                for key in plugin_keys:
+                    val = combined_data_copy.get(key)
+                    if val is not None:
+                        try:
+                            float_val = float(val)
+                            with QMutexLocker(self.historical_buffer_mutex):
+                                self.historical_buffer[key].append((current_emit_time, float_val))
+                        except (ValueError, TypeError):
+                            pass
+            
+            # Emit signal with all latest data (both real and averaged)
+            # This is done even if NOT collecting_data to allow for monitoring/UI updates
+            self.data_received_signal.emit(combined_data_copy)
+            
+            # Also emit combined data signal for graphs and metrics
+            self.combined_data_signal.emit(combined_data_copy)
+
+            # Do not log to CSV if collection is not active
+            if not self.collecting_data:
+                return
 
             # print(f"DEBUG: Final combined_data_copy keys before emit: {list(combined_data_copy.keys())}") # <<< COMMENTED OUT
             
@@ -3596,10 +4273,27 @@ class DataCollectionController(QObject):
             print(f"DEBUG: Exception in _load_historical_data_async: {str(e)}")
 
     # Add a method to explicitly reconnect (used when user clicks Connect button)
-    def explicit_reconnect_other_serial(self, port, baud_rate=9600, data_bits=8, parity="None", 
-                                      stop_bits=1, poll_interval=1.0, sequence=None):
-        """Explicitly reconnect to Other Serial device (user initiated)"""
+    def explicit_reconnect_other_serial(self, port, baud_rate=9600, data_bits=8, parity="None",
+                                        stop_bits=1, poll_interval=1.0, sequence=None, sequences=None):
+        """Explicitly reconnect to Other Serial device (user initiated).
+        
+        This should override the manual-disconnect guard and allow reconnecting immediately.
+        Supports both a single `sequence` and multi-`sequences` mode.
+        """
         self._explicit_reconnect = True
-        result = self.connect_other_serial(port, baud_rate, data_bits, parity, stop_bits, poll_interval, sequence)
-        self._explicit_reconnect = False
+        try:
+            result = self.connect_other_serial(
+                port=port,
+                baud_rate=baud_rate,
+                data_bits=data_bits,
+                parity=parity,
+                stop_bits=stop_bits,
+                poll_interval=poll_interval,
+                sequence=sequence,
+                sequences=sequences
+            )
+            return result
+        finally:
+            self._explicit_reconnect = False
+        return result
         return result

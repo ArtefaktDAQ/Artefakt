@@ -85,7 +85,7 @@ class OpticalSensorConfigDialog(QDialog):
         "brightness": {
             "name": "Brightness",
             "icon": "☀️",
-            "description": "Measure overall brightness levels (mean, max, min)"
+            "description": "Measure overall brightness levels (mean, max, min, std) in a selected Region of Interest. Useful for light level monitoring or transition detection."
         },
         "color": {
             "name": "Color Tracking",
@@ -164,6 +164,12 @@ class OpticalSensorConfigDialog(QDialog):
             "fill_threshold": 128,
             "fill_direction": "horizontal",
             "fill_threshold_percent": 50,
+
+            # Brightness
+            "brightness_roi_x": 0,
+            "brightness_roi_y": 0,
+            "brightness_roi_width": 640,
+            "brightness_roi_height": 480,
 
             # RPM detection
             "rpm_roi_x": 0,
@@ -299,6 +305,11 @@ class OpticalSensorConfigDialog(QDialog):
         self.sample_rate_spin.setSuffix(" Hz")
         camera_layout.addRow("Sample Rate:", self.sample_rate_spin)
         
+        self.auto_connect_cb = QCheckBox("Auto-connect on Startup")
+        self.auto_connect_cb.setChecked(True)
+        self.auto_connect_cb.setStyleSheet(f"color: {COLORS.TEXT_PRIMARY}; font-size: 11px;")
+        camera_layout.addRow("", self.auto_connect_cb)
+        
         left_column.addWidget(camera_group)
         
         # Event Saving
@@ -372,6 +383,10 @@ class OpticalSensorConfigDialog(QDialog):
         # Light Events Tab
         self.light_events_tab = self._create_light_events_tab()
         self.settings_tabs.addTab(self.light_events_tab, "💡 Light")
+        
+        # Brightness Tab
+        self.brightness_tab = self._create_brightness_tab()
+        self.settings_tabs.addTab(self.brightness_tab, "☀️ Bright")
         
         # Particle Counter Tab
         self.particle_counter_tab = self._create_particle_counter_tab()
@@ -467,6 +482,53 @@ class OpticalSensorConfigDialog(QDialog):
             "💡 Light Events mode detects tiny bright spots (1-100 pixels) "
             "against a dark baseline. Perfect for scintillation detection, "
             "particle impacts, or cosmic ray detection."
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet(f"color: {COLORS.TEXT_MUTED}; font-size: 11px; padding: 10px;")
+        layout.addRow(info_label)
+        
+        return widget
+    
+    def _create_brightness_tab(self):
+        """Create the brightness settings tab"""
+        widget = QWidget()
+        layout = QFormLayout(widget)
+        layout.setSpacing(10)
+        
+        # ROI settings
+        roi_group = QGroupBox("Region of Interest (ROI)")
+        roi_layout = QGridLayout(roi_group)
+        
+        roi_layout.addWidget(QLabel("X:"), 0, 0)
+        self.brightness_roi_x_spin = QSpinBox()
+        self.brightness_roi_x_spin.setRange(0, 1920)
+        roi_layout.addWidget(self.brightness_roi_x_spin, 0, 1)
+        
+        roi_layout.addWidget(QLabel("Y:"), 0, 2)
+        self.brightness_roi_y_spin = QSpinBox()
+        self.brightness_roi_y_spin.setRange(0, 1080)
+        roi_layout.addWidget(self.brightness_roi_y_spin, 0, 3)
+        
+        roi_layout.addWidget(QLabel("Width:"), 1, 0)
+        self.brightness_roi_width_spin = QSpinBox()
+        self.brightness_roi_width_spin.setRange(10, 1920)
+        self.brightness_roi_width_spin.setValue(640)
+        roi_layout.addWidget(self.brightness_roi_width_spin, 1, 1)
+        
+        roi_layout.addWidget(QLabel("Height:"), 1, 2)
+        self.brightness_roi_height_spin = QSpinBox()
+        self.brightness_roi_height_spin.setRange(10, 1080)
+        self.brightness_roi_height_spin.setValue(480)
+        roi_layout.addWidget(self.brightness_roi_height_spin, 1, 3)
+        
+        layout.addRow(roi_group)
+        
+        # Info
+        info_label = QLabel(
+            "☀️ Brightness mode measures overall light levels (mean, max, min, std) "
+            "within the selected region of interest (ROI). "
+            "Leave ROI at full resolution for global measurement, or "
+            "constrain it to a specific area of interest."
         )
         info_label.setWordWrap(True)
         info_label.setStyleSheet(f"color: {COLORS.TEXT_MUTED}; font-size: 11px; padding: 10px;")
@@ -922,6 +984,14 @@ class OpticalSensorConfigDialog(QDialog):
                     cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                     cv2.putText(display_frame, "ROI", (x, y - 5), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                elif mode == "brightness":
+                    x = self.brightness_roi_x_spin.value()
+                    y = self.brightness_roi_y_spin.value()
+                    w = self.brightness_roi_width_spin.value()
+                    h = self.brightness_roi_height_spin.value()
+                    cv2.rectangle(display_frame, (x, y), (x + w, y + h), (255, 255, 0), 2)
+                    cv2.putText(display_frame, "Brightness ROI", (x, y - 5),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
                 elif mode == "rpm":
                     x = self.rpm_roi_x_spin.value()
                     y = self.rpm_roi_y_spin.value()
@@ -998,9 +1068,23 @@ class OpticalSensorConfigDialog(QDialog):
                 results.append(f"Event: {'✅ YES' if event_detected else '❌ No'} (range: {min_pixels}-{max_pixels})")
                 
             elif mode == "brightness":
-                mean_brightness = np.mean(gray)
-                max_brightness = np.max(gray)
-                min_brightness = np.min(gray)
+                x = self.brightness_roi_x_spin.value()
+                y = self.brightness_roi_y_spin.value()
+                w = self.brightness_roi_width_spin.value()
+                h = self.brightness_roi_height_spin.value()
+                
+                # Clip ROI to frame bounds
+                h_frame, w_frame = gray.shape
+                x = max(0, min(x, w_frame - 1))
+                y = max(0, min(y, h_frame - 1))
+                w = max(1, min(w, w_frame - x))
+                h = max(1, min(h, h_frame - y))
+                
+                roi = gray[y:y+h, x:x+w]
+                mean_brightness = np.mean(roi)
+                max_brightness = np.max(roi)
+                min_brightness = np.min(roi)
+                results.append(f"ROI: {w}x{h} at ({x},{y})")
                 results.append(f"Mean: {mean_brightness:.1f}")
                 results.append(f"Max: {max_brightness}, Min: {min_brightness}")
                 
@@ -1128,12 +1212,12 @@ class OpticalSensorConfigDialog(QDialog):
         # Switch to appropriate tab while keeping preview accessible
         tab_map = {
             "light_events": 0,
-            "brightness": 0,  # Uses light events tab (threshold settings)
-            "particle_count": 1,  # Particle counter tab
-            "color": 2,
-            "position": 3,
-            "rpm": 4,
-            "fill_level": 5,
+            "brightness": 1,
+            "particle_count": 2,
+            "color": 3,
+            "position": 4,
+            "rpm": 5,
+            "fill_level": 6,
         }
         # Only switch if not on preview tab
         if self.settings_tabs.currentIndex() != preview_tab_index:
@@ -1169,6 +1253,7 @@ class OpticalSensorConfigDialog(QDialog):
         if res_index >= 0:
             self.resolution_combo.setCurrentIndex(res_index)
         self.sample_rate_spin.setValue(self.settings.get("sample_rate", 10))
+        self.auto_connect_cb.setChecked(self.settings.get("auto_connect", True))
         
         # Light events
         threshold_mode = self.settings.get("threshold_mode", "absolute")
@@ -1178,6 +1263,12 @@ class OpticalSensorConfigDialog(QDialog):
         self.min_pixels_spin.setValue(self.settings.get("min_pixels", 1))
         self.max_pixels_spin.setValue(self.settings.get("max_pixels", 100))
         self.cooldown_spin.setValue(self.settings.get("cooldown_ms", 100))
+        
+        # Brightness
+        self.brightness_roi_x_spin.setValue(self.settings.get("brightness_roi_x", 0))
+        self.brightness_roi_y_spin.setValue(self.settings.get("brightness_roi_y", 0))
+        self.brightness_roi_width_spin.setValue(self.settings.get("brightness_roi_width", 640))
+        self.brightness_roi_height_spin.setValue(self.settings.get("brightness_roi_height", 480))
         
         # Particle counter
         particle_threshold_mode = self.settings.get("particle_threshold_mode", "relative")
@@ -1247,6 +1338,12 @@ class OpticalSensorConfigDialog(QDialog):
             "max_pixels": self.max_pixels_spin.value(),
             "cooldown_ms": self.cooldown_spin.value(),
             
+            # Brightness
+            "brightness_roi_x": self.brightness_roi_x_spin.value(),
+            "brightness_roi_y": self.brightness_roi_y_spin.value(),
+            "brightness_roi_width": self.brightness_roi_width_spin.value(),
+            "brightness_roi_height": self.brightness_roi_height_spin.value(),
+            
             # Particle counter
             "particle_threshold_mode": "absolute" if self.particle_threshold_mode_combo.currentIndex() == 0 else "relative",
             "particle_brightness_threshold": self.particle_brightness_threshold_spin.value(),
@@ -1283,6 +1380,7 @@ class OpticalSensorConfigDialog(QDialog):
             "rpm_max_hz": self.rpm_max_hz_spin.value(),
             "rpm_min_prominence": self.rpm_prominence_spin.value(),
             "rpm_pulses_per_rev": self.rpm_ppr_spin.value(),
+            "auto_connect": self.auto_connect_cb.isChecked(),
             
             # Event saving
             "save_event_images": self.save_events_check.isChecked(),
@@ -1393,6 +1491,10 @@ class OpticalSensorAddDialog(QDialog):
             )
         form_layout.addRow("Detection Mode:", self.mode_combo)
         
+        self.auto_connect_cb = QCheckBox("Auto-connect on Startup")
+        self.auto_connect_cb.setChecked(True)
+        form_layout.addRow("", self.auto_connect_cb)
+        
         layout.addLayout(form_layout)
         
         # Info text
@@ -1441,5 +1543,6 @@ class OpticalSensorAddDialog(QDialog):
             "name": self.name_edit.text().strip(),
             "camera_id": self.camera_combo.currentData(),
             "mode": self.mode_combo.currentData(),
+            "auto_connect": self.auto_connect_cb.isChecked(),
         }
 

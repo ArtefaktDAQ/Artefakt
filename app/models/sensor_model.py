@@ -1,3 +1,5 @@
+import time
+
 class SensorModel:
     """Model for sensor data and configuration."""
     
@@ -5,7 +7,8 @@ class SensorModel:
                  offset=0.0, conversion_factor=1.0, color="#FFFFFF", 
                  enabled=True, show_in_graph=True, sequence_config=None, 
                  audio_config=None, optical_config=None,
-                 stale_timeout_factor=None, averaging_enabled=False):
+                 stale_timeout_factor=None, averaging_enabled=False,
+                 auto_connect=True, use_secondary_axis=False):
         self.name = name
         self.interface_type = interface_type
         self.port = port
@@ -16,7 +19,10 @@ class SensorModel:
         self.enabled = enabled
         self.show_in_graph = show_in_graph
         self.averaging_enabled = averaging_enabled
+        self.auto_connect = auto_connect
+        self.use_secondary_axis = use_secondary_axis
         self.current_value = None
+        self.last_update_time = 0  # Timestamp of the last valid reading
         self.history = []
         self.sequence_config = sequence_config or {}  # Store sequence configuration for OtherSerial sensors
         self.audio_config = audio_config or {}  # Store audio sensor configuration
@@ -42,9 +48,19 @@ class SensorModel:
                 # Fallback to simple offset + conversion factor
                 processed_value = (raw_float * self.conversion_factor) + self.offset
             
-            self.current_value = processed_value
-            self.history.append(processed_value)
-            return processed_value
+            return self.set_value(processed_value)
+        except (ValueError, TypeError):
+            return None
+            
+    def set_value(self, value):
+        """Set the sensor's current value directly (already corrected)"""
+        try:
+            float_val = float(value) if value is not None else None
+            self.current_value = float_val
+            self.last_update_time = time.time()
+            if float_val is not None:
+                self.history.append(float_val)
+            return float_val
         except (ValueError, TypeError):
             return None
     
@@ -105,6 +121,8 @@ class SensorModel:
             "enabled": self.enabled,
             "show_in_graph": self.show_in_graph,
             "averaging_enabled": self.averaging_enabled,
+            "auto_connect": self.auto_connect,
+            "use_secondary_axis": self.use_secondary_axis,
             "sequence_config": self.sequence_config
         }
         if self.stale_timeout_factor is not None:
@@ -141,6 +159,8 @@ class SensorModel:
             enabled=data.get("enabled", True),
             show_in_graph=data.get("show_in_graph", True),
             averaging_enabled=data.get("averaging_enabled", False),
+            auto_connect=data.get("auto_connect", True),
+            use_secondary_axis=data.get("use_secondary_axis", False),
             sequence_config=data.get("sequence_config", {}),
             audio_config=data.get("audio_config", {}),
             optical_config=data.get("optical_config", {}),

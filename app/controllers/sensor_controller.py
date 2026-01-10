@@ -4,12 +4,13 @@ Sensor Controller
 Manages sensor data acquisition and operations.
 """
 from PyQt6.QtCore import QObject, pyqtSignal
-from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QLineEdit, QDialogButtonBox, QColorDialog, QCheckBox, QFormLayout, QSpinBox, QDoubleSpinBox, QPushButton, QMessageBox, QTableWidgetItem, QWidget, QScrollArea, QTextEdit, QInputDialog, QListWidgetItem)
+from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QLineEdit, QDialogButtonBox, QColorDialog, QCheckBox, QFormLayout, QSpinBox, QDoubleSpinBox, QPushButton, QMessageBox, QTableWidgetItem, QWidget, QScrollArea, QTextEdit, QInputDialog, QListWidgetItem, QGroupBox)
 from PyQt6.QtGui import QColor
 from PyQt6.QtCore import Qt
 from app.models.sensor_model import SensorModel
 from app.utils.common_types import StatusState
 from app.models.settings_model import SettingsModel
+from app.ui.theme import COLORS
 
 # Import the LabJack interface
 import sys
@@ -17,8 +18,11 @@ import os
 import queue  # Add this import for queue.Empty exceptions
 import time
 import collections  # For deque in buffer clearing
+import re
 
 # Import from the app.core.interfaces package
+from app.core.interfaces.interface_registry import InterfaceRegistry
+
 try:
     from app.core.interfaces.labjack_interface import LabJackInterface
     print("Successfully imported LabJackInterface from app.core.interfaces")
@@ -63,8 +67,9 @@ class SensorController(QObject):
         # Connect signals
         self.connect_signals()
         
-        # Initialize the controller (load sensors, start monitoring)
-        self.initialize()
+        # NOTE: initialize() is now called explicitly by DAQApp.init_controllers()
+        # to ensure all controllers (especially DataCollectionController) are available.
+        # self.initialize()
     
     def connect_signals(self):
         """Connect UI signals to controller methods"""
@@ -102,10 +107,10 @@ class SensorController(QObject):
         # Get the table and ensure it has 7 columns
         table = self.main_window.data_table
         
-        # Ensure table has 9 columns (added Smooth/Average)
-        if table.columnCount() < 9:
-            table.setColumnCount(9)
-            table.setHorizontalHeaderLabels(["Use", "Sensor", "Value", "Interface", "Offset/Unit", "Stale xInt", "Smooth", "Color", "Cal."])
+        # Ensure table has 10 columns (added Sec Y)
+        if table.columnCount() < 10:
+            table.setColumnCount(10)
+            table.setHorizontalHeaderLabels(["Use", "Sensor", "Value", "Interface", "Offset/Unit", "Stale xInt", "Smooth", "Sec Y", "Color", "Cal."])
             table.setColumnWidth(0, 50)  # Use checkbox
             table.setColumnWidth(1, 120)  # Sensor name
             table.setColumnWidth(2, 90)   # Value
@@ -113,8 +118,9 @@ class SensorController(QObject):
             table.setColumnWidth(4, 95)   # Offset/Unit
             table.setColumnWidth(5, 85)  # Stale xInt
             table.setColumnWidth(6, 55)  # Smooth checkbox
-            table.setColumnWidth(7, 70)   # Color
-            table.setColumnWidth(8, 50)   # Cal.
+            table.setColumnWidth(7, 50)  # Sec Y checkbox
+            table.setColumnWidth(8, 70)   # Color
+            table.setColumnWidth(9, 50)   # Cal.
         
         # Clear the table rows
         table.setRowCount(0)
@@ -123,9 +129,10 @@ class SensorController(QObject):
         for i, sensor in enumerate(self.sensors):
             table.insertRow(i)
             
-            # Create a checkbox for "Show in Graph"
+            # Create a checkbox for "Use in Graphs"
             show_checkbox = QCheckBox()
             show_checkbox.setChecked(sensor.show_in_graph)
+            show_checkbox.setToolTip("Show sensor in graph visualizations. Data is always recorded for all enabled sensors.")
             show_checkbox.stateChanged.connect(lambda state, s=sensor: self.toggle_sensor_in_graph(s, state))
             
             # Center the checkbox in the cell
@@ -135,6 +142,7 @@ class SensorController(QObject):
             
             # Sensor name
             name_item = QTableWidgetItem(sensor.name)
+            name_item.setData(Qt.ItemDataRole.UserRole, sensor.name)
             table.setItem(i, 1, name_item)
             
             # Current value (check for staleness)
@@ -200,6 +208,22 @@ class SensorController(QObject):
             smooth_layout.addStretch()
             table.setCellWidget(i, 6, smooth_container)
 
+            # Secondary Y axis toggle
+            sec_y_checkbox = QCheckBox()
+            sec_y_checked = getattr(sensor, 'use_secondary_axis', False)
+            sec_y_checkbox.setChecked(sec_y_checked)
+            sec_y_checkbox.setToolTip("Plot this sensor on a separate Y-axis (right side)")
+            sec_y_checkbox.stateChanged.connect(lambda state, s=sensor: self.toggle_secondary_axis(s, state))
+            
+            sec_y_container = QWidget()
+            sec_y_layout = QVBoxLayout(sec_y_container)
+            sec_y_layout.setContentsMargins(0, 0, 0, 0)
+            sec_y_layout.setSpacing(0)
+            sec_y_layout.addStretch()
+            sec_y_layout.addWidget(sec_y_checkbox, alignment=Qt.AlignmentFlag.AlignCenter)
+            sec_y_layout.addStretch()
+            table.setCellWidget(i, 7, sec_y_container)
+
             # Color
             # Replace the colored cell with a button
             color_button = QPushButton(sensor.color)
@@ -251,7 +275,7 @@ class SensorController(QObject):
             color_layout.addStretch()
             
             # Add the button container to the table
-            table.setCellWidget(i, 7, color_container)
+            table.setCellWidget(i, 8, color_container)
             
             # Calibration button - check if sensor is calibrated
             is_calibrated = self._is_sensor_calibrated(sensor)
@@ -306,7 +330,7 @@ class SensorController(QObject):
             cal_layout.addWidget(cal_button, alignment=Qt.AlignmentFlag.AlignCenter)
             cal_layout.addStretch()
             
-            table.setCellWidget(i, 8, cal_container)
+            table.setCellWidget(i, 9, cal_container)
             
             # Set row height to fit buttons properly
             table.setRowHeight(i, 34)
@@ -363,7 +387,7 @@ class SensorController(QObject):
                 prefixed_key_base = f"labjack_{sensor_port}"
             elif interface_type.lower() == 'arduino' and sensor_name:
                 prefixed_key_base = f"arduino_{sensor_name}"
-            elif interface_type.lower() == 'otherserial' and sensor_name:
+            elif interface_type.lower() in ('otherserial', 'serial', 'other_serial') and sensor_name:
                 prefixed_key_base = f"other_serial_{sensor_name}"
             elif interface_type.lower() == 'audiosensor' and sensor_name:
                 prefixed_key_base = f"audio_{sensor_name}"
@@ -422,6 +446,21 @@ class SensorController(QObject):
         self.update_graph_sensor_dropdowns()
         
         # Update the main analysis graph
+        if hasattr(self.main_window, 'update_graph'):
+            self.main_window.update_graph()
+            
+    def toggle_secondary_axis(self, sensor, state):
+        """Toggle whether sensor uses the secondary Y axis"""
+        sensor.use_secondary_axis = int(state) == Qt.CheckState.Checked.value
+        
+        # Save the updated sensor configuration
+        self.save_sensors()
+        
+        # Trigger graph update if active
+        if hasattr(self.main_window, 'graph_controller'):
+            self.main_window.graph_controller.update_dashboard_graph()
+        
+        # Update the main analysis graph as well
         if hasattr(self.main_window, 'update_graph'):
             self.main_window.update_graph()
             
@@ -572,610 +611,436 @@ class SensorController(QObject):
                     for i in range(self.main_window.multi_sensor_list.count()):
                         self.main_window.multi_sensor_list.item(i).setSelected(True)
     
-    def add_sensor(self):
-        """Add a new sensor"""
+    def add_sensor(self, preselected_type=None):
+        """Add a new sensor (Harmonized)"""
         try:
-            print("Starting add_sensor method")
+            InterfaceRegistry.initialize()
+            interfaces = InterfaceRegistry.get_interfaces()
             
-            # Create a new dialog for adding a sensor
+            from app.ui.theme import DialogStyles, COLORS, GroupBoxStyles, ButtonStyles, ConnectionStyles
+            from app.ui.dialogs.interface_config_dialog import InterfaceConfigDialog
+            from PyQt6.QtWidgets import QDialog, QVBoxLayout, QFormLayout, QComboBox, QLineEdit, QDoubleSpinBox, QHBoxLayout, QLabel, QGroupBox, QCheckBox, QDialogButtonBox, QPushButton
+            from PyQt6.QtCore import Qt
+
             dialog = QDialog(self.main_window)
             dialog.setWindowTitle("Add Sensor")
-            dialog.setMinimumWidth(400)
+            dialog.setMinimumWidth(500)
+            dialog.setStyleSheet(DialogStyles.dark_dialog())
             
-            print("Created dialog")
-            
-            # Main layout
             layout = QVBoxLayout(dialog)
             
-            # Form layout for inputs
-            form_layout = QFormLayout()
+            # 1. Device & Interface Group
+            dev_group = QGroupBox("Interface Selection")
+            dev_group.setStyleSheet(GroupBoxStyles.default())
+            dev_layout = QFormLayout(dev_group)
             
-            # Device type selection (Arduino, LabJack, etc.)
             device_type_combo = QComboBox()
-            device_type_combo.addItem("Arduino")
-            device_type_combo.addItem("LabJack")
-            device_type_combo.addItem("MQTT")
-            device_type_combo.addItem("Other/Virtual Sensor")
-            device_type_combo.addItem("Optical Sensor")
-            device_type_combo.addItem("Read CSV")
-            device_type_combo.setCurrentIndex(0)  # Default to Arduino
+            ordered_names = ["Arduino", "LabJack", "Serial", "Read CSV", "Optical", "Audio", "MQTT"]
+            all_names = list(interfaces.keys())
+            sorted_names = [n for n in ordered_names if n in all_names] + [n for n in all_names if n not in ordered_names]
+            for name in sorted_names:
+                device_type_combo.addItem(name)
             
-            print("Created device type combo")
-            
-            # Enable LabJack option if we have the interface module
-            try:
-                from app.core.interfaces.labjack_interface import LabJackInterface
-                # LabJack option should be enabled if we have the module
-                print("Successfully imported LabJackInterface, enabling option")
-            except ImportError as e:
-                print(f"Could not import LabJackInterface, disabling option: {e}")
-                device_type_combo.model().item(1).setEnabled(False)  # Disable LabJack option
+            if preselected_type and preselected_type in sorted_names:
+                device_type_combo.setCurrentText(preselected_type)
                 
-            form_layout.addRow("Device Type:", device_type_combo)
+            dev_layout.addRow("Interface Type:", device_type_combo)
+            layout.addWidget(dev_group)
             
-            # Port selection container (will be updated based on device type)
-            port_container = QWidget()
-            port_layout = QHBoxLayout(port_container)
-            port_layout.setContentsMargins(0, 0, 0, 0)
+            # 2. Interface Configuration Group (Dynamic)
+            int_group = QGroupBox("Interface Settings")
+            int_group.setStyleSheet(GroupBoxStyles.default())
+            int_layout = QFormLayout(int_group)
+            layout.addWidget(int_group)
             
-            # Arduino port selection widgets
-            arduino_port_combo = QComboBox()
-            refresh_btn = QPushButton("Refresh")
-            port_layout.addWidget(arduino_port_combo)
-            port_layout.addWidget(refresh_btn)
+            # 3. Sensor Metadata Group
+            sensor_group = QGroupBox("Sensor Details")
+            sensor_group.setStyleSheet(GroupBoxStyles.default())
+            sensor_layout = QFormLayout(sensor_group)
             
-            # Function to refresh Arduino ports
-            def refresh_arduino_ports():
-                arduino_port_combo.clear()
+            measurement_combo = QComboBox()
+            sensor_layout.addRow("Measurement:", measurement_combo)
+            
+            name_input = QLineEdit()
+            sensor_layout.addRow("Sensor Name:", name_input)
+            
+            unit_input = QLineEdit()
+            sensor_layout.addRow("Unit:", unit_input)
+            
+            poll_rate_spin = QDoubleSpinBox()
+            poll_rate_spin.setRange(0.1, 1000.0)
+            poll_rate_spin.setDecimals(3)
+            global_rate = getattr(self.main_window.data_collection_controller, 'sampling_rate', 10.0)
+            poll_rate_spin.setValue(global_rate)
+            sensor_layout.addRow("Poll Rate (Hz):", poll_rate_spin)
+            
+            rate_info = QLabel(f"Global sampling rate: {global_rate:.3f} Hz.\nOverride if the hardware interface updates at a different speed.")
+            rate_info.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 10px;")
+            sensor_layout.addRow("", rate_info)
+            
+            layout.addWidget(sensor_group)
+            
+            # 4. Connection & Status Group
+            conn_group = QGroupBox("Connection & Status")
+            conn_group.setStyleSheet(GroupBoxStyles.default())
+            conn_layout = QVBoxLayout(conn_group)
+            
+            status_row = QHBoxLayout()
+            enabled_checkbox = QCheckBox("Enabled")
+            enabled_checkbox.setChecked(True)
+            
+            autoconnect_checkbox = QCheckBox("Auto-connect on Startup")
+            autoconnect_checkbox.setChecked(False)
+            
+            # (Settings will be loaded in update_dynamic_ui)
+
+            status_row.addWidget(enabled_checkbox)
+            status_row.addWidget(autoconnect_checkbox)
+            conn_layout.addLayout(status_row)
+            
+            conn_btn_row = QHBoxLayout()
+            status_indicator = QLabel("●")
+            status_indicator.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 20px;")
+            conn_btn_row.addWidget(status_indicator)
+            status_text = QLabel("Disconnected")
+            conn_btn_row.addWidget(status_text)
+            conn_btn_row.addStretch()
+            
+            connect_btn = QPushButton("Connect")
+            connect_btn.setMinimumWidth(100)
+            conn_btn_row.addWidget(connect_btn)
+            conn_layout.addLayout(conn_btn_row)
+            layout.addWidget(conn_group)
+
+            # Field storage
+            self.current_dialog_fields = {}
+
+            def _get_serial_measurements_for_current_port():
+                """Return available published outputs for the Serial interface as 'Sequence:Target' keys."""
                 try:
-                    if hasattr(self.main_window, 'data_collection_controller'):
-                        available_ports = self.main_window.data_collection_controller.get_arduino_ports()
-                        for port in available_ports:
-                            arduino_port_combo.addItem(port)
-                        if len(available_ports) > 0:
-                            arduino_port_combo.setCurrentIndex(0)
-                        print(f"Found {len(available_ports)} Arduino port(s): {', '.join(available_ports) if available_ports else 'None'}")
-                except Exception as e:
-                    self.main_window.logger.log(f"Error refreshing ports: {str(e)}", "ERROR")
-                    QMessageBox.warning(dialog, "Port Refresh", f"Error refreshing ports: {str(e)}")
-            
-            # Automatically refresh Arduino ports if Arduino is connected
-            if device_type_combo.currentText() == "Arduino" and hasattr(self.main_window, 'data_collection_controller'):
-                if 'arduino' in self.main_window.data_collection_controller.interfaces and \
-                   self.main_window.data_collection_controller.interfaces['arduino']['connected']:
-                    print("Arduino is connected, auto-refreshing ports")
-                    refresh_arduino_ports()
-                else:
-                    print("Arduino is not connected, deferring port refresh to user action")
-            
-            # LabJack channel selection widgets
-            labjack_channel_combo = QComboBox()
-            labjack_channel_combo.setVisible(False)  # Hide initially
-            port_layout.addWidget(labjack_channel_combo)
-            
-            # CSV Mapping selection widgets
-            csv_mapping_combo = QComboBox()
-            csv_mapping_combo.setVisible(False)  # Hide initially
-            port_layout.addWidget(csv_mapping_combo)
-            
-            form_layout.addRow("Port/Channel:", port_container)
-            
-            # Function to populate LabJack channels
-            def populate_labjack_channels():
-                labjack_channel_combo.clear()
+                    port_widget = self.current_dialog_fields.get("port")
+                    selected_port = None
+                    if port_widget and hasattr(port_widget, "currentText"):
+                        selected_port = port_widget.currentText()
+                    sequences = getattr(self.main_window, "other_sequences", []) or []
+                    opts = set()
+                    for seq in sequences:
+                        if not isinstance(seq, dict):
+                            continue
+                        if selected_port and seq.get("port") and seq.get("port") != selected_port:
+                            continue
+                        seq_name = seq.get("name", "").strip()
+                        if not seq_name:
+                            continue
+                        steps_or_actions = seq.get("actions") or seq.get("steps") or []
+                        for a in steps_or_actions:
+                            if not isinstance(a, dict):
+                                continue
+                            if (a.get("type") or "").strip().lower() == "publish":
+                                target = (a.get("target") or "").strip()
+                                if target:
+                                    opts.add(f"{seq_name}:{target}")
+                    return sorted(opts)
+                except Exception:
+                    return []
+
+            def update_dynamic_ui():
+                # Clear interface layout
+                while int_layout.count():
+                    child = int_layout.takeAt(0)
+                    if child.widget(): child.widget().deleteLater()
                 
-                # Try to get detailed channel information
-                channels_info = self.get_labjack_channels_info()
+                self.current_dialog_fields = {}
+                selected_type = device_type_combo.currentText()
+                interface_class = interfaces.get(selected_type)
                 
-                if channels_info:
-                    # Group channels by type for better organization
-                    analog_inputs = []
-                    digital_ios = []
-                    ef_channels = []
-                    analog_outputs = []
-                    
-                    # Sort channels by type
-                    for channel in channels_info:
-                        channel_type = channel.get("type", "")
-                        if channel_type == "analog_input":
-                            analog_inputs.append(channel)
-                        elif channel_type == "digital_io":
-                            digital_ios.append(channel)
-                        elif channel_type.startswith("ef_"):
-                            ef_channels.append(channel)
-                        elif channel_type == "analog_output":
-                            analog_outputs.append(channel)
-                    
-                    # Add channels to combo box with headers for each type
-                    if analog_inputs:
-                        labjack_channel_combo.addItem("--- Analog Inputs ---")
-                        for channel in analog_inputs:
-                            labjack_channel_combo.addItem(f"{channel['name']} - {channel['description']}")
-                    
-                    if digital_ios:
-                        labjack_channel_combo.addItem("--- Digital I/O ---")
-                        for channel in digital_ios:
-                            labjack_channel_combo.addItem(f"{channel['name']} - {channel['description']}")
-                    
-                    if ef_channels:
-                        labjack_channel_combo.addItem("--- Extended Features ---")
-                        for channel in ef_channels:
-                            labjack_channel_combo.addItem(f"{channel['name']} - {channel['description']}")
-                    
-                    if analog_outputs:
-                        labjack_channel_combo.addItem("--- Analog Outputs ---")
-                        for channel in analog_outputs:
-                            labjack_channel_combo.addItem(f"{channel['name']} - {channel['description']}")
+                # Load interface-wide settings (Enabled/Auto-connect) for this type
+                settings_key = selected_type.lower().replace(" ", "_")
+                if hasattr(self, 'settings') and self.settings:
+                    enabled = self.settings.get_bool(f"{settings_key}_enabled", True)
+                    auto_conn = self.settings.get_bool(f"{settings_key}_auto_connect", False)
                 else:
-                    # Fall back to simple channel list if detailed info not available
-                    channels = self.get_labjack_channels()
-                    for channel in channels:
-                        labjack_channel_combo.addItem(channel)
-            
-            # Function to handle device type change
-            def on_device_type_changed(index):
-                device_type = device_type_combo.currentText()
-                if device_type == "Arduino":
-                    arduino_port_combo.setVisible(True)
-                    refresh_btn.setVisible(True)
-                    labjack_channel_combo.setVisible(False)
-                    # Don't auto-refresh here, let the user click the refresh button
-                elif device_type == "LabJack":
-                    arduino_port_combo.setVisible(False)
-                    refresh_btn.setVisible(False)
-                    labjack_channel_combo.setVisible(True)
-                    csv_mapping_combo.setVisible(False)
-                    if hasattr(self, 'mqtt_topic_input'): self.mqtt_topic_input.setVisible(False)
-                    populate_labjack_channels()  # Populate channels when switching to LabJack
-                elif device_type == "MQTT":
-                    arduino_port_combo.setVisible(False)
-                    refresh_btn.setVisible(False)
-                    labjack_channel_combo.setVisible(False)
-                    csv_mapping_combo.setVisible(False)
-                    if not hasattr(self, 'mqtt_topic_input'):
-                        self.mqtt_topic_input = QLineEdit()
-                        self.mqtt_topic_input.setPlaceholderText("e.g. sensors/temperature")
-                        port_layout.addWidget(self.mqtt_topic_input)
-                    self.mqtt_topic_input.setVisible(True)
-                elif device_type == "Read CSV":
-                    arduino_port_combo.setVisible(False)
-                    refresh_btn.setVisible(False)
-                    labjack_channel_combo.setVisible(False)
-                    csv_mapping_combo.setVisible(True)
-                    if hasattr(self, 'mqtt_topic_input'): self.mqtt_topic_input.setVisible(False)
+                    enabled = self.main_window.settings.value(f"{settings_key}_enabled", "true") == "true"
+                    auto_conn = self.main_window.settings.value(f"{settings_key}_auto_connect", "false") == "true"
+                
+                enabled_checkbox.setChecked(enabled)
+                autoconnect_checkbox.setChecked(auto_conn)
+
+                if interface_class:
+                    schema = getattr(interface_class, "CONFIG_SCHEMA", {})
+                    for key, config in schema.items():
+                        field_widget = self._create_ui_field(key, config, interface_class)
+                        int_layout.addRow(config.get("label", key.replace("_", " ").title()) + ":", field_widget)
+                        self.current_dialog_fields[key] = field_widget
+                        # Refresh measurement options when Serial port changes
+                        if device_type_combo.currentText() == "Serial" and key == "port" and hasattr(field_widget, "currentIndexChanged"):
+                            field_widget.currentIndexChanged.connect(lambda _: update_dynamic_ui())
                     
-                    # Populate CSV mappings
-                    csv_mapping_combo.clear()
-                    csv_configs = getattr(self.main_window, 'csv_configs', [])
-                    for cfg in csv_configs:
-                        file_name = os.path.basename(cfg.get('file', 'Unknown'))
-                        for mapping in cfg.get('mappings', []):
-                            sensor_name = mapping.get('sensor_name', 'Unnamed')
-                            csv_mapping_combo.addItem(f"{sensor_name} (from {file_name})", sensor_name)
+                    # Update measurement combo
+                    measurement_combo.clear()
+                    outputs = []
+                    if device_type_combo.currentText() == "Serial":
+                        outputs = _get_serial_measurements_for_current_port()
+                    elif hasattr(interface_class, "get_output_keys"):
+                        outputs = interface_class.get_output_keys()
                     
-                    if csv_mapping_combo.count() == 0:
-                        csv_mapping_combo.addItem("No CSV mappings configured")
-                        csv_mapping_combo.setEnabled(False)
+                    if outputs:
+                        measurement_combo.addItems(outputs)
+                        measurement_combo.setEnabled(True)
                     else:
-                        csv_mapping_combo.setEnabled(True)
-                elif device_type == "Other/Virtual Sensor":
-                    # First check if we have any sequences with published variables
-                    other_sequences = getattr(self.main_window, 'other_sequences', [])
+                        measurement_combo.addItem("Standard Output")
+                        measurement_combo.setEnabled(False)
+                
+                update_conn_ui()
+
+            def update_conn_ui():
+                selected_type = device_type_combo.currentText()
+                is_connected = False
+                if hasattr(self.main_window, 'data_collection_controller'):
+                    dcc = self.main_window.data_collection_controller
                     
-                    # Check if we have any sequences with published variables
-                    has_valid_sequences = False
-                    for seq in other_sequences:
-                        for action in seq.get("actions", []):
-                            if action.get("type") == "publish" and action.get("target"):
-                                has_valid_sequences = True
+                    # Normalize selected_type for lookup
+                    st_lower = selected_type.lower()
+                    
+                    if st_lower == "arduino": 
+                        is_connected = dcc.arduino_connected
+                    elif st_lower == "labjack": 
+                        is_connected = dcc.labjack_connected
+                    elif st_lower == "mqtt":
+                        is_connected = bool(dcc.interfaces.get("mqtt", {}).get("connected", False))
+                    elif st_lower == "serial" or st_lower == "otherserial":
+                        is_connected = bool(dcc.interfaces.get("other_serial", {}).get("connected", False))
+                    else:
+                        # Check generic plugins (case-insensitive lookup)
+                        for key, val in dcc.interfaces.items():
+                            if key.lower() == st_lower:
+                                is_connected = val.get('connected', False)
                                 break
-                        if has_valid_sequences:
-                            break
-                    
-                    if not has_valid_sequences:
-                        # No published variables found, need to create sequences first
-                        result = QMessageBox.question(
-                            self.main_window,
-                            "Create Sequences First",
-                            "Before adding a virtual sensor, you need to create sequences with published variables.\n\n"
-                            "Would you like to open the sequence management dialog now?",
-                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                        )
                         
-                        if result == QMessageBox.StandardButton.Yes:
-                            # Close this dialog
-                            dialog.reject()
-                            
-                            # Show the sequence management dialog
-                            if hasattr(self.main_window, 'show_other_settings_popup'):
-                                self.main_window.show_other_settings_popup()
-                            return
-                    else:
-                        # We have valid sequences, proceed with the sensor dialog
-                        from app.ui.dialogs.other_sensors_dialog import AddEditSensorDialog
-                        
-                        # Close the current dialog
-                        dialog.reject()
-                        
-                        # Open AddEditSensorDialog
-                        sensor_dialog = AddEditSensorDialog(self.main_window, sequences=other_sequences)
-                        if sensor_dialog.exec():
-                            # Get the new sensor configuration
-                            new_sensor = sensor_dialog.get_sensor()
-                            
-                            # Create OtherSerial sensor
-                            name = new_sensor.get("name", "")
-                            sensor_type = new_sensor.get("type", "")
-                            mapping = new_sensor.get("mapping", "")
-                            
-                            # Add to main_window.other_sensors
-                            if name and mapping:
-                                # Create sensor model
-                                from app.models.sensor_model import SensorModel
-                                
-                                # Create dictionary for sensor (needed for both places)
-                                sensor_dict = {
-                                    "name": name,
-                                    "type": sensor_type,
-                                    "mapping": mapping,
-                                    "interface_type": "OtherSerial"
-                                }
-                                
-                                # Add to other_sensors list for persistence
-                                if not hasattr(self.main_window, 'other_sensors'):
-                                    self.main_window.other_sensors = []
-                                self.main_window.other_sensors.append(sensor_dict)
-                                
-                                # Add to main sensor list
-                                sensor_model = SensorModel.from_dict(sensor_dict)
-                                self.add_sensor_to_list(sensor_model)
-                                
-                                # Save the configuration
-                                if hasattr(self.main_window, 'save_virtual_sensors'):
-                                    self.main_window.save_virtual_sensors()
-                                    
-                                # Update the sensor table
-                                self.update_sensor_table()
-                                
-                                # Connect any associated sequence
-                                if hasattr(self.main_window, 'data_collection_controller') and ":" in mapping:
-                                    seq_name, var_name = mapping.split(":", 1)
-                                    # Find the sequence by name
-                                    for sequence in other_sequences:
-                                        if sequence.get("name") == seq_name:
-                                            # Create the sequence object and connect
-                                            port = sequence.get("port", "")
-                                            baud = sequence.get("baud", 9600)
-                                            poll_interval = sequence.get("poll_interval", 1.0)
-                                            steps = sequence.get("actions", [])
-                                            
-                                            # Connect sequence if not already connected
-                                            self.main_window.data_collection_controller.connect_other_serial(
-                                                port=port,
-                                                baud_rate=baud,
-                                                poll_interval=poll_interval,
-                                                sequence=self.main_window.data_collection_controller.create_serial_sequence(seq_name, steps)
-                                            )
-                                            break
+                        # Fallback to checking threads if not in interfaces dict
+                        if not is_connected:
+                            for key, thread in dcc.interface_threads.items():
+                                if key.lower() == st_lower:
+                                    # If it has an interface and it's connected
+                                    if hasattr(thread, 'interface') and thread.interface:
+                                        is_connected = thread.interface.is_connected()
+                                    elif hasattr(thread, 'is_connected'):
+                                        is_connected = thread.is_connected()
+                                    break
+                
+                if is_connected:
+                    status_indicator.setStyleSheet(f"color: {COLORS.SUCCESS}; font-size: 20px;")
+                    status_text.setText("Connected")
+                    connect_btn.setText("Disconnect")
+                    connect_btn.setStyleSheet(ConnectionStyles.disconnected())
+                else:
+                    status_indicator.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 20px;")
+                    status_text.setText("Disconnected")
+                    connect_btn.setText("Connect")
+                    connect_btn.setStyleSheet(ConnectionStyles.connected())
+
+            def on_conn_click():
+                selected_type = device_type_combo.currentText()
+                dcc = self.main_window.data_collection_controller
+                if "Disconnect" in connect_btn.text():
+                    if selected_type == "Arduino": dcc.disconnect_arduino()
+                    elif selected_type == "LabJack": dcc.disconnect_labjack()
+                    elif selected_type == "MQTT": dcc.disconnect_mqtt()
+                    elif selected_type == "Serial": dcc.disconnect_other_serial()
+                    else: dcc.disconnect_plugin_interface(selected_type)
+                else:
+                    # Connect logic
+                    if selected_type == "Arduino": dcc.connect_arduino()
+                    elif selected_type == "LabJack": dcc.connect_labjack()
+                    elif selected_type == "MQTT":
+                        broker = self.main_window.settings.value("mqtt_broker", "localhost")
+                        port = int(self.main_window.settings.value("mqtt_port", 1883))
+                        dcc.connect_mqtt(broker=broker, port=port)
+                    elif selected_type == "Serial":
+                        # Build and connect all sequences configured for the selected port (and current baud/poll group).
+                        port_widget = self.current_dialog_fields.get("port")
+                        baud_widget = self.current_dialog_fields.get("baud_rate")
+                        poll_widget = self.current_dialog_fields.get("poll_interval")
+                        port_val = port_widget.currentText() if port_widget else ""
+                        baud_val = int(baud_widget.currentText()) if baud_widget and hasattr(baud_widget, "currentText") else 9600
+                        poll_val = float(poll_widget.value()) if poll_widget and hasattr(poll_widget, "value") else 1.0
+
+                        other_sequences = getattr(self.main_window, "other_sequences", []) or []
+                        matching = []
+                        for seq in other_sequences:
+                            if isinstance(seq, dict) and seq.get("port") == port_val:
+                                # Respect different baud/poll groups if stored
+                                if int(seq.get("baud", baud_val)) != baud_val:
+                                    continue
+                                if float(seq.get("poll_interval", poll_val)) != poll_val:
+                                    continue
+                                matching.append(seq)
+
+                        seq_objs = []
+                        if matching:
+                            for seq in matching:
+                                actions = seq.get("actions") or seq.get("steps") or []
+                                seq_obj = dcc.create_serial_sequence(seq.get("name", "Unnamed"), actions)
+                                if seq_obj:
+                                    seq_objs.append(seq_obj)
+
+                        if seq_objs:
+                            dcc.connect_other_serial(port=port_val, baud_rate=baud_val, poll_interval=poll_val, sequences=seq_objs)
+                        else:
+                            # Fallback: connect with a single empty sequence (no outputs until configured)
+                            dcc.connect_other_serial(port=port_val, baud_rate=baud_val, poll_interval=poll_val)
+                    else: dcc.connect_plugin_interface(selected_type)
+                update_conn_ui()
+
+            device_type_combo.currentIndexChanged.connect(update_dynamic_ui)
+            connect_btn.clicked.connect(on_conn_click)
+            
+            # Add a timer to keep connection status in sync
+            from PyQt6.QtCore import QTimer
+            sync_timer = QTimer(dialog)
+            sync_timer.timeout.connect(update_conn_ui)
+            sync_timer.start(1000) # Sync every second
+            
+            def _auto_name_from_measurement(t: str):
+                if not t or t == "Standard Output":
                     return
-                elif device_type == "Optical Sensor":
-                    # Close the current dialog and open the Optical Sensor dialog
-                    dialog.reject()
-                    
-                    # Open the Optical Sensor add dialog
-                    self._show_add_optical_sensor_dialog()
-                    return
-            
-            # Connect the device type combo box change event
-            device_type_combo.currentIndexChanged.connect(on_device_type_changed)
-            
-            # Function to update sensor name text field when LabJack channel is selected
-            def on_labjack_channel_changed(index):
-                # Only process valid selections (skip headers)
-                channel_text = labjack_channel_combo.currentText()
-                if not channel_text.startswith("---"):
-                    # Extract the channel name and update the sensor name field
-                    channel_name = self._extract_channel_name(channel_text)
-                    if channel_name:
-                        sensor_name_edit.setText(channel_name)
-            
-            # Connect the LabJack channel combo box change event
-            labjack_channel_combo.currentIndexChanged.connect(on_labjack_channel_changed)
-            
-            # Function to update sensor name text field when CSV mapping is selected
-            def on_csv_mapping_changed(index):
-                sensor_name = csv_mapping_combo.currentData()
-                if sensor_name:
-                    sensor_name_edit.setText(sensor_name)
-            
-            # Connect the CSV mapping combo box change event
-            csv_mapping_combo.currentIndexChanged.connect(on_csv_mapping_changed)
-            
-            # Automatically refresh Arduino ports if Arduino is connected
-            if device_type_combo.currentText() == "Arduino" and hasattr(self.main_window, 'data_collection_controller'):
-                if 'arduino' in self.main_window.data_collection_controller.interfaces and \
-                   self.main_window.data_collection_controller.interfaces['arduino']['connected']:
-                    print("Arduino is connected, auto-refreshing ports")
-                    refresh_arduino_ports()
+                # If measurement is "Sequence:Target", default the sensor name to Target.
+                if ":" in t:
+                    name_input.setText(t.split(":", 1)[1])
                 else:
-                    print("Arduino is not connected, deferring port refresh to user action")
+                    name_input.setText(t)
+            measurement_combo.currentTextChanged.connect(_auto_name_from_measurement)
             
-            # Connect the refresh button
-            refresh_btn.clicked.connect(refresh_arduino_ports)
+            update_dynamic_ui()
+
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
             
-            # Sensor selection - dynamically populated from available Arduino sensors
-            sensor_name_combo = QComboBox()
-            sensor_name_edit = QLineEdit()
-            sensor_name_layout = QVBoxLayout()
-            
-            # Try to get available sensor names from Arduino data
-            available_sensors = []
-            if hasattr(self.main_window, 'data_collection_controller'):
-                available_sensors = self.main_window.data_collection_controller.get_available_sensor_names()
-            
-            # Add a custom option in case user wants to enter a name manually
-            sensor_name_combo.addItem("-- Select a sensor --")
-            if available_sensors:
-                for sensor_name in available_sensors:
-                    sensor_name_combo.addItem(sensor_name)
-                sensor_name_combo.addItem("Custom (enter name below)")
-                sensor_name_edit.setPlaceholderText("Enter custom sensor name if needed")
-                sensor_name_edit.setEnabled(False)
-            else:
-                sensor_name_combo.addItem("Custom (enter name below)")
-                sensor_name_edit.setPlaceholderText("No sensors detected - enter sensor name")
-                sensor_name_edit.setEnabled(True)
-            
-            # Function to handle sensor combo selection change
-            def on_sensor_combo_changed(index):
-                if sensor_name_combo.currentText() == "Custom (enter name below)":
-                    sensor_name_edit.setEnabled(True)
-                    sensor_name_edit.clear()
-                else:
-                    sensor_name_edit.setEnabled(False)
-                    sensor_name_edit.setText(sensor_name_combo.currentText())
-            
-            # Function to handle device type change for sensor names
-            def update_sensor_name_options(index):
-                device_type = device_type_combo.currentText()
-                if device_type == "LabJack" or device_type == "Read CSV":
-                    # For LabJack and CSV, hide the dropdown and enable text field directly
-                    sensor_name_combo.setVisible(False)
-                    sensor_name_edit.setVisible(True)
-                    sensor_name_edit.setEnabled(True)
-                    
-                    # Set a placeholder text
-                    sensor_name_edit.setPlaceholderText("Enter sensor name")
-                else:
-                    # For Arduino, restore original behavior
-                    sensor_name_combo.setVisible(True)
-                    sensor_name_edit.setVisible(True)
-                    sensor_name_combo.clear()
-                    sensor_name_combo.addItem("-- Select a sensor --")
-                    if available_sensors:
-                        for sensor_name in available_sensors:
-                            sensor_name_combo.addItem(sensor_name)
-                        sensor_name_combo.addItem("Custom (enter name below)")
-                        sensor_name_edit.setEnabled(False)
+            if dialog.exec():
+                selected_measurement = measurement_combo.currentText()
+                if selected_measurement == "Standard Output": selected_measurement = None
+                
+                # Get interface-specific settings from the dynamic layout
+                interface_config = {
+                    "type": device_type_combo.currentText(),
+                    "name": name_input.text(),
+                    "unit": unit_input.text(),
+                    "measurement": selected_measurement,
+                    "poll_rate": poll_rate_spin.value(),
+                    "enabled": enabled_checkbox.isChecked(),
+                    "auto_connect": autoconnect_checkbox.isChecked()
+                }
+                
+                # Collect values from dynamic fields
+                for key, widget in self.current_dialog_fields.items():
+                    if isinstance(widget, QComboBox):
+                        interface_config[key] = widget.currentText()
+                    elif isinstance(widget, QDoubleSpinBox):
+                        interface_config[key] = widget.value()
+                    elif isinstance(widget, QCheckBox):
+                        interface_config[key] = widget.isChecked()
                     else:
-                        sensor_name_combo.addItem("Custom (enter name below)")
-                        sensor_name_edit.setEnabled(True)
-            
-            # Connect device type change to sensor name options update
-            device_type_combo.currentIndexChanged.connect(update_sensor_name_options)
-            
-            sensor_name_combo.currentIndexChanged.connect(on_sensor_combo_changed)
-            sensor_name_layout.addWidget(sensor_name_combo)
-            sensor_name_layout.addWidget(sensor_name_edit)
-            form_layout.addRow("Sensor Name:", sensor_name_layout)
-            
-            # Offset and unit
-            offset_layout = QHBoxLayout()
-            offset_spinbox = QDoubleSpinBox()
-            offset_spinbox.setDecimals(2)
-            offset_spinbox.setRange(-9999, 9999)
-            offset_spinbox.setValue(0.00)
-            offset_layout.addWidget(offset_spinbox)
-            
-            unit_edit = QLineEdit()
-            unit_edit.setPlaceholderText("Unit (e.g. °C, bar)")
-            offset_layout.addWidget(unit_edit)
-            form_layout.addRow("Offset/Unit:", offset_layout)
-            
-            # Color picker
-            color_button = QPushButton("Choose Color")
-            selected_color = QColor("#4287f5")
-            
-            def update_color_button():
-                color_style = f"background-color: {selected_color.name()}; color: {'black' if selected_color.lightness() > 128 else 'white'};"
-                color_button.setStyleSheet(color_style)
+                        interface_config[key] = widget.text()
                 
-            update_color_button()
-            
-            def choose_color():
-                nonlocal selected_color
-                color = QColorDialog.getColor(selected_color, dialog, "Choose Sensor Color")
-                if color.isValid():
-                    selected_color = color
-                    update_color_button()
-                    
-            color_button.clicked.connect(choose_color)
-            form_layout.addRow("Color:", color_button)
-            
-            # Show in graph checkbox
-            show_in_graph = QCheckBox("Show in Graph")
-            show_in_graph.setChecked(True)
-            form_layout.addRow("", show_in_graph)
-            
-            layout.addLayout(form_layout)
-            
-            # Dialog buttons
-            button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-            button_box.accepted.connect(dialog.accept)
-            button_box.rejected.connect(dialog.reject)
-            layout.addWidget(button_box)
-            
-            # Execute the dialog
-            print("About to show dialog")
-            result = dialog.exec()
-            print(f"Dialog result: {result}")
-            
-            if result == QDialog.DialogCode.Accepted:
-                # Process accepted result
-                print("Dialog accepted, processing input")
+                # Save auto_connect and enabled state to QSettings as well for consistency across the app
+                # This ensures settings popups (which use QSettings) and sensors (which use virtual_sensors.json) stay in sync
+                settings_key = device_type_combo.currentText().lower().replace(" ", "_")
+                self.main_window.settings.setValue(f"{settings_key}_enabled", "true" if enabled_checkbox.isChecked() else "false")
+                self.main_window.settings.setValue(f"{settings_key}_auto_connect", "true" if autoconnect_checkbox.isChecked() else "false")
                 
-                device_type = device_type_combo.currentText()
-                
-                # Get the sensor name based on device type
-                if device_type == "LabJack" or device_type == "Read CSV":
-                    # For LabJack/CSV, just use the text from the edit field
-                    name = sensor_name_edit.text()
-                else:
-                    # For Arduino, use existing logic
-                    name = sensor_name_edit.text() if sensor_name_edit.isEnabled() else sensor_name_combo.currentText()
-                
-                # Create the sensor based on device type
-                if device_type == "LabJack":
-                    # For LabJack, use our specialized method
-                    port = self._extract_channel_name(labjack_channel_combo.currentText())
-                    
-                    new_sensor = self.create_labjack_sensor(
-                        name=name,
-                        port=port,
-                        unit=unit_edit.text(),
-                        offset=offset_spinbox.value(),
-                        conversion_factor=1.0,  # Default to 1.0 for now
-                        color=selected_color.name(),
-                        enabled=True,
-                        show_in_graph=show_in_graph.isChecked()
-                    )
-                elif device_type == "Read CSV":
-                    # For CSV, use the selected mapping name as port
-                    port = f"csv_{csv_mapping_combo.currentData()}"
-                    new_sensor = SensorModel(
-                        name=name,
-                        interface_type="CSV",
-                        port=port,
-                        unit=unit_edit.text(),
-                        offset=offset_spinbox.value(),
-                        conversion_factor=1.0,
-                        color=selected_color.name(),
-                        enabled=True,
-                        show_in_graph=show_in_graph.isChecked(),
-                        stale_timeout_factor=3.0, # Set stale factor to 3x sampling interval
-                        averaging_enabled=False
-                    )
-                elif device_type == "MQTT":
-                    # For MQTT, use the topic input
-                    port = self.mqtt_topic_input.text().strip() if hasattr(self, 'mqtt_topic_input') else ""
-                    new_sensor = SensorModel(
-                        name=name,
-                        interface_type="MQTT",
-                        port=port,
-                        unit=unit_edit.text(),
-                        offset=offset_spinbox.value(),
-                        conversion_factor=1.0,
-                        color=selected_color.name(),
-                        enabled=True,
-                        show_in_graph=show_in_graph.isChecked(),
-                        stale_timeout_factor=None, # Default for new sensor
-                        averaging_enabled=False    # Default for new sensor
-                    )
-                    
-                    # Automatically subscribe if connected
-                    if hasattr(self.main_window, 'data_collection_controller'):
-                        dcc = self.main_window.data_collection_controller
-                        if hasattr(dcc, 'mqtt_thread') and dcc.mqtt_thread.is_connected() and port:
-                            dcc.mqtt_thread.subscribe(port)
-                else:
-                    # For other device types, use the standard creation method
-                    new_sensor = SensorModel(
-                        name=name,
-                        interface_type=device_type,
-                        port=self._extract_channel_name(arduino_port_combo.currentText() if device_type == "Arduino" else labjack_channel_combo.currentText()),
-                        unit=unit_edit.text(),
-                        offset=offset_spinbox.value(),
-                        conversion_factor=1.0,  # Default to 1.0 for now (removed from UI)
-                        color=selected_color.name(),
-                        enabled=True,
-                        show_in_graph=show_in_graph.isChecked(),
-                        stale_timeout_factor=None,
-                        averaging_enabled=False
-                    )
-                    
-                    # If Arduino sensor was created with a name that matches available_sensors, set empty port to support direct name matching
-                    if device_type == "Arduino" and name in available_sensors:
-                        new_sensor.port = ""  # Empty port to force name-based matching
-                
-                # Log detailed information about the sensor being created
-                self.main_window.logger.log(f"Creating new sensor: {new_sensor.name} ({new_sensor.interface_type})")
-                self.main_window.logger.log(f"  - Port/Channel: {new_sensor.port}")
-                self.main_window.logger.log(f"  - Unit: {new_sensor.unit}")
-                self.main_window.logger.log(f"  - Offset: {new_sensor.offset}")
-                self.main_window.logger.log(f"  - Color: {new_sensor.color}")
-                self.main_window.logger.log(f"  - Show in Graph: {new_sensor.show_in_graph}")
-                
-                # Additional debugging for LabJack sensors
-                if device_type == "LabJack":
-                    self.main_window.logger.log(f"  - LabJack sensor details:")
-                    self.main_window.logger.log(f"    - Conversion factor: {new_sensor.conversion_factor}")
-                    self.main_window.logger.log(f"    - Offset: {new_sensor.offset}")
-                    self.main_window.logger.log(f"    - Enabled: {new_sensor.enabled}")
-                    self.main_window.logger.log(f"    - Raw port value: '{new_sensor.port}'")
-                
-                # Post-processing for specific sensor types
-                if device_type == "LabJack":
-                    # Ensure all necessary properties are set for LabJack sensors
-                    self.main_window.logger.log(f"Post-processing LabJack sensor: {new_sensor.name}")
-                    # Sanitize the new LabJack sensor to ensure all properties are correct
-                    self._sanitize_labjack_sensor(new_sensor)
-                    
-                    # Log the final state after sanitizing
-                    self.main_window.logger.log(f"  - LabJack sensor after sanitizing:")
-                    self.main_window.logger.log(f"    - Port: {new_sensor.port}")
-                    self.main_window.logger.log(f"    - Conversion factor: {new_sensor.conversion_factor}")
-                    self.main_window.logger.log(f"    - Offset: {new_sensor.offset}")
-                    self.main_window.logger.log(f"    - Color: {new_sensor.color}")
-                
-                # Add the new sensor to the list
-                self.sensors.append(new_sensor)
-                
-                # Update the UI
-                if hasattr(self.main_window, 'data_table'):
-                    self.update_sensor_table()
-                    
-                # Log the new sensor addition
-                self.main_window.logger.log(f"Added new sensor: {new_sensor.name}")
-                
-                # Update status indicators immediately
-                if hasattr(self.main_window, 'update_status_indicators'):
-                    self.main_window.update_status_indicators()
-                
-                # Reinitialize the dashboard graph if data collection is active
-                if (hasattr(self.main_window, 'data_collection_controller') and 
-                    hasattr(self.main_window.data_collection_controller, 'collecting_data') and
-                    self.main_window.data_collection_controller.collecting_data):
-                    
-                    if (hasattr(self.main_window, 'graph_controller') and 
-                        hasattr(self.main_window.graph_controller, 'live_plotting_active') and
-                        self.main_window.graph_controller.live_plotting_active):
-                        
-                        # Reinitialize the dashboard with the updated sensor list
-                        print(f"DEBUG: Reinitializing dashboard graph due to sensor addition: {new_sensor.name}")
-                        start_time = self.main_window.data_collection_controller.start_time
-                        if start_time is not None:
-                            self.main_window.graph_controller.start_live_dashboard_update(start_time)
-                
-            # After adding, emit the status changed signal
-            self.status_changed.emit()
-            return True
-            
+                # For generic fields, also store them in QSettings so they appear in settings popups
+                for key, val in interface_config.items():
+                    if key not in ["name", "type", "unit", "measurement", "poll_rate", "enabled", "auto_connect"]:
+                        self.main_window.settings.setValue(f"{settings_key}_{key}", str(val))
+
+                return bool(self.main_window.data_collection_controller.add_sensor_from_config(interface_config))
+            return False
+
         except Exception as e:
-            print(f"Error in add_sensor: {e}")
             import traceback
             traceback.print_exc()
+            QMessageBox.critical(self.main_window, "Error", f"Failed to open Add Sensor dialog: {e}")
             return False
-    
+
+    def _process_add_sensor_result(self, device_type, name, unit, measurement=None, poll_rate=10.0, enabled=True, auto_connect=False):
+        """Process the results from the dynamic add sensor dialog"""
+        # Collect configuration from dynamic fields
+        config = {
+            "name": name, 
+            "unit": unit, 
+            "type": device_type,
+            "measurement": measurement, # The sub-key to look for
+            "poll_rate": poll_rate,
+            "enabled": enabled,
+            "auto_connect": auto_connect
+        }
+        
+        for key, widget in self.current_dialog_fields.items():
+            if isinstance(widget, QComboBox):
+                config[key] = widget.currentText()
+            elif isinstance(widget, QDoubleSpinBox):
+                config[key] = widget.value()
+            elif isinstance(widget, QCheckBox):
+                config[key] = widget.isChecked()
+            else:
+                config[key] = widget.text()
+        
+        # Now pass this to the data collection controller to actually add the sensor
+        if hasattr(self.main_window, 'data_collection_controller'):
+            # Save auto_connect and enabled state to QSettings as well for consistency across the app
+            settings_key = device_type.lower().replace(" ", "_")
+            self.main_window.settings.setValue(f"{settings_key}_enabled", "true" if enabled else "false")
+            self.main_window.settings.setValue(f"{settings_key}_auto_connect", "true" if auto_connect else "false")
+            
+            ok = bool(self.main_window.data_collection_controller.add_sensor_from_config(config))
+            if ok:
+                self.update_sensor_table()
+            return ok
+        return False
+
+    def _create_ui_field(self, key, config, interface_class):
+        """Helper to create a UI widget based on schema config"""
+        field_type = config.get("type", "string")
+        default = config.get("default")
+        
+        if field_type == "list":
+            widget = QComboBox()
+            options = config.get("options", [])
+            options_cmd = config.get("options_cmd")
+            
+            if options_cmd and hasattr(interface_class, "get_ui_options"):
+                options = interface_class.get_ui_options(key)
+            
+            for opt in options:
+                widget.addItem(str(opt))
+            
+            if default is not None:
+                index = widget.findText(str(default))
+                if index >= 0:
+                    widget.setCurrentIndex(index)
+            return widget
+            
+        elif field_type == "number":
+            widget = QDoubleSpinBox()
+            widget.setRange(-999999, 999999)
+            if default is not None:
+                widget.setValue(float(default))
+            return widget
+            
+        elif field_type == "boolean":
+            widget = QCheckBox()
+            if default:
+                widget.setChecked(True)
+            return widget
+            
+        else:  # string
+            widget = QLineEdit()
+            if default is not None:
+                widget.setText(str(default))
+            return widget
+
     def _extract_channel_name(self, display_text):
         """Extract the actual channel name from a display string
         
@@ -1197,488 +1062,361 @@ class SensorController(QObject):
         return display_text.strip()
     
     def edit_sensor(self):
-        """Edit the selected sensor"""
-        # Get the selected row
+        """Edit the selected sensor (Harmonized)"""
         if not hasattr(self.main_window, 'data_table'):
             return
             
         selected_rows = self.main_window.data_table.selectedItems()
         if not selected_rows:
-            # Show an error message
             from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.warning(
-                self.main_window,
-                "Edit Sensor",
-                "Please select a sensor to edit first.",
-                QMessageBox.StandardButton.Ok
-            )
+            QMessageBox.warning(self.main_window, "Edit Sensor", "Please select a sensor to edit first.")
             return
             
-        # Get the row index of the first selected item
         row = selected_rows[0].row()
-        
-        # Check if a sensor exists at this index
         if row < 0 or row >= len(self.sensors):
             return
             
-        # Get the sensor to edit
         sensor = self.sensors[row]
+        self.main_window.logger.log(f"Editing sensor: {sensor.name} ({sensor.interface_type})")
+
+        # Use harmonized dialog for all types that have a schema or are standard
+        InterfaceRegistry.initialize()
+        interface_class = InterfaceRegistry.get_interface_class(sensor.interface_type)
         
-        # Different handling based on sensor type
-        if sensor.interface_type == "Arduino":
-            # Implement Arduino sensor editing
-            self.main_window.logger.log(f"Editing Arduino sensor {sensor.name}")
-            
-            from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QLineEdit, 
-                                       QDoubleSpinBox, QComboBox, QCheckBox, 
-                                       QDialogButtonBox, QColorDialog, QPushButton,
-                                       QHBoxLayout)
-            from PyQt6.QtGui import QColor
-            
-            # Create dialog
-            dialog = QDialog(self.main_window)
-            dialog.setWindowTitle(f"Edit Arduino Sensor: {sensor.name}")
-            dialog.setMinimumWidth(400)
-            
-            # Main layout
-            layout = QVBoxLayout(dialog)
-            
-            # Form layout
-            form_layout = QFormLayout()
-            
-            # Sensor name
-            name_edit = QLineEdit(sensor.name)
-            form_layout.addRow("Name:", name_edit)
-            
-            # Unit
-            unit_edit = QLineEdit(sensor.unit)
-            form_layout.addRow("Unit:", unit_edit)
-            
-            # Offset
-            offset_spinbox = QDoubleSpinBox()
-            offset_spinbox.setDecimals(2)
-            offset_spinbox.setRange(-9999, 9999)
-            offset_spinbox.setValue(sensor.offset)
-            form_layout.addRow("Offset:", offset_spinbox)
-            
-            # Arduino port selection
-            port_layout = QHBoxLayout()
-            arduino_port_combo = QComboBox()
-            refresh_btn = QPushButton("Refresh")
-            port_layout.addWidget(arduino_port_combo)
-            port_layout.addWidget(refresh_btn)
-            
-            # Function to refresh Arduino ports in edit mode
-            def refresh_arduino_ports():
-                current_port = sensor.port
-                arduino_port_combo.clear()
-                try:
-                    if hasattr(self.main_window, 'data_collection_controller'):
-                        available_ports = self.main_window.data_collection_controller.get_arduino_ports()
-                        
-                        # Add the current port first if it exists but is not in the list
-                        if current_port and current_port not in available_ports:
-                            arduino_port_combo.addItem(current_port)
-                            
-                        # Add all available ports
-                        for port in available_ports:
-                            if port != current_port:  # Avoid duplicates
-                                arduino_port_combo.addItem(port)
-                                
-                        # Select the current port if it exists
-                        if current_port:
-                            index = arduino_port_combo.findText(current_port)
-                            if index >= 0:
-                                arduino_port_combo.setCurrentIndex(index)
-                        elif len(available_ports) > 0:
-                            arduino_port_combo.setCurrentIndex(0)
-                        
-                        print(f"Found {len(available_ports)} Arduino port(s): {', '.join(available_ports) if available_ports else 'None'}")
-                except Exception as e:
-                    self.main_window.logger.log(f"Error refreshing ports: {str(e)}", "ERROR")
-                    QMessageBox.warning(dialog, "Port Refresh", f"Error refreshing ports: {str(e)}")
-            
-            # Connect refresh button
-            refresh_btn.clicked.connect(refresh_arduino_ports)
-            
-            # Do initial refresh
-            refresh_arduino_ports()
-            
-            # Add to form layout
-            form_layout.addRow("Port:", port_layout)
-            
-            # Color picker
-            color_button = QPushButton("Choose Color")
-            current_color = QColor(sensor.color)
-            
-            # Update button color
-            def update_color_button():
-                color_style = f"background-color: {current_color.name()}; color: {'black' if current_color.lightness() > 128 else 'white'};"
-                color_button.setStyleSheet(color_style)
-                
-            update_color_button()
-            
-            # Choose color function
-            def choose_color():
-                nonlocal current_color
-                color = QColorDialog.getColor(current_color, dialog, "Choose Sensor Color")
-                if color.isValid():
-                    current_color = color
-                    update_color_button()
-                    
-            color_button.clicked.connect(choose_color)
-            form_layout.addRow("Color:", color_button)
-            
-            # Show in graph checkbox
-            show_in_graph = QCheckBox("Show in Graph")
-            show_in_graph.setChecked(sensor.show_in_graph)
-            form_layout.addRow("", show_in_graph)
-            
-            layout.addLayout(form_layout)
-            
-            # Dialog buttons
-            button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-            button_box.accepted.connect(dialog.accept)
-            button_box.rejected.connect(dialog.reject)
-            layout.addWidget(button_box)
-            
-            # Execute the dialog
-            result = dialog.exec()
-            
-            if result == QDialog.DialogCode.Accepted:
-                # Update sensor properties
-                # Create a new Arduino sensor with updated values
-                updated_sensor = SensorModel(
-                    name=name_edit.text(),
-                    interface_type="Arduino",
-                    port=arduino_port_combo.currentText(),  # Use the selected port
-                    unit=unit_edit.text(),
-                    offset=offset_spinbox.value(),
-                    color=current_color.name(),
-                    show_in_graph=show_in_graph.isChecked(),
-                    stale_timeout_factor=getattr(sensor, 'stale_timeout_factor', None),
-                    averaging_enabled=getattr(sensor, 'averaging_enabled', False)
-                )
-                
-                # Replace the old sensor with the updated one
-                self.sensors[row] = updated_sensor
-                
-                # Save the updated sensor configuration
-                self.save_sensors()
-                
-                # Update the UI
-                self.update_sensor_table()
-                
-                # Log the sensor update
-                self.main_window.logger.log(f"Updated Arduino sensor: {name_edit.text()}")
-                
-                # Emit status changed signal
-                self.status_changed.emit()
-                
-        elif sensor.interface_type == "LabJack":
-            # Implement LabJack sensor editing
-            self.main_window.logger.log(f"Editing LabJack sensor {sensor.name}")
-            
-            from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QLineEdit, 
-                                       QDoubleSpinBox, QComboBox, QCheckBox, 
-                                       QDialogButtonBox, QColorDialog, QPushButton)
-            from PyQt6.QtGui import QColor
-            
-            # Create dialog
-            dialog = QDialog(self.main_window)
-            dialog.setWindowTitle(f"Edit LabJack Sensor: {sensor.name}")
-            dialog.setMinimumWidth(400)
-            
-            # Main layout
-            layout = QVBoxLayout(dialog)
-            
-            # Form layout
-            form_layout = QFormLayout()
-            
-            # Channel selection
-            channel_combo = QComboBox()
-            form_layout.addRow("Channel:", channel_combo)
-            
-            # Populate channels
-            channels_info = self.get_labjack_channels_info()
-            current_channel = sensor.port
-            current_channel_index = 0
-            
-            if channels_info:
-                # Group channels by type for better organization
-                analog_inputs = []
-                digital_ios = []
-                ef_channels = []
-                analog_outputs = []
-                
-                # Sort channels by type
-                for channel in channels_info:
-                    channel_type = channel.get("type", "")
-                    if channel_type == "analog_input":
-                        analog_inputs.append(channel)
-                    elif channel_type == "digital_io":
-                        digital_ios.append(channel)
-                    elif channel_type.startswith("ef_"):
-                        ef_channels.append(channel)
-                    elif channel_type == "analog_output":
-                        analog_outputs.append(channel)
-                
-                # Add channels to combo box with headers for each type
-                if analog_inputs:
-                    channel_combo.addItem("--- Analog Inputs ---")
-                    for i, channel in enumerate(analog_inputs):
-                        display_text = f"{channel['name']} - {channel['description']}"
-                        channel_combo.addItem(display_text)
-                        if channel['name'] == current_channel:
-                            current_channel_index = channel_combo.count() - 1
-                
-                if digital_ios:
-                    channel_combo.addItem("--- Digital I/O ---")
-                    for i, channel in enumerate(digital_ios):
-                        display_text = f"{channel['name']} - {channel['description']}"
-                        channel_combo.addItem(display_text)
-                        if channel['name'] == current_channel:
-                            current_channel_index = channel_combo.count() - 1
-                
-                if ef_channels:
-                    channel_combo.addItem("--- Extended Features ---")
-                    for i, channel in enumerate(ef_channels):
-                        display_text = f"{channel['name']} - {channel['description']}"
-                        channel_combo.addItem(display_text)
-                        if channel['name'] == current_channel:
-                            current_channel_index = channel_combo.count() - 1
-                
-                if analog_outputs:
-                    channel_combo.addItem("--- Analog Outputs ---")
-                    for i, channel in enumerate(analog_outputs):
-                        display_text = f"{channel['name']} - {channel['description']}"
-                        channel_combo.addItem(display_text)
-                        if channel['name'] == current_channel:
-                            current_channel_index = channel_combo.count() - 1
-            else:
-                # Fall back to simple channel list
-                channels = self.get_labjack_channels()
-                for i, channel_name in enumerate(channels):
-                    channel_combo.addItem(channel_name)
-                    if channel_name == current_channel:
-                        current_channel_index = i
-            
-            # Select the current channel
-            if current_channel_index > 0:
-                channel_combo.setCurrentIndex(current_channel_index)
-            
-            # Sensor name
-            name_edit = QLineEdit(sensor.name)
-            form_layout.addRow("Name:", name_edit)
-            
-            # Unit
-            unit_edit = QLineEdit(sensor.unit)
-            form_layout.addRow("Unit:", unit_edit)
-            
-            # Offset
-            offset_spinbox = QDoubleSpinBox()
-            offset_spinbox.setDecimals(2)
-            offset_spinbox.setRange(-9999, 9999)
-            offset_spinbox.setValue(sensor.offset)
-            form_layout.addRow("Offset:", offset_spinbox)
-            
-            # Conversion factor
-            conversion_spinbox = QDoubleSpinBox()
-            conversion_spinbox.setDecimals(4)
-            conversion_spinbox.setRange(0.0001, 10000)
-            conversion_spinbox.setValue(sensor.conversion_factor)
-            form_layout.addRow("Conversion Factor:", conversion_spinbox)
-            
-            # Color picker
-            color_button = QPushButton("Choose Color")
-            current_color = QColor(sensor.color)
-            
-            # Update button color
-            def update_color_button():
-                color_style = f"background-color: {current_color.name()}; color: {'black' if current_color.lightness() > 128 else 'white'};"
-                color_button.setStyleSheet(color_style)
-                
-            update_color_button()
-            
-            # Choose color function
-            def choose_color():
-                nonlocal current_color
-                color = QColorDialog.getColor(current_color, dialog, "Choose Sensor Color")
-                if color.isValid():
-                    current_color = color
-                    update_color_button()
-                    
-            color_button.clicked.connect(choose_color)
-            form_layout.addRow("Color:", color_button)
-            
-            # Show in graph checkbox
-            show_in_graph = QCheckBox("Show in Graph")
-            show_in_graph.setChecked(sensor.show_in_graph)
-            form_layout.addRow("", show_in_graph)
-            
-            layout.addLayout(form_layout)
-            
-            # Dialog buttons
-            button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-            button_box.accepted.connect(dialog.accept)
-            button_box.rejected.connect(dialog.reject)
-            layout.addWidget(button_box)
-            
-            # Execute the dialog
-            result = dialog.exec()
-            
-            if result == QDialog.DialogCode.Accepted:
-                # Update sensor properties
-                selected_channel = self._extract_channel_name(channel_combo.currentText())
-                if selected_channel and not selected_channel.startswith("---"):
-                    # Create a new sensor with the updated values
-                    updated_sensor = self.create_labjack_sensor(
-                        name=name_edit.text(),
-                        port=selected_channel,
-                        unit=unit_edit.text(),
-                        offset=offset_spinbox.value(),
-                        conversion_factor=conversion_spinbox.value(),
-                        color=current_color.name(),
-                        enabled=True,
-                        show_in_graph=show_in_graph.isChecked(),
-                        stale_timeout_factor=getattr(sensor, 'stale_timeout_factor', None),
-                        averaging_enabled=getattr(sensor, 'averaging_enabled', False)
-                    )
-                    
-                    # Replace the old sensor with the updated one
-                    self.sensors[row] = updated_sensor
-                    
-                    # Save the updated sensor configuration
-                    self.save_sensors()
-                
-                # Update the UI
-                self.update_sensor_table()
-                
-                # Log the sensor update
-                self.main_window.logger.log(f"Updated LabJack sensor: {name_edit.text()}")
-                
-                # Emit status changed signal
-                self.status_changed.emit()
-            
+        # If it's a specialized type that doesn't fit the generic pattern yet, keep old logic
+        if sensor.interface_type == "OpticalSensor":
+            self.show_optical_sensor_config(sensor)
+            return
         elif sensor.interface_type == "OtherSerial":
-            # Special handling for Other Serial sensors - open the popup in edit mode
-            self.main_window.logger.log(f"Editing Other Serial sensor {sensor.name}")
-            # Edit using the AddEditSensorDialog, then update both the main sensor list and main_window.other_sensors
             from app.ui.dialogs.other_sensors_dialog import AddEditSensorDialog
             dialog = AddEditSensorDialog(self.main_window, sensor=sensor.to_dict(), sequences=getattr(self.main_window, 'other_sequences', []))
             if dialog.exec():
                 updated_sensor_dict = dialog.get_sensor()
                 if updated_sensor_dict["name"]:
-                    # Update the SensorModel in self.sensors
                     updated_sensor = type(sensor).from_dict(updated_sensor_dict)
                     self.sensors[row] = updated_sensor
                     # Update in main_window.other_sensors
-                    for i, vs in enumerate(self.main_window.other_sensors):
-                        if (isinstance(vs, dict) and vs.get("name") == sensor.name) or (hasattr(vs, 'name') and vs.name == sensor.name):
-                            self.main_window.other_sensors[i] = updated_sensor_dict
-                            break
-                    # Save
-                    if hasattr(self.main_window, 'save_virtual_sensors'):
-                        self.main_window.save_virtual_sensors()
+                    if hasattr(self.main_window, 'other_sensors'):
+                        for i, vs in enumerate(self.main_window.other_sensors):
+                            if (isinstance(vs, dict) and vs.get("name") == sensor.name) or (hasattr(vs, 'name') and vs.name == sensor.name):
+                                self.main_window.other_sensors[i] = updated_sensor_dict
+                                break
                     self.save_sensors()
                     self.update_sensor_table()
                     self.status_changed.emit()
-                    self.main_window.logger.log(f"Updated OtherSerial sensor: {updated_sensor_dict['name']}")
             return
+
+        # Generic harmonized Edit Dialog
+        from app.ui.dialogs.interface_config_dialog import InterfaceConfigDialog
         
-        elif sensor.interface_type == "OpticalSensor":
-            # Open the specialized Optical Sensor configuration dialog
-            self.main_window.logger.log(f"Editing Optical Sensor {sensor.name}")
-            self.show_optical_sensor_config(sensor)
-            return
+        # We need a way to edit sensor metadata AND interface config
+        # For now, let's use a specialized dialog that combines both
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QFormLayout, QLineEdit, QDoubleSpinBox, QCheckBox, QDialogButtonBox, QColorDialog, QPushButton, QHBoxLayout, QGroupBox, QComboBox
+        from PyQt6.QtGui import QColor
+        from app.ui.theme import DialogStyles, ButtonStyles, COLORS, GroupBoxStyles
+
+        dialog = QDialog(self.main_window)
+        dialog.setWindowTitle(f"Edit Sensor: {sensor.name}")
+        dialog.setMinimumWidth(450)
+        dialog.setStyleSheet(DialogStyles.dark_dialog())
         
-        else:
-            # Default editing for other sensors
-            self.main_window.logger.log(f"Editing generic sensor {sensor.name}")
+        layout = QVBoxLayout(dialog)
+        
+        # 1. Sensor Metadata Group
+        meta_group = QGroupBox("Sensor Properties")
+        meta_group.setStyleSheet(GroupBoxStyles.default())
+        meta_layout = QFormLayout(meta_group)
+        
+        name_edit = QLineEdit(sensor.name)
+        meta_layout.addRow("Name:", name_edit)
+        
+        unit_edit = QLineEdit(sensor.unit)
+        meta_layout.addRow("Unit:", unit_edit)
+        
+        # Offset & Factor row
+        math_layout = QHBoxLayout()
+        offset_edit = QDoubleSpinBox()
+        offset_edit.setRange(-10000, 10000)
+        offset_edit.setValue(sensor.offset)
+        math_layout.addWidget(QLabel("Offset:"))
+        math_layout.addWidget(offset_edit)
+        
+        factor_edit = QDoubleSpinBox()
+        factor_edit.setRange(0.00001, 10000)
+        factor_edit.setDecimals(5)
+        factor_edit.setValue(sensor.conversion_factor)
+        math_layout.addWidget(QLabel("Factor:"))
+        math_layout.addWidget(factor_edit)
+
+        # Advanced calibration info/button
+        adv_cal_btn = QPushButton("...")
+        adv_cal_btn.setFixedWidth(30)
+        adv_cal_btn.setToolTip("Open advanced calibration wizard (Linear/Polynomial)")
+        adv_cal_btn.setStyleSheet(ButtonStyles.get("secondary", "small"))
+        adv_cal_btn.clicked.connect(lambda: [dialog.reject(), self.open_calibration_for_sensor(sensor)])
+        math_layout.addWidget(adv_cal_btn)
+        
+        meta_layout.addRow("Calibration:", math_layout)
+
+        # Info text for advanced calibration
+        cal_hint = QLabel("💡 <i>Advanced calibration methods available via '...'</i>")
+        cal_hint.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 10px; margin-top: -5px;")
+        meta_layout.addRow("", cal_hint)
+
+        # Advanced Calibration Info
+        if hasattr(sensor, 'calibration_data') and sensor.calibration_data:
+            cal_method = sensor.calibration_data.get('method', 'linear')
+            cal_msg = f"⚠️ Advanced Calibration Active ({cal_method})"
+            cal_info_label = QLabel(cal_msg)
+            cal_info_label.setStyleSheet(f"color: {COLORS.WARNING}; font-weight: bold;")
+            cal_info_label.setToolTip("Advanced calibration (from Tools > Calibration) is currently overriding these simple offset/factor values.")
+            meta_layout.addRow("Status:", cal_info_label)
             
-            from PyQt6.QtWidgets import QDialog, QFormLayout, QLineEdit, QDoubleSpinBox, QPushButton, QHBoxLayout, QVBoxLayout, QColorDialog, QMessageBox
+            reset_cal_btn = QPushButton("Reset Advanced Calibration")
+            reset_cal_btn.setStyleSheet(ButtonStyles.get("secondary", "small"))
+            def reset_advanced_cal():
+                sensor.calibration_data = None
+                cal_info_label.setText("✅ Using simple calibration")
+                cal_info_label.setStyleSheet(f"color: {COLORS.SUCCESS};")
+                reset_cal_btn.setEnabled(False)
+            reset_cal_btn.clicked.connect(reset_advanced_cal)
+            meta_layout.addRow("", reset_cal_btn)
+        
+        # Color & Visibility
+        vis_layout = QHBoxLayout()
+        color_btn = QPushButton("Color")
+        color_btn.setMinimumWidth(80)
+        current_color = QColor(sensor.color)
+        def update_color_btn():
+            color_btn.setStyleSheet(f"background-color: {current_color.name()}; color: {'black' if current_color.lightness() > 128 else 'white'}; font-weight: bold; border-radius: 4px;")
+        update_color_btn()
+        
+        def pick_color():
+            nonlocal current_color
+            new_color = QColorDialog.getColor(current_color, dialog, "Select Sensor Color")
+            if new_color.isValid():
+                current_color = new_color
+                update_color_btn()
+        color_btn.clicked.connect(pick_color)
+        vis_layout.addWidget(color_btn)
+        
+        show_graph_cb = QCheckBox("Show in Graph")
+        show_graph_cb.setChecked(sensor.show_in_graph)
+        vis_layout.addWidget(show_graph_cb)
+        
+        avg_cb = QCheckBox("Averaging")
+        avg_cb.setChecked(sensor.averaging_enabled)
+        vis_layout.addWidget(avg_cb)
+
+        autoconnect_cb = QCheckBox("Auto-connect")
+        autoconnect_cb.setChecked(getattr(sensor, 'auto_connect', True))
+        vis_layout.addWidget(autoconnect_cb)
+        
+        meta_layout.addRow("Display:", vis_layout)
+        layout.addWidget(meta_group)
+        
+        # 2. Interface Configuration Group (if schema exists)
+        self.current_dialog_fields = {}
+        if interface_class:
+            # Use display name for settings key (harmonized)
+            settings_key = sensor.interface_type.lower().replace(" ", "_")
             
-            dialog = QDialog(self.main_window)
-            dialog.setWindowTitle(f"Edit Sensor: {sensor.name}")
+            int_group = QGroupBox(f"{sensor.interface_type} Interface Settings")
+            int_group.setStyleSheet(GroupBoxStyles.default())
+            int_layout = QFormLayout(int_group)
             
-            layout = QFormLayout()
-            
-            # Sensor name
-            name_edit = QLineEdit(sensor.name)
-            layout.addRow("Name:", name_edit)
-            
-            # Unit
-            unit_edit = QLineEdit(sensor.unit)
-            layout.addRow("Unit:", unit_edit)
-            
-            # Offset
-            offset_edit = QDoubleSpinBox()
-            offset_edit.setRange(-1000, 1000)
-            offset_edit.setValue(sensor.offset)
-            layout.addRow("Offset:", offset_edit)
-            
-            # Conversion factor
-            conversion_edit = QDoubleSpinBox()
-            conversion_edit.setRange(0.001, 1000)
-            conversion_edit.setValue(sensor.conversion_factor)
-            layout.addRow("Conversion Factor:", conversion_edit)
-            
-            # Color button
-            color_btn = QPushButton("Choose Color")
-            color_btn.setStyleSheet(f"background-color: {sensor.color};")
-            layout.addRow("Color:", color_btn)
-            
-            # Function to handle color selection
-            def on_color_select():
-                color = QColorDialog.getColor()
-                if color.isValid():
-                    color_btn.setStyleSheet(f"background-color: {color.name()};")
-            
-            color_btn.clicked.connect(on_color_select)
-            
-            # Buttons
-            button_layout = QHBoxLayout()
-            save_btn = QPushButton("Save Changes")
-            cancel_btn = QPushButton("Cancel")
-            button_layout.addWidget(save_btn)
-            button_layout.addWidget(cancel_btn)
-            
-            # Main layout
-            main_layout = QVBoxLayout()
-            main_layout.addLayout(layout)
-            main_layout.addLayout(button_layout)
-            dialog.setLayout(main_layout)
-            
-            # Connect buttons
-            cancel_btn.clicked.connect(dialog.reject)
-            
-            def on_save():
-                # Update sensor properties
-                sensor.name = name_edit.text()
-                sensor.unit = unit_edit.text()
-                sensor.offset = offset_edit.value()
-                sensor.conversion_factor = conversion_edit.value()
+            # Add port/channel field as first if it's LabJack or Arduino
+            if sensor.interface_type == "LabJack":
+                channel_combo = QComboBox()
+                channels_info = self.get_labjack_channels_info()
+                for ch in channels_info:
+                    channel_combo.addItem(f"{ch['name']} - {ch['description']}")
                 
-                # Extract color from the stylesheet
-                style = color_btn.styleSheet()
-                color_start = style.find("background-color: ") + len("background-color: ")
-                color_end = style.find(";", color_start)
-                if color_start >= len("background-color: ") and color_end > color_start:
-                    sensor.color = style[color_start:color_end]
-                
-                # Update the UI
-                self.update_sensor_table()
-                
-                # Log the change
-                self.main_window.logger.log(f"Updated sensor: {sensor.name}")
-                
-                dialog.accept()
-                
-            save_btn.clicked.connect(on_save)
+                # Try to find current port
+                index = channel_combo.findText(sensor.port, Qt.MatchFlag.MatchStartsWith)
+                if index >= 0:
+                    channel_combo.setCurrentIndex(index)
+                int_layout.addRow("Channel:", channel_combo)
+                self.current_dialog_fields["port"] = channel_combo
             
-            # Show the dialog
-            dialog.exec()
-    
+            # Add fields from schema
+            schema = getattr(interface_class, "CONFIG_SCHEMA", {})
+            for key, config in schema.items():
+                # Skip port if we handled it specially above
+                if key == "port" and sensor.interface_type == "LabJack":
+                    continue
+                    
+                field_widget = self._create_ui_field(key, config, interface_class)
+                
+                # Try to set current value from QSettings (the source of truth for interfaces)
+                saved_val = self.main_window.settings.value(f"{settings_key}_{key}")
+                if saved_val is not None:
+                    if isinstance(field_widget, QLineEdit):
+                        field_widget.setText(str(saved_val))
+                    elif isinstance(field_widget, QDoubleSpinBox):
+                        try: field_widget.setValue(float(saved_val))
+                        except: pass
+                    elif isinstance(field_widget, QCheckBox):
+                        field_widget.setChecked(str(saved_val).lower() == "true")
+                    elif isinstance(field_widget, QComboBox):
+                        idx = field_widget.findText(str(saved_val))
+                        if idx >= 0: field_widget.setCurrentIndex(idx)
+                
+                int_layout.addRow(config.get("label", key.replace("_", " ").title()) + ":", field_widget)
+                self.current_dialog_fields[key] = field_widget
+
+            layout.addWidget(int_group)
+            
+        # 3. Connection Control (Harmonized)
+        if interface_class:
+            conn_group = QGroupBox("Connection Control")
+            conn_group.setStyleSheet(GroupBoxStyles.default())
+            conn_layout = QHBoxLayout(conn_group)
+            
+            status_indicator = QLabel("●")
+            status_indicator.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 20px;")
+            conn_layout.addWidget(status_indicator)
+            
+            status_text = QLabel("Disconnected")
+            conn_layout.addWidget(status_text)
+            conn_layout.addStretch()
+            
+            connect_btn = QPushButton("Connect")
+            connect_btn.setMinimumWidth(100)
+            from app.ui.theme import ConnectionStyles
+            
+            def update_conn_ui():
+                is_connected = False
+                if hasattr(self.main_window, 'data_collection_controller'):
+                    dcc = self.main_window.data_collection_controller
+                    if sensor.interface_type == "Arduino":
+                        is_connected = dcc.arduino_connected
+                    elif sensor.interface_type == "LabJack":
+                        is_connected = dcc.labjack_connected
+                    elif sensor.interface_type in dcc.interfaces:
+                        is_connected = dcc.interfaces[sensor.interface_type].get('connected', False)
+                    elif sensor.interface_type in dcc.interface_threads:
+                        is_connected = True
+                
+                if is_connected:
+                    status_indicator.setStyleSheet(f"color: {COLORS.SUCCESS}; font-size: 20px;")
+                    status_text.setText("Connected")
+                    connect_btn.setText("Disconnect")
+                    connect_btn.setStyleSheet(ConnectionStyles.disconnected())
+                else:
+                    status_indicator.setStyleSheet(f"color: {COLORS.ERROR}; font-size: 20px;")
+                    status_text.setText("Disconnected")
+                    connect_btn.setText("Connect")
+                    connect_btn.setStyleSheet(ConnectionStyles.connected())
+            
+            def on_conn_click():
+                dcc = self.main_window.data_collection_controller
+                if "Disconnect" in connect_btn.text():
+                    if sensor.interface_type == "Arduino": dcc.disconnect_arduino()
+                    elif sensor.interface_type == "LabJack": dcc.disconnect_labjack()
+                    elif sensor.interface_type == "MQTT": dcc.disconnect_mqtt()
+                    else: dcc.disconnect_plugin_interface(sensor.interface_type)
+                else:
+                    if sensor.interface_type == "Arduino": self.connect_arduino()
+                    elif sensor.interface_type == "LabJack": self.connect_labjack()
+                    elif sensor.interface_type == "MQTT":
+                        # Use settings
+                        broker = self.main_window.settings.value("mqtt_broker", "localhost")
+                        port = int(self.main_window.settings.value("mqtt_port", 1883))
+                        dcc.connect_mqtt(broker=broker, port=port)
+                    else: dcc.connect_plugin_interface(sensor.interface_type)
+                update_conn_ui()
+                
+            connect_btn.clicked.connect(on_conn_click)
+            conn_layout.addWidget(connect_btn)
+            update_conn_ui()
+            layout.addWidget(conn_group)
+
+        # Buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        
+        if dialog.exec():
+            # Update sensor properties
+            sensor.name = name_edit.text()
+            sensor.unit = unit_edit.text()
+            sensor.offset = offset_edit.value()
+            sensor.conversion_factor = factor_edit.value()
+            sensor.color = current_color.name()
+            sensor.show_in_graph = show_graph_cb.isChecked()
+            sensor.averaging_enabled = avg_cb.isChecked()
+            sensor.auto_connect = autoconnect_cb.isChecked()
+            
+            # Use display name for settings key (harmonized)
+            settings_key = sensor.interface_type.lower().replace(" ", "_")
+            
+            # Save interface settings to QSettings
+            self.main_window.settings.setValue(f"{settings_key}_enabled", "true" if sensor.enabled else "false")
+            self.main_window.settings.setValue(f"{settings_key}_auto_connect", "true" if sensor.auto_connect else "false")
+            
+            # Save dynamic interface settings to QSettings
+            for key, widget in self.current_dialog_fields.items():
+                if key == "port" and sensor.interface_type == "LabJack":
+                    continue
+                if isinstance(widget, QComboBox):
+                    self.main_window.settings.setValue(f"{settings_key}_{key}", widget.currentText())
+                elif isinstance(widget, QDoubleSpinBox):
+                    self.main_window.settings.setValue(f"{settings_key}_{key}", str(widget.value()))
+                elif isinstance(widget, QCheckBox):
+                    self.main_window.settings.setValue(f"{settings_key}_{key}", "true" if widget.isChecked() else "false")
+                else:
+                    self.main_window.settings.setValue(f"{settings_key}_{key}", widget.text())
+            
+            if "port" in self.current_dialog_fields:
+                widget = self.current_dialog_fields["port"]
+                if isinstance(widget, QComboBox):
+                    sensor.port = self._extract_channel_name(widget.currentText())
+                else:
+                    sensor.port = widget.text()
+            
+            # Save and update
+            self.save_sensors()
+            
+            # If it's a plugin sensor, update in main_window.other_sensors too to persist changes to virtual_sensors.json
+            if hasattr(self.main_window, 'other_sensors') and sensor.interface_type not in ["Arduino", "LabJack", "Serial", "Read CSV", "OtherSerial"]:
+                for i, vs in enumerate(self.main_window.other_sensors):
+                    name_match = False
+                    if isinstance(vs, dict):
+                        if vs.get("name") == sensor.name: name_match = True
+                    elif hasattr(vs, 'name'):
+                        if vs.name == sensor.name: name_match = True
+                        
+                    if name_match:
+                        # IMPORTANT:
+                        # `virtual_sensors.json` uses the unified config format (keys like "type", "measurement"),
+                        # while `SensorModel.to_dict()` uses the sensors.json format (keys like "interface_type", "mapping").
+                        # Do not overwrite the unified config with the sensors.json schema.
+                        if not isinstance(vs, dict):
+                            try:
+                                vs = vs.to_dict()
+                            except Exception:
+                                vs = {"name": sensor.name}
+
+                        # Only update fields that are relevant for persistence & startup behavior.
+                        vs["name"] = sensor.name
+                        vs.setdefault("type", sensor.interface_type)
+                        vs["unit"] = sensor.unit
+                        vs["auto_connect"] = bool(getattr(sensor, "auto_connect", False))
+                        if hasattr(sensor, "mapping") and sensor.mapping is not None:
+                            # Unified plugin config uses "measurement" (per output key)
+                            vs["measurement"] = sensor.mapping
+
+                        self.main_window.other_sensors[i] = vs
+                        if hasattr(self.main_window, 'save_virtual_sensors'):
+                            self.main_window.save_virtual_sensors()
+                        break
+
+            self.update_sensor_table()
+            self.status_changed.emit()
+            self.main_window.logger.log(f"Updated sensor: {sensor.name}")
+
     def remove_sensor(self):
         """Remove the selected sensor"""
         from PyQt6.QtWidgets import QMessageBox
@@ -1741,11 +1479,43 @@ class SensorController(QObject):
             if hasattr(self.main_window, 'update_status_indicators'):
                 self.main_window.update_status_indicators()
             
-            # If it's a virtual sensor, remove from main_window.other_sensors too
-            if hasattr(self.main_window, 'other_sensors') and getattr(removed_sensor, 'interface_type', None) == 'OtherSerial':
-                self.main_window.other_sensors = [vs for vs in self.main_window.other_sensors if not ((isinstance(vs, dict) and vs.get('name') == removed_sensor.name) or (hasattr(vs, 'name') and vs.name == removed_sensor.name))]
-                if hasattr(self.main_window, 'save_virtual_sensors'):
-                    self.main_window.save_virtual_sensors()
+            # If it's a virtual/plugin sensor, remove from main_window.other_sensors too
+            if hasattr(self.main_window, 'other_sensors'):
+                # Identify if this was a plugin sensor or OtherSerial
+                is_plugin = False
+                module_name = ""
+                
+                # Check if it matches any registered plugin interface or is OtherSerial
+                if interface_type == 'OtherSerial':
+                    is_plugin = True
+                else:
+                    # Check in registry
+                    iface_class = InterfaceRegistry.get_interface_class(interface_type)
+                    if iface_class:
+                        module_name = getattr(iface_class, "__module__", "")
+                        if "plugins." in module_name:
+                            is_plugin = True
+                
+                if is_plugin:
+                    original_len = len(self.main_window.other_sensors)
+                    self.main_window.other_sensors = [
+                        vs for vs in self.main_window.other_sensors 
+                        if not ((isinstance(vs, dict) and vs.get('name') == removed_sensor.name) or 
+                                (hasattr(vs, 'name') and vs.name == removed_sensor.name))
+                    ]
+                    
+                    if len(self.main_window.other_sensors) != original_len:
+                        print(f"DEBUG: Removed '{removed_sensor.name}' from main_window.other_sensors")
+                        if hasattr(self.main_window, 'save_virtual_sensors'):
+                            self.main_window.save_virtual_sensors()
+                
+                # If no more sensors for this plugin interface, disconnect it
+                if is_plugin and interface_type != 'OtherSerial':
+                    remaining_plugin_sensors = [s for s in self.sensors if s.interface_type == interface_type]
+                    if not remaining_plugin_sensors:
+                        print(f"DEBUG: No more sensors for plugin {interface_type}. Disconnecting interface.")
+                        if hasattr(self.main_window, 'data_collection_controller'):
+                            self.main_window.data_collection_controller.disconnect_plugin_interface(interface_type)
             
             # Reinitialize the dashboard graph if data collection is active
             if (hasattr(self.main_window, 'data_collection_controller') and 
@@ -1819,6 +1589,10 @@ class SensorController(QObject):
             import traceback
             traceback.print_exc()
             self.main_window.logger.log(traceback.format_exc(), "ERROR")
+                
+        # Invalidate the DCC sensor cache after loading to ensure new sensors are mapped correctly
+        if hasattr(self.main_window, 'data_collection_controller'):
+            self.main_window.data_collection_controller.invalidate_sensor_cache()
     
     def _load_sensors_from_file(self, sensors_file):
         """Helper method to load sensors from a specific file
@@ -2008,6 +1782,10 @@ class SensorController(QObject):
                 if sensor.interface_type == "LabJack":
                     self._sanitize_labjack_sensor(sensor)
             
+                # Save all sensors including plugins to sensors.json 
+                # This ensures they are available in Replay mode and for live metrics
+                # on startup, even if they aren't fully reconnected yet.
+                
                 # Log detailed information about each sensor being saved
                 self.main_window.logger.log(f"Saving sensor: {sensor.name} ({sensor.interface_type})")
                 self.main_window.logger.log(f"  - Port: {sensor.port}")
@@ -2124,10 +1902,7 @@ class SensorController(QObject):
                     # print(f"DEBUG - Direct name match for Arduino sensor {sensor.name}, value: {data[sensor.name]}")
                     # sensor.process_reading(data[sensor.name]) # REMOVED
                     # Directly assign the corrected value
-                    try:
-                        sensor.current_value = float(data[sensor.name])
-                    except (ValueError, TypeError):
-                        sensor.current_value = None # Set to None on error
+                    sensor.set_value(data[sensor.name])
                     processed_data[sensor.name] = sensor.current_value
                     matched = True
                 # Also try case-insensitive matching for Arduino sensors
@@ -2139,10 +1914,7 @@ class SensorController(QObject):
                             # print(f"DEBUG - Case-insensitive match for Arduino sensor {sensor.name} with key {key}, value: {data[key]}")
                             # sensor.process_reading(data[key]) # REMOVED
                             # Directly assign the corrected value
-                            try:
-                                sensor.current_value = float(data[key])
-                            except (ValueError, TypeError):
-                                sensor.current_value = None # Set to None on error
+                            sensor.set_value(data[key])
                             processed_data[sensor.name] = sensor.current_value
                             matched = True
                             break
@@ -2154,17 +1926,57 @@ class SensorController(QObject):
         # Handle non-Arduino sensors with the existing logic
         for sensor in self.sensors:
             if sensor.interface_type != "Arduino":
-                if sensor.name in data:
+                if sensor.interface_type == "LabJack":
+                    # For LabJack, data is already corrected in DataCollectionController.handle_labjack_data
+                    # Use set_value to update current_value, history, and last_update_time
+                    # Try to find a match in the data keys (case-insensitive)
+                    matched_key = None
+                    sensor_port = sensor.port.strip() if sensor.port else ""
+                    sensor_port_upper = sensor_port.upper()
+                    
+                    # 1. Try direct match with normalization
+                    for data_key in data.keys():
+                        if data_key.upper() == sensor_port_upper:
+                            matched_key = data_key
+                            break
+                    
+                    if not matched_key:
+                        # 2. Try flexible matching (e.g., AIN0 matching AIN0 - Analog Input 0)
+                        for data_key in data.keys():
+                            dk_upper = data_key.upper()
+                            # EF variant match
+                            if (dk_upper.startswith(sensor_port_upper) and "_EF_READ_" in dk_upper) or \
+                               (sensor_port_upper.startswith(dk_upper) and "_EF_READ_" in sensor_port_upper):
+                                matched_key = data_key
+                                break
+                            # Base channel match (e.g., "AIN0" in "AIN0 - Analog Input 0")
+                            if dk_upper in sensor_port_upper or sensor_port_upper in dk_upper:
+                                # Only match if the base part is the same (e.g. "AIN0")
+                                # To avoid matching "AIN1" with "AIN10"
+                                import re
+                                base_pattern = r'([A-Z]+\d+)'
+                                dk_base = re.search(base_pattern, dk_upper)
+                                sp_base = re.search(base_pattern, sensor_port_upper)
+                                if dk_base and sp_base and dk_base.group(1) == sp_base.group(1):
+                                    matched_key = data_key
+                                    break
+                    
+                    if matched_key:
+                        sensor.set_value(data[matched_key])
+                    elif sensor.name in data:
+                        sensor.set_value(data[sensor.name])
+                    else:
+                        # Try case-insensitive name match as final fallback
+                        sensor_name_upper = sensor.name.upper()
+                        for data_key in data.keys():
+                            if data_key.upper() == sensor_name_upper:
+                                sensor.set_value(data[data_key])
+                                break
+                elif sensor.name in data:
                     # Direct match by sensor name
-                    # print(f"DEBUG - Direct match found for {sensor.name}, value: {data[sensor.name]}")
                     sensor.process_reading(data[sensor.name])
-                elif sensor.interface_type == "LabJack" and sensor.port in data:
-                    # Match by port for LabJack
-                    # print(f"DEBUG - Port match found for {sensor.name} via port {sensor.port}, value: {data[sensor.port]}")
-                    sensor.process_reading(data[sensor.port])
                 elif sensor.interface_type == "MQTT" and sensor.port in data:
                     # Match by topic (stored in 'port' field) for MQTT
-                    # print(f"DEBUG - Topic match found for MQTT sensor {sensor.name} via topic {sensor.port}, value: {data[sensor.port]}")
                     sensor.process_reading(data[sensor.port])
                 elif sensor.interface_type == "CSV":
                     # Match by prefixed key (stored in 'port' field) or name
@@ -2179,11 +1991,13 @@ class SensorController(QObject):
                     elif sensor.name in data:
                         sensor.process_reading(data[sensor.name])
             
-        # Update UI with the new values
-        self.update_sensor_values()
-        
         # Update automation context with current sensor values
         self.update_automation_context()
+        
+        # NOTE: We no longer call self.update_sensor_values() here.
+        # The MainWindow has a dedicated 1Hz timer that updates the table.
+        # Triggering it here on every data packet (especially from plugins)
+        # leads to a refresh rate higher than the intended 1Hz.
         
         # No need to emit data here - the DataCollectionController will handle synchronized updates
         # The original data has already been stored in the combined buffer by DataCollectionController
@@ -2239,39 +2053,48 @@ class SensorController(QObject):
     def update_sensor_values(self):
         """Update sensor values in the UI table"""
         if not hasattr(self, 'sensors') or not self.sensors:
-            if hasattr(self.main_window, "logger"):
-                self.main_window.logger.debug("SensorController: No sensors found in update_sensor_values")
             return
         if not hasattr(self.main_window, 'data_table') or not self.main_window.data_table:
-            if hasattr(self.main_window, "logger"):
-                self.main_window.logger.debug("SensorController: No data_table found in main_window")
             return
-        arduino_connected = False
-        other_serial_connected = False
-        labjack_connected = False
-        if hasattr(self.main_window, 'data_collection_controller'):
-            dcc = self.main_window.data_collection_controller
-            if hasattr(dcc, 'interfaces'):
-                if 'arduino' in dcc.interfaces:
-                    arduino_connected = dcc.interfaces['arduino'].get('connected', False)
-                if 'other_serial' in dcc.interfaces:
-                    if isinstance(dcc.interfaces['other_serial'], dict):
-                        other_serial_connected = dcc.interfaces['other_serial'].get('connected', False)
-                    else:
-                        other_serial_connected = bool(dcc.interfaces['other_serial'])
-                if 'labjack' in dcc.interfaces:
-                    labjack_connected = dcc.interfaces['labjack'].get('connected', False)
-                    
+            
         table = self.main_window.data_table
-        if table.rowCount() != len(self.sensors):
-            table.setRowCount(len(self.sensors))
-        for i, sensor in enumerate(self.sensors):
+        
+        # Mapping of sensor names to sensor objects for fast lookup
+        sensor_map = {sensor.name: sensor for sensor in self.sensors}
+        
+        # Iterate through all table rows to find which sensor belongs where (handles sorting)
+        for row in range(table.rowCount()):
+            name_item = table.item(row, 1)
+            if not name_item:
+                continue
+                
+            sensor_name = name_item.data(Qt.ItemDataRole.UserRole) or name_item.text()
+            sensor = sensor_map.get(sensor_name)
+            
+            if not sensor:
+                continue
+                
             # Check for staleness
             is_stale = False
             timeout_val = 2.0
-            if hasattr(self.main_window, 'data_collection_controller'):
+            
+            # Get the key used for staleness tracking
+            hist_key = self.get_historical_buffer_key(sensor)
+            
+            # Use the new per-sensor last_update_time if available, 
+            # falling back to the data_collection_controller's lookup
+            if hasattr(sensor, 'last_update_time') and sensor.last_update_time > 0:
+                # Use data_collection_controller to determine timeout
+                if hasattr(self.main_window, 'data_collection_controller'):
+                    dcc = self.main_window.data_collection_controller
+                    timeout_val = dcc._get_stale_timeout_for_key(hist_key)
+                
+                # Check age
+                age = time.time() - sensor.last_update_time
+                if age > timeout_val:
+                    is_stale = True
+            elif hasattr(self.main_window, 'data_collection_controller'):
                 dcc = self.main_window.data_collection_controller
-                hist_key = self.get_historical_buffer_key(sensor)
                 if hist_key:
                     timeout_val = dcc._get_stale_timeout_for_key(hist_key)
                     if hist_key in dcc._last_sensor_update:
@@ -2279,51 +2102,137 @@ class SensorController(QObject):
                         if time.time() - last_ts > timeout_val:
                             is_stale = True
                     else:
-                        # If we have a current_value but it's not in _last_sensor_update yet,
-                        # it means no data has ever been received for this prefixed key.
-                        # We should treat it as stale/unavailable.
+                        # No data ever received for this key
                         is_stale = True
+            else:
+                # No way to check staleness, assume not stale if we have a value
+                pass
+                
+            # If we just received data (current_value is not None) and we are 
+            # within a very short window (e.g. 2s), don't mark as stale even if 
+            # the timeout logic above thought otherwise. This handles startup/glitches.
+            if is_stale and hasattr(sensor, 'current_value') and sensor.current_value is not None:
+                if hasattr(sensor, 'last_update_time') and time.time() - sensor.last_update_time < 2.0:
+                    is_stale = False
                 
             value_display = ""
             if not is_stale and hasattr(sensor, 'current_value') and sensor.current_value is not None:
                 try:
                     value = sensor.current_value
                     if isinstance(value, (int, float)):
-                        if value == 0:
-                            value_display = "0"
-                        elif abs(value) < 0.001:
+                        if abs(value) < 0.001 and value != 0:
                             value_display = f"{value:.6f}"
-                        elif abs(value) < 0.01:
-                            value_display = f"{value:.5f}"
-                        elif abs(value) < 0.1:
-                            value_display = f"{value:.4f}"
-                        elif abs(value) < 1:
-                            value_display = f"{value:.3f}"
-                        elif abs(value) < 10:
-                            value_display = f"{value:.2f}"
                         elif abs(value) < 100:
-                            value_display = f"{value:.1f}"
+                            value_display = f"{value:.2f}"
                         else:
-                            value_display = f"{int(value)}"
+                            value_display = f"{value:.1f}"
                     else:
                         value_display = str(value)
+                        
                     if hasattr(sensor, 'unit') and sensor.unit:
                         value_display = f"{value_display} {sensor.unit}"
                 except Exception as e:
-                    print(f"ERROR SensorController: Error formatting value for sensor {sensor.name}: {e}")
                     value_display = str(sensor.current_value)
             else:
-                # Verwende Klassenkonstante für fehlende Werte
                 value_display = self.NO_VALUE_DISPLAY
                 
-            value_item = QTableWidgetItem(value_display)
-            value_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            table.setItem(i, 2, value_item)
-        table.repaint()
-        
-        # --- ADDED: Update automation context whenever values are updated ---
-        # This ensures triggers based on ANY sensor (Arduino, LabJack, etc.) are checked
+            # Update the table cell
+            current_item = table.item(row, 2)
+            if not current_item or current_item.text() != value_display:
+                # If item doesn't exist, create it
+                if not current_item:
+                    value_item = QTableWidgetItem(value_display)
+                    value_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    table.setItem(row, 2, value_item)
+                else:
+                    current_item.setText(value_display)
+                
+        # Update automation context with current sensor values
         self.update_automation_context()
+        
+        # Force a repaint of the table to ensure values show up on startup
+        table.viewport().update()
+
+    def update_from_combined_data(self, data):
+        """Update all sensors from a combined data dictionary (from all interfaces)"""
+        if not data:
+            return
+            
+        timestamp = data.get('timestamp', time.time())
+        updates_made = 0
+        
+        # print(f"DEBUG: update_from_combined_data with {len(data)} keys")
+        
+        for sensor in self.sensors:
+            key = self.get_historical_buffer_key(sensor)
+            if key and key in data:
+                try:
+                    raw_value = data[key]
+                    # print(f"DEBUG: Found data for sensor {sensor.name} (key: {key}): {raw_value}")
+                    
+                    # Apply calibration/offset/conversion via SensorModel logic if possible
+                    # or do it here for simplicity
+                    offset = float(getattr(sensor, 'offset', 0.0))
+                    conversion_factor = float(getattr(sensor, 'conversion_factor', 1.0))
+                    
+                    # Convert raw_value to float if it's a string
+                    if isinstance(raw_value, str):
+                        try:
+                            # Try to extract a number from the string
+                            import re
+                            match = re.search(r'[-+]?\d*\.\d+|\d+', raw_value)
+                            if match:
+                                raw_value = float(match.group(0))
+                            else:
+                                raw_value = 0.0
+                        except:
+                            raw_value = 0.0
+                            
+                    if isinstance(raw_value, (int, float)):
+                        sensor.set_value((raw_value * conversion_factor) + offset)
+                        updates_made += 1
+                except Exception as e:
+                    print(f"Error updating sensor {sensor.name} from combined data: {e}")
+                    
+        if updates_made > 0:
+            # We don't call update_sensor_values here as it's called by a timer anyway.
+            # This just ensures the data is ready for the next UI refresh.
+            pass
+
+    def get_historical_buffer_key(self, sensor):
+        """Helper to get the prefixed key used in combined_data and historical_buffer"""
+        if not sensor:
+            return None
+            
+        interface_type = getattr(sensor, 'interface_type', '')
+        itype_lower = interface_type.lower()
+        
+        if itype_lower == "arduino":
+            return f"arduino_{sensor.name}"
+        elif itype_lower == "labjack":
+            return f"labjack_{sensor.port}"
+        elif itype_lower == "serial" or itype_lower == "otherserial" or itype_lower == "other_serial":
+            return f"other_serial_{sensor.name}"
+        elif itype_lower == "mqtt":
+            return f"mqtt_{sensor.name}"
+        elif itype_lower == "read csv" or itype_lower == "csv":
+            # For CSV, the key might be in the port field or follow the standard prefix
+            port_key = getattr(sensor, 'port', None)
+            if port_key and port_key.startswith("csv_"):
+                return port_key
+            return f"csv_{sensor.name}"
+        elif itype_lower == "audio" or itype_lower == "audiosensor":
+            return f"audio_{sensor.name}"
+        elif itype_lower == "optical" or itype_lower == "opticalsensor":
+            return f"optical_{sensor.name}"
+        else:
+            # For dynamic plugins and others
+            # measurement_name is often stored in the 'mapping' field for plugins
+            mapping = getattr(sensor, 'mapping', None)
+            if mapping:
+                # Use the original case for interface_type to match handle_plugin_data
+                return f"{interface_type}_{mapping}"
+            return f"{interface_type}_{sensor.name}"
     
     def start_acquisition(self):
         """Start data acquisition"""
@@ -2410,16 +2319,8 @@ class SensorController(QObject):
             return False
         
         try:
-            # Get first available port
-            available_ports = self.main_window.data_collection_controller.get_arduino_ports()
-            if not available_ports:
-                self.main_window.logger.log("No Arduino ports found", "WARNING")
-                return False
-                
-            port = available_ports[0]
-            
-            # Connect to Arduino
-            success = self.main_window.data_collection_controller.connect_arduino(port, 9600, 1.0)
+            # Connect to Arduino using saved settings
+            success = self.main_window.data_collection_controller.connect_arduino()
             
             if success:
                 # Start monitoring Arduino data
@@ -2429,7 +2330,7 @@ class SensorController(QObject):
                 self.connected = True
                 
                 # Log success
-                self.main_window.logger.log(f"Connected to Arduino on {port}")
+                self.main_window.logger.log("Connected to Arduino")
                 
                 # Update UI status display
                 if hasattr(self.main_window, 'update_device_connection_status_ui'):
@@ -2440,7 +2341,7 @@ class SensorController(QObject):
                 
                 return True
             else:
-                self.main_window.logger.log(f"Failed to connect to Arduino on {port}", "ERROR")
+                self.main_window.logger.log("Failed to connect to Arduino", "ERROR")
                 return False
         except Exception as e:
             self.main_window.logger.log(f"Error connecting to Arduino: {str(e)}", "ERROR")
@@ -2516,29 +2417,29 @@ class SensorController(QObject):
             import traceback
             traceback.print_exc()
     
-    def connect_labjack(self, device_identifier="ANY"):
+    def connect_labjack(self, device_identifier=None):
         """Connect to LabJack using the DataCollectionController
         
         Args:
-            device_identifier: Specific serial number or "ANY"
+            device_identifier: Specific serial number or "ANY" (if None, use settings)
         Returns:
             True if connection was successful, False otherwise
         """
-        print(f"DEBUG SENSOR_CONTROLLER: connect_labjack called with identifier='{device_identifier}'") # <<< ADDED
+        print(f"DEBUG SENSOR_CONTROLLER: connect_labjack called with identifier='{device_identifier}'") 
         
         # Make sure the data collection controller exists
         if not hasattr(self.main_window, 'data_collection_controller'):
             print("ERROR SENSOR_CONTROLLER: Data Collection Controller not found!")
-            if hasattr(self.main_window, 'logger'): # Check if logger exists
+            if hasattr(self.main_window, 'logger'): 
                 self.main_window.logger.log("Data Collection Controller not found during LabJack connect", "ERROR")
             return False
             
         # Call the DataCollectionController's connect method
-        print("DEBUG SENSOR_CONTROLLER: Calling data_collection_controller.connect_labjack()") # <<< ADDED
+        print("DEBUG SENSOR_CONTROLLER: Calling data_collection_controller.connect_labjack()")
+        
+        # If device_identifier is provided, use it as the port
         success = self.main_window.data_collection_controller.connect_labjack(
-            device_type="ANY",  # Keep these general for now
-            connection_type="ANY" 
-            # device_identifier=device_identifier # DataCollectionController doesn't use identifier
+            port=device_identifier
         )
         
         print(f"DEBUG SENSOR_CONTROLLER: data_collection_controller.connect_labjack() returned: {success}") # <<< ADDED
@@ -2648,7 +2549,7 @@ class SensorController(QObject):
                 print(f"Error updating LabJack sensor {sensor.name}: {e}")
                 
         # Update the UI with new values
-        self.update_sensor_values()
+        # self.update_sensor_values()
             
     def _process_labjack_data(self, data):
         """Process data update from the LabJack interface
@@ -2675,7 +2576,7 @@ class SensorController(QObject):
                 processed_data[sensor.name] = sensor.current_value
         
         # Update UI
-        self.update_sensor_values()
+        # self.update_sensor_values()
         
         # Update automation context with current sensor values
         self.update_automation_context()
@@ -3598,7 +3499,7 @@ class SensorController(QObject):
             return False
     
     def initialize(self):
-        """Initialize the controller and set up initial sensor state"""
+        """Initialize the controller and set up initial sensor state (Harmonized)"""
         try:
             # Load saved sensors
             self.load_sensors()
@@ -3609,21 +3510,60 @@ class SensorController(QObject):
             # Ensure graph visibility is correctly configured
             self._ensure_graph_visibility()
             
-            # Check if Arduino is connected and auto-connect if needed
-            if hasattr(self.main_window, 'auto_connect_arduino') and self.main_window.auto_connect_arduino:
-                self.main_window.logger.log("Auto-connecting to Arduino...")
-                self.connect_arduino()
+            # Harmonized Auto-connect logic for all registered interfaces
+            InterfaceRegistry.initialize()
+            interfaces = InterfaceRegistry.get_interfaces()
+            
+            for display_name in interfaces:
+                # Map display name to settings key (e.g. "Arduino" -> "arduino")
+                settings_key = display_name.lower().replace(" ", "_")
                 
-                # Start Arduino monitoring
-                self._start_arduino_monitoring()
+                # Skip plugins/virtual sensors here - they are handled by main_window._connect_virtual_sensors
+                # after the sensors and sequences are fully loaded from virtual_sensors.json.
+                # This prevents connecting too early with dummy configs.
+                module_name = getattr(interfaces[display_name], "__module__", "")
+                if not module_name.startswith("app.core.interfaces"):
+                    print(f"DEBUG: Skipping harmonized auto-connect for plugin '{display_name}' in sc.initialize()")
+                    continue
+
+                # Get settings using the SettingsModel helper if possible
+                enabled = True
+                auto_connect = False
                 
-                # Force update Arduino sensor values
-                self.force_update_arduino_status()
+                if hasattr(self, 'settings') and self.settings:
+                    enabled = self.settings.get_bool(f"{settings_key}_enabled", True)
+                    auto_connect = self.settings.get_bool(f"{settings_key}_auto_connect", False)
+                else:
+                    enabled = self.main_window.settings.value(f"{settings_key}_enabled", "true") == "true"
+                    auto_connect = self.main_window.settings.value(f"{settings_key}_auto_connect", "false") == "true"
                 
-            # Check if LabJack is already connected
-            if hasattr(self, 'labjack_interface') and self.labjack_interface:
-                self._start_labjack_status_monitoring()
-                
+                if enabled and auto_connect:
+                    self.main_window.logger.log(f"Auto-connecting to {display_name}...")
+                    
+                    if display_name == "Arduino":
+                        self.connect_arduino()
+                        self._start_arduino_monitoring()
+                        self.force_update_arduino_status()
+                    elif display_name == "LabJack":
+                        self.connect_labjack()
+                        self._start_labjack_status_monitoring()
+                    elif display_name == "MQTT":
+                        # MQTT connect requires settings from MainWindow
+                        if hasattr(self.main_window, 'data_collection_controller'):
+                            broker = self.main_window.settings.value("mqtt_broker", "localhost")
+                            port = int(self.main_window.settings.value("mqtt_port", 1883))
+                            client_id = self.main_window.settings.value("mqtt_client_id", f"ArtefaktDAQ_{int(time.time())}")
+                            user = self.main_window.settings.value("mqtt_username", "")
+                            pw = self.main_window.settings.value("mqtt_password", "")
+                            self.main_window.data_collection_controller.connect_mqtt(
+                                broker=broker, port=port, client_id=client_id, username=user, password=pw
+                            )
+                    else:
+                        # Handle other built-in interfaces via DataCollectionController
+                        if hasattr(self.main_window, 'data_collection_controller'):
+                            self.main_window.data_collection_controller.connect_plugin_interface(display_name)
+
+            # Legacy connection handling for non-harmonized interfaces
             # Connect OtherSerial sensors
             self.initialize_other_serial_connections()
             
@@ -3634,20 +3574,32 @@ class SensorController(QObject):
             if hasattr(self.main_window, 'data_collection_controller'):
                 self.main_window.data_collection_controller._rebuild_averaging_cache()
                 self.main_window.logger.log("Rebuilt averaging cache after sensor controller initialization", "INFO")
+                
+                # Initial table update
+                self.update_sensor_table()
             
         except Exception as e:
             # Log any exceptions during initialization
             if hasattr(self.main_window, 'logger'):
                 self.main_window.logger.log(f"Error initializing sensor controller: {str(e)}", "ERROR")
             print(f"Error initializing sensor controller: {str(e)}")
+            import traceback
+            traceback.print_exc()
     
     def initialize_audio_optical_connections(self):
         """Auto-connect audio and optical sensors on startup"""
         try:
-            # Connect audio sensors - connect all enabled sensors, not just those shown in graph
+            # Connect audio sensors - connect only if enabled AND auto_connect is True
             audio_sensors = [s for s in self.sensors if getattr(s, 'interface_type', '') == 'AudioSensor']
             for sensor in audio_sensors:
-                if getattr(sensor, 'enabled', True):
+                # Get auto_connect from config if available, default to True for backward compatibility
+                auto_connect = True
+                if hasattr(sensor, 'audio_config'):
+                    auto_connect = sensor.audio_config.get('auto_connect', True)
+                elif hasattr(sensor, 'auto_connect'):
+                    auto_connect = sensor.auto_connect
+                
+                if getattr(sensor, 'enabled', True) and auto_connect:
                     try:
                         if self.connect_audio_sensor(sensor):
                             if hasattr(self.main_window, 'logger'):
@@ -3658,10 +3610,17 @@ class SensorController(QObject):
                     except Exception as e:
                         print(f"Error auto-connecting audio sensor {sensor.name}: {e}")
             
-            # Connect optical sensors - connect all enabled sensors, not just those shown in graph
+            # Connect optical sensors - connect only if enabled AND auto_connect is True
             optical_sensors = [s for s in self.sensors if getattr(s, 'interface_type', '') == 'OpticalSensor']
             for sensor in optical_sensors:
-                if getattr(sensor, 'enabled', True):
+                # Get auto_connect from config if available, default to True for backward compatibility
+                auto_connect = True
+                if hasattr(sensor, 'optical_config'):
+                    auto_connect = sensor.optical_config.get('auto_connect', True)
+                elif hasattr(sensor, 'auto_connect'):
+                    auto_connect = sensor.auto_connect
+                
+                if getattr(sensor, 'enabled', True) and auto_connect:
                     try:
                         if self.connect_optical_sensor(sensor):
                             if hasattr(self.main_window, 'logger'):
@@ -3699,7 +3658,7 @@ class SensorController(QObject):
         data_controller = self.main_window.data_collection_controller
         
         # Get OtherSerial sensors from main sensor list
-        other_sensors_main = [s for s in self.sensors if getattr(s, 'interface_type', '') == 'OtherSerial']
+        other_sensors_main = [s for s in self.sensors if getattr(s, 'interface_type', '') in ('OtherSerial', 'Serial')]
         # Also check for sensors in main_window.other_sensors (from dialog)
         other_sensors_dialog = []
         if hasattr(self.main_window, 'other_sensors'):
@@ -3768,30 +3727,41 @@ class SensorController(QObject):
         # Now connect each unique port configuration
         for (port, baud, poll_interval), sequences in port_configs.items():
             try: # Outer try for this port configuration
+                # Check if ANY sequence for this port has auto_connect enabled
+                # or if this is an explicit reconnect
+                should_connect = is_explicit_reconnect
+                if not should_connect:
+                    for seq in sequences:
+                        if seq.get('auto_connect', True): # Default to True for backward compatibility
+                            should_connect = True
+                            break
+                
+                if not should_connect:
+                    print(f"DEBUG SensorController: Skipping auto-connect for port {port} (all sequences have auto_connect=False)")
+                    continue
+
                 print(f"DEBUG SensorController: Connecting to port {port} at baud {baud} with poll interval {poll_interval}s for {len(sequences)} sequences")
                 if hasattr(self.main_window, 'logger'):
                     self.main_window.logger.log(f"Connecting Other Serial on {port} at {baud} baud", "INFO")
 
-                primary_sequence = sequences[0] if sequences else None
-                sequence_obj = None  # Initialize sequence_obj
-
-                if primary_sequence:
-                    if isinstance(primary_sequence, dict):
-                        # This is the correct path for dictionary sequences
-                        print(f"DEBUG SensorController: primary_sequence dict before create_serial_sequence: {primary_sequence}")
-                        actions = primary_sequence.get('actions') or primary_sequence.get('steps') or []
-                        print(f"DEBUG SensorController: Creating SerialSequence using create_serial_sequence for {primary_sequence.get('name', 'Unnamed')} with {len(actions)} actions")
-                        sequence_obj = data_controller.create_serial_sequence(primary_sequence.get('name', 'Unnamed'), actions)
-                        current_steps = getattr(sequence_obj, 'steps', [])
-                        print(f"DEBUG SensorController: Created SerialSequence object via create_serial_sequence for {getattr(sequence_obj, 'name', 'Unnamed')} with {len(current_steps)} steps")
+                # Build sequence objects for ALL configured sequences on this port group
+                seq_objs = []
+                for seq_cfg in sequences:
+                    if isinstance(seq_cfg, dict):
+                        actions = seq_cfg.get('actions') or seq_cfg.get('steps') or []
+                        seq_name = seq_cfg.get('name', 'Unnamed')
+                        seq_obj = data_controller.create_serial_sequence(seq_name, actions)
+                        if seq_obj:
+                            seq_objs.append(seq_obj)
+                            print(f"DEBUG SensorController: Created SerialSequence object for '{seq_name}' with {len(getattr(seq_obj, 'steps', []))} steps")
                     else:
-                        # This is for objects that already have steps attribute
-                        sequence_obj = primary_sequence
-                        print(f"DEBUG SensorController: Using existing sequence object with name: {getattr(sequence_obj, 'name', 'Unnamed')}")
+                        # Already a SerialSequence-like object
+                        seq_objs.append(seq_cfg)
+                        print(f"DEBUG SensorController: Using existing sequence object with name: {getattr(seq_cfg, 'name', 'Unnamed')}")
 
                 # Now connect to the device with the sequence
-                if sequence_obj:
-                    print(f"DEBUG SensorController: Connecting to port {port} with sequence {getattr(sequence_obj, 'name', 'Unnamed')}")
+                if seq_objs:
+                    print(f"DEBUG SensorController: Connecting to port {port} with {len(seq_objs)} sequences: {[getattr(s, 'name', 'Unnamed') for s in seq_objs]}")
                     
                     # Use explicit reconnect if this is a user-initiated reconnect
                     if is_explicit_reconnect and hasattr(data_controller, 'explicit_reconnect_other_serial'):
@@ -3800,7 +3770,7 @@ class SensorController(QObject):
                             port=port,
                             baud_rate=baud,
                             poll_interval=float(poll_interval),
-                            sequence=sequence_obj
+                            sequences=seq_objs
                         )
                     else:
                         # Use the regular connect method
@@ -3808,7 +3778,7 @@ class SensorController(QObject):
                             port=port,
                             baud_rate=baud,
                             poll_interval=float(poll_interval),
-                            sequence=sequence_obj
+                            sequences=seq_objs
                         )
                     
                     if success:
@@ -3915,19 +3885,10 @@ class SensorController(QObject):
                 if matched_key:
                     sensors_matched.append(sensor.name)
                     # Get the *already corrected* value from the input data dict
-                    corrected_value = data[matched_key]
-                    try:
-                        # Directly update the sensor's current value 
-                        sensor.current_value = float(corrected_value)
-                        updates_made += 1
-                    except (ValueError, TypeError) as e:
-                        # Handle potential errors if the corrected value isn't a valid float
-                        print(f"ERROR SensorController: Failed to update LabJack sensor {sensor.name} ({matched_key}) value to float: {corrected_value} - {e}")
-                        sensor.current_value = None # Set to None on error
-                    except Exception as e:
-                        print(f"ERROR SensorController: Unexpected error updating LabJack sensor {sensor.name} ({matched_key}): {e}")
-                        sensor.current_value = None # Set to None on error
-        
+                    # and use set_value to update current_value, history, and last_update_time
+                    sensor.set_value(data[matched_key])
+                    updates_made += 1
+                
         # Log summary only if something was expected or happened
         if updates_made > 0 or sensors_matched:
              # print(f"DEBUG SensorController: update_labjack_data matched sensors: {sensors_matched}, updated values for {updates_made} sensors.")
@@ -3941,43 +3902,6 @@ class SensorController(QObject):
         # Don't trigger UI update here, let the MainWindow timer handle it
         # self.update_sensor_values() 
     
-    def get_historical_buffer_key(self, sensor):
-        """Generate the key used for storing this sensor's data in DataCollectionController.historical_buffer."""
-        if not sensor:
-            return None
-        # Based on DataCollectionController's handle_*_data methods
-        interface_type = getattr(sensor, 'interface_type', '').lower()
-        result_key = None
-        
-        if interface_type == 'arduino':
-            # Arduino uses the sensor name as the key in the data dict
-            result_key = f"arduino_{getattr(sensor, 'name', 'unknown')}"
-        elif interface_type == 'labjack':
-            # LabJack uses the port/channel name (e.g., AIN0) as the key
-            result_key = f"labjack_{getattr(sensor, 'port', 'unknown')}"
-        elif interface_type == 'other_serial' or interface_type == 'otherserial':
-            # OtherSerial uses key pattern "other_serial_{name}" in the historical buffer
-            # Must match the pattern in handle_other_serial_data
-            result_key = f"other_serial_{getattr(sensor, 'name', 'unknown')}"
-        elif interface_type == 'optical_sensor' or interface_type == 'opticalsensor':
-            # OpticalSensor uses key pattern "optical_{name}" in the historical buffer
-            result_key = f"optical_{getattr(sensor, 'name', 'unknown')}"
-        elif interface_type == 'audio_sensor' or interface_type == 'audiosensor':
-            # AudioSensor uses key pattern "audio_{name}" in the historical buffer
-            result_key = f"audio_{getattr(sensor, 'name', 'unknown')}"
-        elif interface_type == 'mqtt':
-            # MQTT uses key pattern "mqtt_{topic}" where topic is stored in 'port'
-            result_key = f"mqtt_{getattr(sensor, 'port', 'unknown')}"
-        elif interface_type == 'csv':
-            # CSV interface uses the prefixed key stored in the port field
-            result_key = getattr(sensor, 'port', None)
-            if not result_key:
-                result_key = f"csv_{getattr(sensor, 'name', 'unknown')}"
-        # result_key = f"unknown_{getattr(sensor, 'name', 'unknown')}"
-            
-        # print(f"DEBUG: get_historical_buffer_key for {getattr(sensor, 'name', 'unknown')} (type: {interface_type}) => {result_key}")
-        return result_key
-            
     def get_sensor_by_name(self, name):
         """Find and return a sensor object by its display name."""
         for sensor in self.sensors:
@@ -4026,12 +3950,12 @@ class SensorController(QObject):
             matched_sensor = None
             for sensor in self.sensors:
                 # Try direct match
-                if sensor.interface_type == 'OtherSerial' and sensor.name == key:
+                if getattr(sensor, 'interface_type', '') in ('OtherSerial', 'Serial') and sensor.name == key:
                     matched_sensor = sensor
                     break
                     
                 # Try case-insensitive match
-                if sensor.interface_type == 'OtherSerial' and sensor.name.lower() == key.lower():
+                if getattr(sensor, 'interface_type', '') in ('OtherSerial', 'Serial') and sensor.name.lower() == key.lower():
                     matched_sensor = sensor
                     break
                     
@@ -4052,21 +3976,14 @@ class SensorController(QObject):
                                 raw_value = 0.0
                         value = (raw_value * conversion_factor) + offset
                         print(f"DEBUG SensorController: Corrected value: raw={raw_value}, offset={offset}, factor={conversion_factor}, final={value}")
+                        matched_sensor.set_value(value)
+                        updates_made += 1
                     except (ValueError, TypeError) as e:
                         print(f"DEBUG SensorController: Error applying conversion to {key} value '{raw_value}': {e}")
-                        if isinstance(raw_value, (int, float)):
-                            value = raw_value
-                        else:
-                            value = 0.0
-                    matched_sensor.current_value = value
-                    matched_sensor.last_update = timestamp
-                    if hasattr(matched_sensor, 'raw_value'):
-                        matched_sensor.raw_value = raw_value
-                    updates_made += 1
+                        matched_sensor.set_value(None)
                 except Exception as e:
                     print(f"DEBUG SensorController: Error updating sensor {matched_sensor.name}: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    matched_sensor.set_value(None)
             else:
                 print(f"DEBUG SensorController: No matching sensor found for key '{key}'")
                 if isinstance(data[key], (int, float)) or (isinstance(data[key], str) and data[key].replace('.', '', 1).isdigit()):
@@ -4078,8 +3995,7 @@ class SensorController(QObject):
                     new_sensor.unit = ""
                     new_sensor.offset = 0.0
                     new_sensor.conversion_factor = 1.0
-                    new_sensor.current_value = float(data[key])
-                    new_sensor.last_update = timestamp
+                    new_sensor.set_value(data[key])
                     import random
                     r, g, b = random.randint(50, 200), random.randint(50, 200), random.randint(50, 200)
                     new_sensor.color = f"#{r:02x}{g:02x}{b:02x}"
@@ -4090,7 +4006,7 @@ class SensorController(QObject):
                     print(f"DEBUG SensorController: Created new sensor '{key}' with value {new_sensor.current_value}")
         print(f"DEBUG SensorController: update_other_serial_data matched sensors: {sensors_matched}, updated values for {updates_made} sensors.")
         if updates_made > 0:
-            self.update_sensor_values()
+            # self.update_sensor_values()
             # Update automation context with current sensor values
             self.update_automation_context()
         return updates_made
@@ -4166,6 +4082,9 @@ class SensorController(QObject):
             
             # Log the addition
             self.main_window.logger.log(f"Added new sensor: {sensor.name}", "INFO")
+            
+            # Update UI and graph dropdowns automatically
+            self.update_sensor_table(update_dropdowns=True)
             
             return True
         except Exception as e:
@@ -4479,6 +4398,10 @@ class SensorController(QObject):
                 interface.disconnect()
                 del self.optical_sensor_interfaces[sensor.name]
                 
+                # Clear the sensor value
+                sensor.current_value = None
+                self.update_sensor_values()
+                
                 # Update dashboard camera sources
                 if hasattr(self.main_window, 'refresh_dashboard_camera_sources'):
                     self.main_window.refresh_dashboard_camera_sources()
@@ -4552,10 +4475,10 @@ class SensorController(QObject):
                 print(f"WARNING: Error storing optical sensor data: {e}")
             
             # Update UI (safe to call from any thread due to QueuedConnection)
-            try:
-                self.update_sensor_values()
-            except Exception as e:
-                print(f"WARNING: Error updating sensor values: {e}")
+            # try:
+            #     self.update_sensor_values()
+            # except Exception as e:
+            #     print(f"WARNING: Error updating sensor values: {e}")
             
             # Feed data to graph controller for live plotting
             try:
@@ -5036,6 +4959,10 @@ class SensorController(QObject):
                 interface.disconnect()
                 del self.audio_sensor_interfaces[sensor.name]
                 
+                # Clear the sensor value
+                sensor.current_value = None
+                self.update_sensor_values()
+                
                 # Emit status changed signal so the nav button icon updates
                 self.status_changed.emit()
                 
@@ -5128,10 +5055,10 @@ class SensorController(QObject):
                 print(f"WARNING: Error storing audio sensor data: {e}")
             
             # Update UI (safe to call from any thread due to QueuedConnection)
-            try:
-                self.update_sensor_values()
-            except Exception as e:
-                print(f"WARNING: Error updating sensor values: {e}")
+            # try:
+            #     self.update_sensor_values()
+            # except Exception as e:
+            #     print(f"WARNING: Error updating sensor values: {e}")
             
             # If not collecting data, send directly to graph for live-only monitoring
             direct_plot_allowed = True

@@ -492,30 +492,33 @@ class DataFlowController(QObject):
             # Camera Controller stats
             if hasattr(self.main_window, 'camera_controller'):
                 cc = self.main_window.camera_controller
-                self.stats['camera']['connected'] = cc.is_connected
-                self.stats['recorder']['recording'] = cc.is_recording
+                self.stats['camera']['connected'] = any(cc.is_connected)
+                self.stats['recorder']['recording'] = any(cc.is_recording)
                 
-                if cc.is_connected and hasattr(cc, 'camera_thread') and cc.camera_thread:
-                    # Get resolution from camera thread if available
-                    if hasattr(cc.camera_thread, 'frame_width') and hasattr(cc.camera_thread, 'frame_height'):
-                        self.stats['camera']['resolution'] = (
-                            cc.camera_thread.frame_width,
-                            cc.camera_thread.frame_height
-                        )
+                # Use the primary camera (main view) for detailed summary stats
+                idx = cc.main_view_index
+                if cc.is_connected[idx] and cc.camera_threads[idx]:
+                    thread = cc.camera_threads[idx]
+                    if hasattr(thread, 'frame_width') and hasattr(thread, 'frame_height'):
+                        self.stats['camera']['resolution'] = (thread.frame_width, thread.frame_height)
                 
-                # Recording stats
-                if cc.is_recording and hasattr(cc, 'camera_thread') and cc.camera_thread:
-                    if hasattr(cc.camera_thread, 'recording_file'):
-                        self.stats['recorder']['file_path'] = cc.camera_thread.recording_file or ''
-                        try:
-                            import os
-                            if cc.camera_thread.recording_file and os.path.exists(cc.camera_thread.recording_file):
-                                self.stats['recorder']['file_size_bytes'] = os.path.getsize(cc.camera_thread.recording_file)
-                        except:
-                            pass
-                    
-                    if hasattr(cc.camera_thread, 'recording_start_time') and cc.camera_thread.recording_start_time:
-                        self.stats['recorder']['duration_sec'] = time.time() - cc.camera_thread.recording_start_time
+                # Recording stats (summary of all active recordings)
+                if any(cc.is_recording):
+                    # Find the first active recording for details
+                    for i in range(4):
+                        if cc.is_recording[i] and cc.camera_threads[i]:
+                            thread = cc.camera_threads[i]
+                            if hasattr(thread, 'output_file'):
+                                self.stats['recorder']['file_path'] = thread.output_file or ''
+                                try:
+                                    import os
+                                    if thread.output_file and os.path.exists(thread.output_file):
+                                        self.stats['recorder']['file_size_bytes'] = os.path.getsize(thread.output_file)
+                                except: pass
+                            
+                            if hasattr(thread, 'recording_start_time') and thread.recording_start_time:
+                                self.stats['recorder']['duration_sec'] = time.time() - thread.recording_start_time
+                            break
             
             # Stream Controller stats
             if hasattr(self.main_window, 'stream_controller'):

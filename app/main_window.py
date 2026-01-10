@@ -47,6 +47,8 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 # Import dialogs
 from app.ui.dialogs.other_sensors_dialog import OtherSensorsDialog
+from app.ui.dialogs.interface_config_dialog import InterfaceConfigDialog
+from app.core.interfaces.interface_registry import InterfaceRegistry
 
 # Import theme system
 from app.ui.theme import (
@@ -195,6 +197,9 @@ class DAQApp(QMainWindow):
         self.recording = False
         self.running = False
         self.start_time = None # To store the start time for relative plotting
+        
+        # Track connection status for all interfaces (used for sensor status)
+        self.interface_connections = {}
         self.dragging_overlay = None
         
         # Initialize theme
@@ -234,39 +239,77 @@ class DAQApp(QMainWindow):
         # Connect signals for various UI elements
         # These will be initialized in ui_setup.py
 
-        # Initialize shared media player for video playback (live/replay)
-        self.media_audio_output = None
-        self.media_player = QMediaPlayer()
-        try:
-            self.media_audio_output = QAudioOutput()
-            self.media_player.setAudioOutput(self.media_audio_output)
-            # Track duration changes for replay/video alignment
+        # Initialize shared media players for video playback (live/replay - up to 4 slots)
+        self.media_audio_outputs = []
+        self.media_players = []
+        
+        for i in range(4):
+            player = QMediaPlayer()
+            audio_output = None
             try:
-                self.media_player.durationChanged.connect(self._on_media_duration_changed)
-                self.media_player.mediaStatusChanged.connect(self._on_media_status_changed)
+                audio_output = QAudioOutput()
+                player.setAudioOutput(audio_output)
+                
+                # Connect signals for all players
+                player.durationChanged.connect(self._on_media_duration_changed)
+                player.mediaStatusChanged.connect(self._on_media_status_changed)
+                player.errorOccurred.connect(lambda error, error_str, p_idx=i: self._on_media_error(error, error_str, p_idx))
+                
+                if i == 0: # Compatibility: track master for main sync logic if needed
+                    pass
             except Exception:
                 pass
-            # Ensure audio is audible by default
-            try:
-                # Load saved volume/mute or default to 100% unmuted
-                saved_vol = float(self.settings.value("media_volume", "100"))
-                saved_vol = max(0.0, min(100.0, saved_vol))
-                saved_muted = str(self.settings.value("media_muted", "false")).lower() == "true"
-                self.media_audio_output.setVolume(saved_vol / 100.0)  # 0.0-1.0 range
-                self.media_audio_output.setMuted(saved_muted)
-            except Exception:
-                pass
-        except Exception:
-            self.media_audio_output = None
+            
+            self.media_players.append(player)
+            self.media_audio_outputs.append(audio_output)
+            
+        # Compatibility attribute for existing code
+        self.media_player = self.media_players[0]
+        self.media_audio_output = self.media_audio_outputs[0]
+        
         # Default video target: dedicated video tab display if available
         self.video_player = None
         if hasattr(self, "video_display") and isinstance(self.video_display, QVideoWidget):
-            self.media_player.setVideoOutput(self.video_display)
+            self.media_players[0].setVideoOutput(self.video_display)
             self.video_player = self.video_display
+        elif hasattr(self, "dashboard_video_widgets") and self.dashboard_video_widgets:
+            for i, vw in enumerate(self.dashboard_video_widgets):
+                if i < len(self.media_players):
+                    self.media_players[i].setVideoOutput(vw)
+            self.video_player = self.dashboard_video_widgets[0]
         elif hasattr(self, "dashboard_video_widget"):
-            self.media_player.setVideoOutput(self.dashboard_video_widget)
+            self.media_players[0].setVideoOutput(self.dashboard_video_widget)
             self.video_player = self.dashboard_video_widget
         
+        # Replay state (dashboard playback)
+        self.replay_mode_enabled = False
+        self.replay_is_playing = False
+        self.replay_current_time = 0.0
+        self.replay_duration = 0.0
+        self.replay_data_duration = 0.0
+        self.replay_video_duration = 0.0  # seconds, from media metadata
+        self.replay_video_offsets = [0.0] * 4
+        self.replay_video_segments = []
+        self.replay_active_video_paths = [None] * 4
+        self.replay_active_video_path = None # Compatibility
+        self.replay_video_drift_threshold_ms = 150  # seek if drift exceeds 150 ms
+        self.replay_speed_factor = 1.0
+        self.replay_last_tick = None  # monotonic timestamp for drift-free dt
+        self._is_syncing_replay_frame = False # Guard against recursion
+        self.replay_timer = QTimer()
+        self.replay_timer.setInterval(50)  # 20 FPS updates for slider/video sync
+        self.replay_timer.timeout.connect(self._tick_replay)
+        # Replay automation table state (simulated during replay)
+        self.automation_replay_active = False
+        self.replay_automation_events = []
+        self.replay_automation_events_by_seq = {}
+
+        # Snapshot preview state
+        self.snapshot_paths = []
+        self.snapshot_data = []
+        self.current_snapshot_index = -1
+        self.last_sync_snapshot_index = -1
+
         # Initialize controllers
         print(f"MAIN_WINDOW: Initializing controllers for win (id={id(self)})")
         self.init_controllers()
@@ -315,34 +358,6 @@ class DAQApp(QMainWindow):
         # Ensure controls are enabled by default
         self._set_media_controls_enabled(True)
 
-        # Replay state (dashboard playback)
-        self.replay_mode_enabled = False
-        self.replay_is_playing = False
-        self.replay_current_time = 0.0
-        self.replay_duration = 0.0
-        self.replay_data_duration = 0.0
-        self.replay_video_duration = 0.0  # seconds, from media metadata
-        self.replay_video_offset = None
-        self.replay_video_segments = []
-        self.replay_active_video_path = None
-        self.replay_video_drift_threshold_ms = 150  # seek if drift exceeds 150 ms
-        self.replay_speed_factor = 1.0
-        self.replay_last_tick = None  # monotonic timestamp for drift-free dt
-        self._is_syncing_replay_frame = False # Guard against recursion
-        self.replay_timer = QTimer()
-        self.replay_timer.setInterval(50)  # 20 FPS updates for slider/video sync
-        self.replay_timer.timeout.connect(self._tick_replay)
-        # Replay automation table state (simulated during replay)
-        self.automation_replay_active = False
-        self.replay_automation_events = []
-        self.replay_automation_events_by_seq = {}
-
-        # Snapshot preview state
-        self.snapshot_paths = []
-        self.snapshot_data = []
-        self.current_snapshot_index = -1
-        self.last_sync_snapshot_index = -1
-        
         # Initialize status LED update timer
         self.dashboard_metric_cards = {}
         
@@ -354,12 +369,12 @@ class DAQApp(QMainWindow):
         
         # Set window properties
         self.setWindowTitle("Artefakt")
-        # Default to Full HD, but clamp to available screen to avoid overflow
+        # Set window size to 1337x840, but clamp to available screen to avoid overflow
         screen = QApplication.primaryScreen()
         if screen:
             avail_geo = screen.availableGeometry()
-            target_width = min(1920, avail_geo.width())
-            target_height = min(1080, avail_geo.height())
+            target_width = min(1337, avail_geo.width())
+            target_height = min(840, avail_geo.height())
             self.resize(target_width, target_height)
             # Center within available area
             self.move(
@@ -367,7 +382,7 @@ class DAQApp(QMainWindow):
                 avail_geo.y() + (avail_geo.height() - target_height) // 2,
             )
         else:
-            self.resize(1920, 1080)
+            self.resize(1337, 840)
         
         # Set icon if available
         icon_path = os.path.join("assets", "icon.png")
@@ -397,26 +412,9 @@ class DAQApp(QMainWindow):
                 self.dashboard_timespan.setCurrentIndex(0)
                 self.logger.log("Added 'All' to dashboard timespan.", "INFO")
 
-        # Auto-connect logic for Arduino and LabJack
-        if self.settings.value("arduino_auto_connect", "false") == "true":
-            try:
-                if hasattr(self, 'arduino_port') and hasattr(self, 'arduino_baud'):
-                    port = self.arduino_port.currentText()
-                    baud = int(self.arduino_baud.currentText())
-                else:
-                    port = self.settings.value("arduino_port", "COM3")
-                    baud = int(self.settings.value("arduino_baud", "9600"))
-                if hasattr(self, 'data_collection_controller'):
-                    self.data_collection_controller.connect_arduino(port, baud)
-            except Exception as e:
-                print(f"Auto-connect Arduino failed: {e}")
-        if self.settings.value("labjack_auto_connect", "false") == "true":
-            try:
-                device_type = self.settings.value("labjack_type", "U3")
-                if hasattr(self, 'sensor_controller'):
-                    self.sensor_controller.connect_labjack(device_type)
-            except Exception as e:
-                print(f"Auto-connect LabJack failed: {e}")
+        # Harmonized Auto-connect is now handled by sensor_controller.initialize() 
+        # and main_window._connect_virtual_sensors().
+        # No need for old-style manual auto-connects here.
 
         # Ensure the graph live update checkbox state is properly handled after all initialization
         # This fixes the issue where the checkbox is checked but the graph doesn't refresh on startup
@@ -502,33 +500,8 @@ class DAQApp(QMainWindow):
         if hasattr(self, 'snapshot_next_btn'):
             self.snapshot_next_btn.clicked.connect(self.next_snapshot)
         
-        # Connect controller signals
-        # Connect data collection signals if available
-        if hasattr(self, 'data_collection_controller'):
-            # Connect data received signal to update sensor values
-            self.data_collection_controller.data_received_signal.connect(
-                self.update_sensor_values)
-            
-            # Connect status update signal to logger
-            self.data_collection_controller.status_update_signal.connect(
-                lambda msg, level: self.logger.log(msg, level))
-            
-            # Connect combined data signal to graph controller for synchronized updates
-            if hasattr(self, 'graph_controller'):
-                # Disconnect the old signal if it was connected
-                try:
-                    self.data_collection_controller.data_received_signal.disconnect(
-                        self.graph_controller.plot_new_data)
-                except:
-                    # If it wasn't connected, just proceed
-                    pass
-                    
-                # Connect the combined data signal for synchronized graph updates
-                self.data_collection_controller.combined_data_signal.connect(
-                    self.graph_controller.plot_new_data)
-                self.data_collection_controller.combined_data_signal.connect(
-                    self.update_dashboard_metrics)
-                self.logger.log("Connected combined data signal to graph controller and dashboard metrics", "INFO")
+        # NOTE: The controller signals (data flow, graphs, metrics) are now connected 
+        # exclusively in connect_controller_signals() to avoid redundant updates.
         
         # Connect sensor controller signals
         if hasattr(self, 'sensor_controller'):
@@ -544,6 +517,7 @@ class DAQApp(QMainWindow):
 
         if hasattr(self, 'camera_controller'):
             self.camera_controller.status_changed.connect(self.update_status_indicators)
+            self.camera_controller.status_changed.connect(self.refresh_dashboard_camera_sources) # Auto-refresh dashboard sources
             self.camera_controller.snapshot_taken.connect(self.on_snapshot_taken)
             self.camera_controller.connect_signals()
             
@@ -551,6 +525,12 @@ class DAQApp(QMainWindow):
             self.automation_controller.status_changed.connect(self.update_status_indicators)
             # Connect UI buttons to controller methods
 
+        
+        # Connect dashboard camera sources
+        self.refresh_dashboard_camera_sources()
+        
+        # Force initial hide of rows and labels
+        self._update_row_visibilities()
         
         # Connect navigation buttons
         for i, btn in enumerate(self.nav_buttons):
@@ -616,11 +596,14 @@ class DAQApp(QMainWindow):
             # Update the dashboard snapshot image
             self._update_snapshot_display()
             
-            # Update the dashboard camera preview if camera is connected
-            if hasattr(self, 'camera_controller'):
-                # Set the default message if no camera frame is available
-                if not hasattr(self, 'dashboard_camera_label'):
-                    return
+            # Ensure row visibilities are correct
+            self._update_row_visibilities()
+            
+            # Update the dashboard camera preview
+            if hasattr(self, 'dashboard_camera_labels'):
+                for lbl in self.dashboard_camera_labels:
+                    if lbl.isVisible():
+                        lbl.update()
                     
         elif hasattr(self, 'graphs_tab') and current_widget == self.graphs_tab:
             # When switching to graphs tab, update the graph display
@@ -800,7 +783,32 @@ class DAQApp(QMainWindow):
 
     def update_dashboard_metrics(self, data):
         """Update the live metric cards on the dashboard"""
-        if not hasattr(self, 'metrics_grid') or not data:
+        if not data:
+            return
+            
+        # Determine source of data
+        source = data.get('_source')
+        
+        # Live data source - only update if actively collecting (recording)
+        is_collecting = False
+        if hasattr(self, 'data_collection_controller'):
+            is_collecting = self.data_collection_controller.collecting_data
+            
+        is_replaying = getattr(self, "replay_mode_enabled", False)
+        
+        # Determine if we should allow the update
+        allow_update = False
+        if source == 'replay':
+            # Always allow updates from explicit replay source (slider/playback/preload)
+            allow_update = True
+        elif is_collecting:
+            # Allow live updates ONLY if actively collecting
+            allow_update = True
+            
+        if not allow_update:
+            return
+
+        if not hasattr(self, 'metrics_grid'):
             return
             
         if not hasattr(self, 'dashboard_metric_cards'):
@@ -810,7 +818,11 @@ class DAQApp(QMainWindow):
         if not hasattr(self, 'sensor_controller'):
             return
             
+        # 1. Track which sensors are actually in the system
+        active_sensor_keys = set()
+        
         for sensor in self.sensor_controller.sensors:
+            # ONLY show enabled sensors that are marked for graphing
             if not getattr(sensor, 'enabled', True) or not getattr(sensor, 'show_in_graph', True):
                 continue
                 
@@ -819,6 +831,8 @@ class DAQApp(QMainWindow):
             if not sensor_key:
                 continue
             
+            active_sensor_keys.add(sensor_key)
+            
             # Create card if it doesn't exist
             if sensor_key not in self.dashboard_metric_cards:
                 from app.ui.ui_setup import DashMetricCard
@@ -826,21 +840,31 @@ class DAQApp(QMainWindow):
                 # Set initial window size from config
                 window_size = self.config.get("dash_trend_window", 5)
                 card.set_window_size(window_size)
-                # Insert before the stretch (which is at the last index)
-                self.metrics_grid.insertWidget(self.metrics_grid.count() - 1, card)
+                
+                # Add to cards dictionary and rearrange
                 self.dashboard_metric_cards[sensor_key] = card
+                self.rearrange_dashboard_metrics()
                 
             # Update card value
             val = None
             
-            # If in replay mode, ALWAYS use the provided data dictionary values
-            if getattr(self, "replay_mode_enabled", False):
+            # If in replay mode or source is replay, prioritize data dict values
+            if is_replaying or source == 'replay':
                 val = data.get(sensor_key)
                 if val is None:
-                    # Try unprefixed name as a fallback
+                    # Try case-insensitive matching if direct key fails
+                    for k, v in data.items():
+                        if k.lower() == sensor_key.lower():
+                            val = v
+                            break
+                    
+                if val is None:
+                    # Try unprefixed name as a fallback (splitting only once from the left)
                     unprefixed = sensor_key.split('_', 1)[1] if '_' in sensor_key else None
                     if unprefixed:
                         val = data.get(unprefixed)
+                    
+                    # If still None, try matching by the sensor name itself
                     if val is None:
                         val = data.get(sensor.name)
             else:
@@ -858,9 +882,7 @@ class DAQApp(QMainWindow):
                             is_stale = True
                     else:
                         # If no update yet but has value, check if it's a CSV sensor
-                        # (which might have been pre-loaded or just connected)
                         if getattr(sensor, 'interface_type', '') == "CSV":
-                             # We'll allow it for now until the first poll cycle
                              is_stale = False
                 
                 if is_stale:
@@ -872,17 +894,88 @@ class DAQApp(QMainWindow):
                 if val is None and not is_stale:
                     val = data.get(sensor_key)
                     if val is None:
-                        # Try unprefixed name as a fallback
                         unprefixed = sensor_key.split('_', 1)[1] if '_' in sensor_key else None
                         if unprefixed:
                             val = data.get(unprefixed)
                 if val is None:
                     val = data.get(sensor.name)
                 
-            # Always call update_value, even if val is None, to ensure the card 
-            # clears itself (showing "---") when a sensor becomes stale.
+            # Always call update_value to ensure the card clears itself when a sensor becomes stale
             self.dashboard_metric_cards[sensor_key].update_value(val)
+            
+        # 2. Cleanup orphaned cards (sensors that were deleted or disabled)
+        keys_to_remove = []
+        for key in list(self.dashboard_metric_cards.keys()):
+            if key not in active_sensor_keys:
+                keys_to_remove.append(key)
                 
+        for key in keys_to_remove:
+            card = self.dashboard_metric_cards.pop(key)
+            self.metrics_grid.removeWidget(card)
+            card.deleteLater()
+            
+        if keys_to_remove:
+            self.rearrange_dashboard_metrics()
+                
+    def rearrange_dashboard_metrics(self):
+        """Rearrange metric cards in the grid based on available width"""
+        if not hasattr(self, 'metrics_grid') or not hasattr(self, 'dashboard_metric_cards'):
+            return
+            
+        if not self.dashboard_metric_cards:
+            return
+            
+        # Determine number of columns based on width
+        # The container width tells us how much space we have in the splitter
+        container_width = self.metrics_container.width()
+        
+        # Calculate number of columns based on width
+        # Each card is now fixed at 130px wide + 8px spacing = 138px
+        if container_width > 966:
+            num_cols = 7
+        elif container_width > 828:
+            num_cols = 6
+        elif container_width > 690:
+            num_cols = 5
+        elif container_width > 552:
+            num_cols = 4
+        elif container_width > 414:
+            num_cols = 3
+        elif container_width > 276:
+            num_cols = 2
+        else:
+            num_cols = 1
+        
+        # Get sorted list of keys to maintain consistent order
+        # We sort by the sensor name for a logical display
+        sorted_keys = sorted(
+            self.dashboard_metric_cards.keys(),
+            key=lambda k: getattr(self.dashboard_metric_cards[k], 'sensor_name', k)
+        )
+        
+        # Remove all widgets from the layout without deleting them
+        while self.metrics_grid.count():
+            item = self.metrics_grid.takeAt(0)
+            # No need to do anything with the item, it's just a layout item
+        
+        # Re-add in the new grid positions
+        for i, key in enumerate(sorted_keys):
+            card = self.dashboard_metric_cards[key]
+            row = i // num_cols
+            col = i % num_cols
+            # Use alignment to prevent the card from stretching to fill the grid cell
+            self.metrics_grid.addWidget(card, row, col, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            
+        # Clear any old row/column stretches
+        for r in range(self.metrics_grid.rowCount() + 1):
+            self.metrics_grid.setRowStretch(r, 0)
+        for c in range(self.metrics_grid.columnCount() + 1):
+            self.metrics_grid.setColumnStretch(c, 0)
+            
+        # Add a stretch to the right and bottom to keep cards packed at the top-left
+        self.metrics_grid.setColumnStretch(num_cols, 1)
+        self.metrics_grid.setRowStretch(self.metrics_grid.rowCount(), 1)
+
     def update_dashboard_header(self):
         """Update project and run info in the dashboard header"""
         try:
@@ -996,130 +1089,85 @@ class DAQApp(QMainWindow):
                 self.project_status, project_tooltip = StatusState.ERROR, "Project Controller not ready"
         except AttributeError:
             self.project_status, project_tooltip = StatusState.ERROR, "Project Controller not ready"
-            
+
         try:
             if hasattr(self, 'sensor_controller'):
                 sensor_status_info = self.sensor_controller.get_status()
                 sensor_count = sensor_status_info["sensor_count"]
                 
-                # Count active sensors (show_in_graph=True) by interface type
-                active_arduino_sensors = 0
-                active_labjack_sensors = 0
-                active_audio_sensors = 0
-                active_optical_sensors = 0
-                active_other_sensors = 0
+                # Dynamic sensor connection tracking
+                active_sensor_count = 0
+                connected_parts = {} # {interface_name: count}
+                missing_parts = {}   # {interface_name: count}
                 
                 if hasattr(self.sensor_controller, 'sensors'):
                     for s in self.sensor_controller.sensors:
                         if getattr(s, 'show_in_graph', False) and getattr(s, 'enabled', True):
-                            interface = getattr(s, 'interface_type', '').lower()
-                            if interface == 'arduino':
-                                active_arduino_sensors += 1
-                            elif interface == 'labjack':
-                                active_labjack_sensors += 1
-                            elif interface == 'audiosensor' or interface == 'audio_sensor':
-                                active_audio_sensors += 1
-                            elif interface == 'opticalsensor' or interface == 'optical_sensor':
-                                active_optical_sensors += 1
+                            active_sensor_count += 1
+                            interface_name = getattr(s, 'interface_type', 'Unknown')
+                            interface_key = interface_name.lower()
+                            
+                            # Determine if this specific interface is connected
+                            is_connected = False
+                            
+                            # 1. Check our tracked interface connections
+                            if hasattr(self, 'interface_connections') and interface_key in self.interface_connections:
+                                is_connected = self.interface_connections[interface_key]
+                            # 2. Fallback to specialized checks if not in dict yet
+                            elif interface_key == 'arduino':
+                                is_connected = getattr(self.data_collection_controller, 'arduino_connected', False) if hasattr(self, 'data_collection_controller') else False
+                            elif interface_key == 'labjack':
+                                is_connected = getattr(self.data_collection_controller, 'labjack_connected', False) if hasattr(self, 'data_collection_controller') else False
+                                if not is_connected and hasattr(self.sensor_controller, 'labjack_connected'):
+                                    is_connected = self.sensor_controller.labjack_connected
+                            elif interface_key in ['audiosensor', 'audio_sensor']:
+                                # We check this dynamically in update_audio_sensor_status, but for now use the count
+                                # This is a bit recursive, but should work if update_audio_sensor_status was called
+                                is_connected = self.interface_connections.get('audiosensor', False)
+                            elif interface_key in ['opticalsensor', 'optical_sensor']:
+                                is_connected = self.interface_connections.get('opticalsensor', False)
+                            elif interface_key in ['otherserial', 'other_serial']:
+                                is_connected = getattr(self.data_collection_controller, 'other_serial_connected', False) if hasattr(self, 'data_collection_controller') else False
+                            elif interface_key == 'mqtt':
+                                is_connected = getattr(self.data_collection_controller, 'mqtt_connected', False) if hasattr(self, 'data_collection_controller') else False
+                            elif interface_key == 'csv':
+                                is_connected = self.interface_connections.get('csv', False)
+                            
+                            # Record status
+                            if is_connected:
+                                connected_parts[interface_name] = connected_parts.get(interface_name, 0) + 1
                             else:
-                                active_other_sensors += 1
-                
-                active_sensor_count = active_arduino_sensors + active_labjack_sensors + active_audio_sensors + active_optical_sensors + active_other_sensors
-                
-                # Check if required hardware is connected for active sensors
-                arduino_connected = False
-                labjack_connected = False
-                audio_sensors_connected = False  # Start with False, check if any are actually connected
-                optical_sensors_connected = False  # Start with False, check if any are actually connected
-                
-                if hasattr(self, 'data_collection_controller'):
-                    arduino_connected = getattr(self.data_collection_controller, 'arduino_connected', False)
-                    labjack_connected = getattr(self.data_collection_controller, 'labjack_connected', False)
-                
-                # Also check sensor_controller for labjack connection
-                if hasattr(self.sensor_controller, 'labjack_connected'):
-                    labjack_connected = labjack_connected or self.sensor_controller.labjack_connected
-                
-                # Check audio sensor connections - check ALL enabled audio sensors, not just active ones
-                if hasattr(self.sensor_controller, 'audio_sensor_interfaces') and self.sensor_controller.audio_sensor_interfaces:
-                    for sensor in self.sensor_controller.sensors:
-                        interface_type = getattr(sensor, 'interface_type', '').lower()
-                        if (interface_type == 'audiosensor' or interface_type == 'audio_sensor') and getattr(sensor, 'enabled', True):
-                            if sensor.name in self.sensor_controller.audio_sensor_interfaces:
-                                interface = self.sensor_controller.audio_sensor_interfaces[sensor.name]
-                                if interface and getattr(interface, 'connected', False):
-                                    audio_sensors_connected = True
-                                    break  # At least one is connected
-                
-                # Check optical sensor connections - check ALL enabled optical sensors, not just active ones
-                if hasattr(self.sensor_controller, 'optical_sensor_interfaces') and self.sensor_controller.optical_sensor_interfaces:
-                    for sensor in self.sensor_controller.sensors:
-                        interface_type = getattr(sensor, 'interface_type', '').lower()
-                        if (interface_type == 'opticalsensor' or interface_type == 'optical_sensor') and getattr(sensor, 'enabled', True):
-                            if sensor.name in self.sensor_controller.optical_sensor_interfaces:
-                                interface = self.sensor_controller.optical_sensor_interfaces[sensor.name]
-                                if interface and getattr(interface, 'connected', False):
-                                    optical_sensors_connected = True
-                                    break  # At least one is connected
-                
+                                missing_parts[interface_name] = missing_parts.get(interface_name, 0) + 1
+
                 # Determine status based on ACTIVE sensors AND hardware connection
                 if sensor_count == 0:
-                    # No sensors configured at all
                     self.sensor_status = StatusState.OPTIONAL
                     sensor_tooltip = "No sensors configured (Optional)"
                 elif active_sensor_count == 0:
-                    # Sensors exist but none are active (show_in_graph)
                     self.sensor_status = StatusState.OPTIONAL
-                    sensor_tooltip = f"{sensor_count} sensor(s) configured, but none active (enable 'Show in Graph')"
+                    sensor_tooltip = f"{sensor_count} sensor(s) configured, but none active (enable 'Use')"
                 else:
-                    # Check if hardware is connected for active sensors
-                    hardware_missing = []
-                    
-                    if active_arduino_sensors > 0 and not arduino_connected:
-                        hardware_missing.append(f"Arduino ({active_arduino_sensors} sensor(s))")
-                    
-                    if active_labjack_sensors > 0 and not labjack_connected:
-                        hardware_missing.append(f"LabJack ({active_labjack_sensors} sensor(s))")
-                    
-                    if active_audio_sensors > 0 and not audio_sensors_connected:
-                        hardware_missing.append(f"Audio Sensor ({active_audio_sensors} sensor(s))")
-                    
-                    if active_optical_sensors > 0 and not optical_sensors_connected:
-                        hardware_missing.append(f"Optical Sensor ({active_optical_sensors} sensor(s))")
-                    
-                    # Check if at least one sensor type is connected
-                    has_connected_sensors = (
-                        (active_arduino_sensors > 0 and arduino_connected) or
-                        (active_labjack_sensors > 0 and labjack_connected) or
-                        (active_audio_sensors > 0 and audio_sensors_connected) or
-                        (active_optical_sensors > 0 and optical_sensors_connected) or
-                        (active_other_sensors > 0)  # OtherSerial sensors don't have a global connection check
-                    )
-                    
-                    if has_connected_sensors:
+                    if connected_parts:
                         # At least one active sensor type is connected - status is READY (green)
                         self.sensor_status = StatusState.READY
-                        connected_parts = []
-                        if active_arduino_sensors > 0 and arduino_connected:
-                            connected_parts.append(f"Arduino ({active_arduino_sensors})")
-                        if active_labjack_sensors > 0 and labjack_connected:
-                            connected_parts.append(f"LabJack ({active_labjack_sensors})")
-                        if active_audio_sensors > 0 and audio_sensors_connected:
-                            connected_parts.append(f"Audio ({active_audio_sensors})")
-                        if active_optical_sensors > 0 and optical_sensors_connected:
-                            connected_parts.append(f"Optical ({active_optical_sensors})")
-                        if active_other_sensors > 0:
-                            connected_parts.append(f"Other ({active_other_sensors})")
                         
-                        sensor_tooltip = f"{active_sensor_count} active sensor(s): " + ", ".join(connected_parts) + " connected"
-                        if hardware_missing:
-                            sensor_tooltip += f"\nMissing: " + ", ".join([h.split('(')[0].strip() for h in hardware_missing])
+                        parts = []
+                        for name, count in connected_parts.items():
+                            parts.append(f"{name} ({count})")
+                        
+                        sensor_tooltip = f"{active_sensor_count} active sensor(s): " + ", ".join(parts) + " connected"
+                        
+                        if missing_parts:
+                            missing_list = [f"{name}" for name in missing_parts.keys()]
+                            sensor_tooltip += f"\nMissing: " + ", ".join(missing_list)
+                            
                         if sensor_status_info.get("acquisition_running", False):
                             sensor_tooltip += "\nData acquisition in progress"
                     else:
                         # No active sensors are connected
                         self.sensor_status = StatusState.OPTIONAL
-                        sensor_tooltip = f"{active_sensor_count} active sensor(s), but hardware not connected:\n• " + "\n• ".join(hardware_missing)
+                        missing_list = [f"{name} ({count} sensor(s))" for name, count in missing_parts.items()]
+                        sensor_tooltip = f"{active_sensor_count} active sensor(s), but hardware not connected:\n• " + "\n• ".join(missing_list)
                 
                 # Ensure sensors are never ERROR (red), only OPTIONAL (yellow/orange) or READY (green)
                 if self.sensor_status == StatusState.ERROR:
@@ -1411,10 +1459,17 @@ class DAQApp(QMainWindow):
                 self.logger.log("Stopped data acquisition")
                 
             # Stop video recording if active
-            if hasattr(self, 'camera_controller') and self.camera_controller.is_recording:
-                print("[TOGGLE] Stopping video recording...")
-                self.camera_controller.stop_recording()
-                self.logger.log("Stopped video recording")
+            if hasattr(self, 'camera_controller'):
+                is_recording = False
+                if isinstance(self.camera_controller.is_recording, list):
+                    is_recording = any(self.camera_controller.is_recording)
+                else:
+                    is_recording = self.camera_controller.is_recording
+                
+                if is_recording:
+                    print("[TOGGLE] Stopping video recording...")
+                    self.camera_controller.stop_recording()
+                    self.logger.log("Stopped video recording")
             
             # --- ADDED: Stop all automation sequences ---
             if hasattr(self, 'automation_controller'):
@@ -1545,24 +1600,24 @@ class DAQApp(QMainWindow):
             print("[TOGGLE] Data acquisition started successfully")
             self.statusBar().showMessage("Acquisition started...")
             
-            # Start video recording if camera is active and recording is enabled
-            # Only check the auto_record setting (from the camera settings checkbox)
-            should_record = False
-            if self.settings_model.get_value("auto_record", False):
-                # Only start recording if camera is actually connected
-                if hasattr(self, 'camera_controller') and self.camera_controller.is_connected:
-                    print("[TOGGLE] Auto-record enabled and camera connected, starting recording...")
-                    should_record = True
+            # Start video recording if any camera is set to record
+            if hasattr(self, 'camera_controller'):
+                # Check if at least one connected camera has recording enabled in its config
+                any_ready_to_record = False
+                for i in range(4):
+                    if self.camera_controller.is_connected[i] and self.camera_controller.camera_configs[i].get("record_video", True):
+                        any_ready_to_record = True
+                        break
+                
+                if any_ready_to_record:
+                    if not any(self.camera_controller.is_recording):
+                        print("[TOGGLE] Starting recording for enabled cameras...")
+                        self.camera_controller.start_recording()
+                        self.logger.log("Started video recording")
+                    else:
+                        print("[TOGGLE] Camera already recording, skipping duplicate start")
                 else:
-                    print("[TOGGLE] Auto-record enabled but camera not connected, skipping recording...")
-            
-            if should_record and hasattr(self, 'camera_controller'):
-                # Only start recording if not already recording
-                if not self.camera_controller.is_recording:
-                    self.camera_controller.start_recording()
-                    self.logger.log("Started video recording")
-                else:
-                    print("[TOGGLE] Camera already recording, skipping duplicate start")
+                    print("[TOGGLE] No cameras connected or set to record, skipping recording start")
 
             # --- ADDED: Start checked automation sequences ---
             if hasattr(self, 'automation_controller'):
@@ -1658,12 +1713,16 @@ class DAQApp(QMainWindow):
                 self.save_config()
         
         # Load other settings as usual
-        # ... remaining settings loading code ...
+        self.other_sensors_autoconnect = self.settings.value("other_sensors_autoconnect", "true") == "true"
         
         # Load the global sampling rate setting if it exists
         if hasattr(self, 'sampling_rate_spinbox'):
             # Load sampling rate in Hz (default 1.0 Hz)
-            saved_rate = float(self.settings.value("global_sampling_rate", 1.0))
+            val = self.settings.value("global_sampling_rate", 1.0)
+            try:
+                saved_rate = float(val) if str(val).lower() != 'none' else 1.0
+            except (ValueError, TypeError):
+                saved_rate = 1.0
             self.sampling_rate_spinbox.setValue(saved_rate)
             
             # If we have the data collection controller, update it
@@ -1677,12 +1736,29 @@ class DAQApp(QMainWindow):
                 if testers:
                     self.run_testers.setText(testers)
         
-        # Load sensors if the sensor controller is available
-        if hasattr(self, 'sensor_controller'):
-            self.sensor_controller.load_sensors(is_startup_load=is_startup_load)
-        
         # Load application settings from settings model
         self.settings_model.load_settings()
+
+        # Load virtual sensors and sequences first (required for sensor_controller.initialize)
+        self.load_virtual_sensors(is_startup_load=is_startup_load)
+
+        # Now perform comprehensive sensor initialization and auto-connection
+        if hasattr(self, 'sensor_controller'):
+            # This loads sensors.json and handles auto-connect for ALL interface types
+            self.sensor_controller.initialize()
+            self.logger.log("Sensor controller initialized and auto-connected", "INFO")
+        
+        # Load automation sequences if the controller is available
+        if hasattr(self, 'automation_controller') and is_startup_load:
+            self.automation_controller.load_sequences(is_startup_load=True)
+
+        # Handle camera auto-connect if enabled
+        if hasattr(self, 'camera_controller') and is_startup_load:
+            camera_auto_connect = self.settings.value("camera_auto_connect", "false") == "true"
+            if camera_auto_connect:
+                self.logger.log("Auto-connecting camera...", "INFO")
+                # Use a small delay to ensure UI is fully ready and video outputs are set
+                QTimer.singleShot(1500, lambda: self.camera_controller.connect_camera(0))
 
         # Load plot formatting settings
         if hasattr(self, 'plot_style_preset'):
@@ -1708,30 +1784,6 @@ class DAQApp(QMainWindow):
             self.log_text.setVisible(show_log)
         # Log panel and theme settings have been removed
 
-        self.load_virtual_sensors(is_startup_load=is_startup_load)
-
-        # Load automation sequences if the controller is available
-        if hasattr(self, 'automation_controller') and is_startup_load:
-            self.automation_controller.load_sequences(is_startup_load=True)
-
-        # --- Inject virtual sensors into main sensor list ---
-        if hasattr(self, 'sensor_controller') and hasattr(self, 'other_sensors'):
-            from app.models.sensor_model import SensorModel
-            existing_names = {s.name for s in self.sensor_controller.sensors}
-            for vs in self.other_sensors:
-                # If already a SensorModel, skip; else, create from dict
-                if isinstance(vs, SensorModel):
-                    if vs.name not in existing_names:
-                        self.sensor_controller.sensors.append(vs)
-                        existing_names.add(vs.name)
-                elif isinstance(vs, dict):
-                    if vs.get('name') not in existing_names:
-                        sensor = SensorModel.from_dict(vs)
-                        self.sensor_controller.sensors.append(sensor)
-                        existing_names.add(sensor.name)
-            # Update UI and dropdowns
-            self.sensor_controller.update_sensor_table()
-
     def apply_settings(self):
         """Apply settings from UI to the application"""
         try:
@@ -1741,6 +1793,13 @@ class DAQApp(QMainWindow):
                 if hasattr(self, 'sampling_rate_spinbox'):
                     sampling_rate_hz = self.sampling_rate_spinbox.value()
                     self.data_collection_controller.set_sampling_rate(sampling_rate_hz)
+                    
+                    # Also update the UI sensor table timer interval
+                    if hasattr(self, 'sensor_values_timer'):
+                        update_interval = max(int(1000 / sampling_rate_hz), 100)
+                        self.sensor_values_timer.setInterval(update_interval)
+                        print(f"DEBUG MainWindow: Updated sensor table refresh interval to {update_interval}ms ({sampling_rate_hz}Hz)")
+                    
                     # Save the rate in Hz to settings
                     self.settings.setValue("global_sampling_rate", sampling_rate_hz)
                     self.logger.log(f"Applied sampling rate: {sampling_rate_hz:.2f} Hz")
@@ -2027,11 +2086,7 @@ class DAQApp(QMainWindow):
                 if success:
                     self.add_dashboard_event("New sensor added", "SUCCESS")
                 
-                if not success:
-                    print("SensorController.add_sensor() returned False, falling back to show_add_sensor_dialog")
-                    # As a fallback, try to show the dialog directly
-                    if hasattr(self, 'show_add_sensor_dialog'):
-                        self.show_add_sensor_dialog()
+                # Removed incorrect fallback logic that caused double popups
             else:
                 print("Error: sensor_controller not found")
                 from PyQt6.QtWidgets import QMessageBox
@@ -2521,6 +2576,9 @@ class DAQApp(QMainWindow):
     def resizeEvent(self, event):
         """Handle window resize events"""
         super().resizeEvent(event)
+        # Print window size after resize
+        size = self.size()
+        print(f"Window resized to: {size.width()}x{size.height()}")
         # Update dashboard snapshot image scaling if currently visible
         if hasattr(self, 'stacked_widget') and hasattr(self, 'dashboard_tab'):
             if self.stacked_widget.currentWidget() == self.dashboard_tab:
@@ -2535,6 +2593,9 @@ class DAQApp(QMainWindow):
                 # Update the snapshot scaling when its container label resizes
                 # (e.g. via splitter movement or window resize)
                 self._update_snapshot_display()
+            elif hasattr(self, 'metrics_container') and source == self.metrics_container:
+                # Update the metrics grid layout (1 or 2 columns) when its container resizes
+                self.rearrange_dashboard_metrics()
         
         return super().eventFilter(source, event)
         
@@ -2694,7 +2755,7 @@ class DAQApp(QMainWindow):
         # Initialize the data collection controller to set up timers
         # We pass load_historical=False because we will perform a comprehensive startup load
         self.data_collection_controller.initialize(load_historical=False)
-
+        
         # Setup the sensor tab UI components
         self.setup_sensor_tab()
 
@@ -2742,7 +2803,9 @@ class DAQApp(QMainWindow):
                     self.graph_controller.plot_new_data)
                 self.data_collection_controller.combined_data_signal.connect(
                     self.update_dashboard_metrics)
-                self.logger.log("Connected combined data signal to graph controller and dashboard metrics", "INFO")
+                self.data_collection_controller.combined_data_signal.connect(
+                    self.sensor_controller.update_from_combined_data)
+                self.logger.log("Connected combined data signal to graph controller, dashboard metrics, and sensor controller", "INFO")
         
         # Connect sensor controller signals
         if hasattr(self, 'sensor_controller'):
@@ -2770,10 +2833,17 @@ class DAQApp(QMainWindow):
             is_connected (bool): Whether the interface is connected
         """
         # Debug
-        print(f"handle_interface_status: {interface_type} is_connected={is_connected}")
+        print(f"DEBUG HW STATUS: {interface_type} is_connected={is_connected}")
         
         # Update device connection status in UI
-        self.update_device_connection_status_ui(interface_type, is_connected)
+        # Guard against recursion: update_device_connection_status_ui() may (optionally) call back into
+        # controller disconnect methods when the UI requests a disconnect. When the controller itself
+        # emits a status update, we must not call disconnect again.
+        self._in_controller_status_update = True
+        try:
+            self.update_device_connection_status_ui(interface_type, is_connected)
+        finally:
+            self._in_controller_status_update = False
 
     def update_device_connection_status_ui(self, device_type, is_connected):
         """Update the connection status UI indicators for a specific device type
@@ -2784,6 +2854,29 @@ class DAQApp(QMainWindow):
         """
         print(f"update_device_connection_status_ui: type={device_type}, connected={is_connected}")
         
+        # If this is a disconnect request from a dialog/UI, make sure the controller actually disconnects
+        # This prevents auto-reconnect loops if the interface instance was disconnected but the thread is still running
+        if (not is_connected
+            and hasattr(self, 'data_collection_controller')
+            and not getattr(self, '_in_controller_status_update', False)):
+            dcc = self.data_collection_controller
+            if device_type.lower() == 'arduino' and dcc.arduino_connected:
+                print(f"DEBUG: Dialog requested disconnect for {device_type}, calling controller.disconnect_arduino()")
+                dcc.disconnect_arduino()
+            elif device_type.lower() == 'labjack' and dcc.labjack_connected:
+                print(f"DEBUG: Dialog requested disconnect for {device_type}, calling controller.disconnect_labjack()")
+                dcc.disconnect_labjack()
+            elif device_type.lower() == 'mqtt' and 'mqtt' in dcc.interfaces and dcc.interfaces['mqtt']['connected']:
+                print(f"DEBUG: Dialog requested disconnect for {device_type}, calling controller.disconnect_mqtt()")
+                dcc.disconnect_mqtt()
+            elif (device_type.lower() == 'other' or device_type.lower() == 'serial') and 'other_serial' in dcc.interfaces and dcc.interfaces['other_serial']['connected']:
+                print(f"DEBUG: Dialog requested disconnect for {device_type}, calling controller.disconnect_other_serial_all()")
+                dcc.disconnect_other_serial_all()
+            elif device_type in dcc.interfaces and dcc.interfaces[device_type].get('connected', False):
+                # Generic plugin interface
+                print(f"DEBUG: Dialog requested disconnect for plugin {device_type}, calling controller.disconnect_plugin_interface()")
+                dcc.disconnect_plugin_interface(device_type)
+
         # Add dashboard event
         status_str = "connected" if is_connected else "disconnected"
         level = "SUCCESS" if is_connected else "ERROR"
@@ -2803,7 +2896,8 @@ class DAQApp(QMainWindow):
             if is_connected and hasattr(self, 'sensor_controller'):
                 self.sensor_controller.subscribe_all_mqtt_topics()
         else:
-            print(f"Warning: Unknown device type: {device_type}")
+            # Generic handler for new plugin interfaces
+            self.update_generic_interface_status(device_type, is_connected)
             
         # Also update the interfaces dictionary directly to ensure consistency
         if hasattr(self, 'data_collection_controller') and hasattr(self.data_collection_controller, 'interfaces'):
@@ -2829,32 +2923,6 @@ class DAQApp(QMainWindow):
         # Force application to process events immediately
         from PyQt6.QtCore import QCoreApplication
         QCoreApplication.processEvents()
-
-    def update_other_connected_status(self, is_connected):
-        """Update the Serial Sensors connection status display
-        
-        Args:
-            is_connected (bool): Whether Serial Sensors are connected
-        """
-        print(f"Direct Serial Sensors status update: is_connected={is_connected}")
-        
-        # Set the text and color directly on the other_status label if it exists
-        if hasattr(self, 'other_status'):
-            status_text = "Connected" if is_connected else "Not connected"
-            status_color = "green" if is_connected else "grey"
-            print(f"Directly updating other_status label to '{status_text}' with color '{status_color}'")
-            self.other_status.setText(status_text)
-            self.other_status.setStyleSheet(f"color: {status_color}; font-size: 9px; background-color: transparent; border: none;")
-            self.other_status.repaint()
-        
-        # Force application to process events immediately
-        from PyQt6.QtCore import QCoreApplication
-        QCoreApplication.processEvents()
-        
-        # Log the status change
-        status_str = "connected" if is_connected else "disconnected"
-        if hasattr(self, 'logger'):
-            self.logger.log(f"Serial Sensors {status_str}", "INFO")
 
     def init_device_status(self):
         """Initialize device status indicators in the UI"""
@@ -2902,6 +2970,9 @@ class DAQApp(QMainWindow):
         """
         print(f"Direct Arduino status update: is_connected={is_connected}")
         
+        # Track connection status
+        self.interface_connections['arduino'] = is_connected
+        
         # First try to update the button if it exists
         if hasattr(self, 'arduino_connect_btn'):
             self.arduino_connect_btn.setText("Disconnect" if is_connected else "Connect")
@@ -2917,7 +2988,7 @@ class DAQApp(QMainWindow):
         # Set the text and color directly on the arduino_status label if it exists
         if hasattr(self, 'arduino_status'):
             status_text = "Connected" if is_connected else "Not connected"
-            status_color = "green" if is_connected else "grey"
+            status_color = COLORS.SUCCESS_TEXT if is_connected else COLORS.TEXT_MUTED
             print(f"Directly updating arduino_status label to '{status_text}' with color '{status_color}'")
             self.arduino_status.setText(status_text)
             self.arduino_status.setStyleSheet(f"color: {status_color}; font-size: 9px; background-color: transparent; border: none;")
@@ -2940,6 +3011,9 @@ class DAQApp(QMainWindow):
             is_connected (bool): Whether MQTT is connected
         """
         print(f"Direct MQTT status update: is_connected={is_connected}")
+        
+        # Track connection status
+        self.interface_connections['mqtt'] = is_connected
         
         # Set the text and color directly on the mqtt_status label if it exists
         if hasattr(self, 'mqtt_status'):
@@ -2964,761 +3038,255 @@ class DAQApp(QMainWindow):
         if hasattr(self, 'logger'):
             self.logger.log(f"MQTT {status_str}", "INFO")
 
+    def update_generic_interface_status(self, device_type, is_connected):
+        """Generic handler to update connection status for any registered interface."""
+        print(f"DEBUG: update_generic_interface_status for '{device_type}' connected={is_connected}")
+        
+        # Track connection status
+        self.interface_connections[device_type.lower()] = is_connected
+        
+        # Find the status label from our registry in ui_setup
+        if hasattr(self, 'interface_status_labels'):
+            # Try exact match first
+            label = self.interface_status_labels.get(device_type)
+            
+            # If not found, try case-insensitive or normalized match
+            if not label:
+                for key, val in self.interface_status_labels.items():
+                    if key.lower() == device_type.lower():
+                        label = val
+                        break
+            
+            if label:
+                status_text = "Connected" if is_connected else "Not connected"
+                
+                # Check if it's a plugin card to use light blue instead of grey
+                container = label.parent()
+                is_plugin = container.property("is_plugin") if container else False
+                
+                if is_connected:
+                    status_color = COLORS.SUCCESS_TEXT
+                elif is_plugin:
+                    status_color = COLORS.INFO
+                else:
+                    status_color = COLORS.TEXT_MUTED
+                
+                label.setText(status_text)
+                label.setStyleSheet(f"color: {status_color}; font-size: 9px; background-color: transparent; border: none;")
+                label.repaint()
+                
+                # Update the surrounding device card background
+                if container and hasattr(container, 'setStyleSheet'):
+                    if is_plugin:
+                        container.setStyleSheet(CardStyles.plugin_card(is_connected))
+                    else:
+                        container.setStyleSheet(CardStyles.device_card(is_connected))
+                    container.update()
+            else:
+                print(f"DEBUG: '{device_type}' not found in interface_status_labels (keys: {list(self.interface_status_labels.keys())})")
+
     def show_arduino_settings_popup(self):
-        """Show Arduino settings in a popup dialog"""
-        print("=== Opening Arduino Settings Popup Dialog ===")
-        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QGridLayout, QLabel, QComboBox, QDoubleSpinBox, QPushButton, QGroupBox, QLineEdit, QHBoxLayout, QCheckBox, QTextEdit
-        from PyQt6.QtCore import Qt
-        
-        # Create dialog
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Arduino Settings")
-        dialog.setMinimumWidth(350)
-        dialog.setMinimumHeight(400)
-        dialog.setStyleSheet(DialogStyles.dark_dialog())
-        
-        # Main layout
-        layout = QVBoxLayout(dialog)
-        
-        # Create a group box for Arduino settings
-        arduino_group = QGroupBox("Arduino Settings")
-        arduino_group.setStyleSheet(GroupBoxStyles.default())
-        arduino_layout = QGridLayout(arduino_group)
-        
-        # Arduino Port
-        arduino_layout.addWidget(QLabel("Port:"), 0, 0)
-        port_combo = QComboBox()
-        port_combo.setEditable(True)
-        
-        # Use the same port as in the main window
-        if hasattr(self, 'arduino_port'):
-            current_port = self.arduino_port.currentText()
-            port_combo.addItem(current_port)
-        else:
-            port_combo.addItem(self.settings.value("arduino_port", "COM3"))
-            
-        arduino_layout.addWidget(port_combo, 0, 1)
-        
-        # Auto-detect button
-        detect_btn = QPushButton("Auto Detect")
-        detect_btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
-        arduino_layout.addWidget(detect_btn, 0, 2)
-        
-        # Baud Rate
-        arduino_layout.addWidget(QLabel("Baud Rate:"), 1, 0)
-        baud_combo = QComboBox()
-        baud_combo.addItems(["9600", "19200", "38400", "57600", "115200"])
-        
-        # Use the same baud rate as in the main window
-        if hasattr(self, 'arduino_baud'):
-            baud_combo.setCurrentText(self.arduino_baud.currentText())
-        else:
-            baud_combo.setCurrentText(str(self.settings.value("arduino_baud", "9600")))
-            
-        arduino_layout.addWidget(baud_combo, 1, 1)
-        
-        # Note: Poll interval removed as it's controlled by the global sampling rate
-        
-        # Auto-connect at program start checkbox
-        auto_connect_checkbox = QCheckBox("Auto-connect at program start")
-        auto_connect_checkbox.setChecked(self.settings.value("arduino_auto_connect", "false") == "true")
-        arduino_layout.addWidget(auto_connect_checkbox, 2, 0, 1, 3)
-        
-        # Arduino connect button
-        buttons_layout = QHBoxLayout()
-        connect_btn = QPushButton("Connect")
-        
-        # Use theme system for button styles
-        green_border_style = ConnectionStyles.connected()
-        red_border_style = ConnectionStyles.disconnected()
-        
-        connect_btn.setStyleSheet(green_border_style)
-        
-        # If we're already connected, change the button text and style
-        if hasattr(self, 'data_collection_controller') and \
-           'arduino' in self.data_collection_controller.interfaces and \
-           self.data_collection_controller.interfaces['arduino']['connected']:
-            connect_btn.setText("Disconnect")
-            connect_btn.setStyleSheet(red_border_style)
-        
-        buttons_layout.addWidget(connect_btn)
-        arduino_layout.addLayout(buttons_layout, 3, 0, 1, 3)
-        
-        # Connect detect button - DO NOT connect to self.detect_arduino to avoid duplicates
-        def detect_arduino_ports():
-            if not hasattr(self, 'data_collection_controller'):
-                from PyQt6.QtWidgets import QMessageBox
-                QMessageBox.warning(dialog, "Arduino Detection", "Data collection controller not initialized")
-                return
-                
-            # Get available Arduino ports
-            available_ports = self.data_collection_controller.get_arduino_ports()
-            
-            # Clear the port combobox
-            port_combo.clear()
-            
-            if not available_ports:
-                port_combo.addItem("No ports found")
-                from PyQt6.QtWidgets import QMessageBox
-                QMessageBox.information(dialog, "Arduino Detection", "No Arduino devices found.")
-                return
-                
-            # Add available ports
-            for port in available_ports:
-                port_combo.addItem(port)
-                
-            # Select the first port
-            if len(available_ports) > 0:
-                port_combo.setCurrentText(available_ports[0])
-                
-            from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.information(dialog, "Arduino Detection", 
-                                   f"Found {len(available_ports)} Arduino port(s):\n{', '.join(available_ports)}")
-        
-        # ONLY connect to local function, not to self.detect_arduino
-        detect_btn.clicked.connect(detect_arduino_ports)
-        
-        # Connect connect button
-        def connect_arduino():
-            if not hasattr(self, 'data_collection_controller'):
-                from PyQt6.QtWidgets import QMessageBox
-                QMessageBox.warning(dialog, "Arduino Connection", "Data collection controller not initialized")
-                return
-                
-            # Get Arduino settings from the dialog
-            port = port_combo.currentText()
-            baud_rate = int(baud_combo.currentText())
-            
-            # Check if already connected
-            is_connected = False
-            if 'arduino' in self.data_collection_controller.interfaces and \
-               self.data_collection_controller.interfaces['arduino']['connected']:
-                is_connected = True
-                
-            if is_connected:
-                # Disconnect
-                self.data_collection_controller.disconnect_arduino()
-                connect_btn.setText("Connect")
-                connect_btn.setStyleSheet(green_border_style)
-                self.update_arduino_connected_status(False)
-                return
-            
-            # Make sure the global sampling rate is set from the sampling_rate_spinbox
-            if hasattr(self, 'sampling_rate_spinbox'):
-                sampling_rate_hz = self.sampling_rate_spinbox.value()
-                self.data_collection_controller.set_sampling_rate(sampling_rate_hz)
-                self.logger.log(f"Applied global sampling rate before connecting Arduino: {sampling_rate_hz:.2f} Hz")
-            
-            # Connect to Arduino using global sampling rate
-            success = self.data_collection_controller.connect_arduino(port, baud_rate)
-            
-            # Update UI based on connection result
-            if success:
-                connect_btn.setText("Disconnect")
-                connect_btn.setStyleSheet(red_border_style)
-                # Save settings
-                self.settings.setValue("arduino_port", port)
-                self.settings.setValue("arduino_baud", baud_rate)
-                self.settings.setValue("arduino_auto_connect", "true" if auto_connect_checkbox.isChecked() else "false")
-                
-                # Update main window UI with values from the dialog
-                if hasattr(self, 'arduino_port'):
-                    self.arduino_port.setCurrentText(port)
-                if hasattr(self, 'arduino_baud'):
-                    self.arduino_baud.setCurrentText(str(baud_rate))
-            else:
-                from PyQt6.QtWidgets import QMessageBox
-                QMessageBox.warning(dialog, "Arduino Connection", 
-                                  "Failed to connect to Arduino. Check the port and settings.")
-                self.update_arduino_connected_status(False)
-        
-        connect_btn.clicked.connect(connect_arduino)
-        
-        # Add Arduino group to main layout FIRST
-        layout.addWidget(arduino_group)
-        
-        # --- HOW-TO BOX AND EXAMPLES (Placed AFTER Arduino settings) ---
-        howto_text = (
-            '<b>How to use Arduino with Artefakt DAQ:</b><br>'
-            '<ul>'
-            '<li>Upload the provided Arduino example code to your Arduino board.</li>'
-            '<li>Connect the Arduino to your PC via USB and select the correct port and baud rate.</li>'
-            '<li>The Arduino code must:</li>'
-            '<ul>'
-            '<li>Send sensor data to the PC via Serial (e.g., <code>Serial.println()</code>).</li>'
-            '<li>Respond to commands from the PC (e.g., via <code>Serial.readStringUntil()</code>).</li>'
-            '<li>Optionally, communicate with other Arduinos via I2C if using master/slave setup.</li>'
-            '</ul>'
-            '<li>See the example codes for a template you can adapt for your sensors.</li>'
-            '</ul>'
-            '<b>Example code files:</b> <br>'
-            '1. <code>Arduino_Master.ino</code>: Master device, reads sensors, sends data to PC.<br>'
-            '2. <code>Arduino_Slave_with_K-Type.ino</code>: Slave device, reads K-Type thermocouple, responds to I2C requests.'
-        )
-        howto_box = QTextEdit()
-        howto_box.setReadOnly(True)
-        howto_box.setHtml(howto_text)
-        howto_box.setMinimumHeight(170)
-        layout.addWidget(howto_box) # Use addWidget instead of insertWidget
-
-        # --- BUTTONS TO VIEW EXAMPLES (Placed AFTER HowTo box) ---
-        def show_code_dialog(title, file_path):
-            code_dialog = QDialog(dialog)
-            code_dialog.setWindowTitle(title)
-            code_dialog.setMinimumSize(700, 500)
-            code_dialog.setStyleSheet(DialogStyles.dark_dialog())
-            vbox = QVBoxLayout(code_dialog)
-            code_edit = QTextEdit()
-            code_edit.setReadOnly(True)
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    code = f.read()
-            except Exception as e:
-                code = f"Could not load file: {file_path}\n\nError: {e}"
-            code_edit.setPlainText(code)
-            vbox.addWidget(code_edit)
-            close_btn = QPushButton('Close')
-            close_btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
-            close_btn.clicked.connect(code_dialog.accept)
-            vbox.addWidget(close_btn)
-            code_dialog.exec()
-
-        # Use absolute paths to ensure correct loading
-        master_path = str(pathlib.Path('Arduino example code/Arduino_Master/Arduino_Master.ino').absolute())
-        slave_path = str(pathlib.Path('Arduino example code/Arduino_Slave_with_K-Type/Arduino_Slave_with_K-Type.ino').absolute())
-        btn_layout = QHBoxLayout()
-        btn_master = QPushButton('View Master Example')
-        btn_master.setStyleSheet(ButtonStyles.get("secondary", "medium"))
-        btn_slave = QPushButton('View Slave Example')
-        btn_slave.setStyleSheet(ButtonStyles.get("secondary", "medium"))
-        btn_layout.addWidget(btn_master)
-        btn_layout.addWidget(btn_slave)
-        layout.addLayout(btn_layout) # Use addLayout instead of insertLayout
-        btn_master.clicked.connect(lambda: show_code_dialog('Arduino_Master.ino', master_path))
-        btn_slave.clicked.connect(lambda: show_code_dialog('Arduino_Slave_with_K-Type.ino', slave_path))
-        
-        # Add close button at the bottom
-        button_layout = QHBoxLayout()
-        close_btn = QPushButton("Close")
-        close_btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
-        button_layout.addWidget(close_btn)
-        layout.addLayout(button_layout)
-        
-        # Connect buttons
-        close_btn.clicked.connect(dialog.reject)
-        
-        # Show dialog
-        dialog.exec()
-        
-    def show_mqtt_settings_popup(self):
-        """Show MQTT settings in a popup dialog"""
-        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QGroupBox, QFormLayout, QLineEdit, QPushButton, QLabel, QMessageBox, QHBoxLayout
-        from PyQt6.QtCore import Qt
-        import time
-        
-        dialog = QDialog(self)
-        dialog.setWindowTitle("MQTT Settings")
-        dialog.setMinimumWidth(400)
-        dialog.setStyleSheet(DialogStyles.dark_dialog())
-        
-        layout = QVBoxLayout(dialog)
-        
-        # MQTT Settings Group
-        mqtt_group = QGroupBox("MQTT Broker Settings")
-        mqtt_group.setStyleSheet(GroupBoxStyles.default())
-        form_layout = QFormLayout(mqtt_group)
-        
-        broker_input = QLineEdit()
-        broker_input.setPlaceholderText("e.g. localhost or 192.168.1.100")
-        
-        port_input = QLineEdit()
-        port_input.setPlaceholderText("1883")
-        port_input.setText("1883")
-        
-        client_id_input = QLineEdit()
-        client_id_input.setText(f"ArtefaktDAQ_{int(time.time())}")
-        
-        username_input = QLineEdit()
-        password_input = QLineEdit()
-        password_input.setEchoMode(QLineEdit.EchoMode.Password)
-        
-        # Load existing settings if available
-        if hasattr(self, 'data_collection_controller'):
-            mqtt_info = self.data_collection_controller.interfaces.get('mqtt', {})
-            if mqtt_info.get('broker'):
-                broker_input.setText(mqtt_info.get('broker'))
-            if mqtt_info.get('port'):
-                port_input.setText(str(mqtt_info.get('port')))
-            if mqtt_info.get('client_id'):
-                client_id_input.setText(mqtt_info.get('client_id'))
-        
-        form_layout.addRow("Broker:", broker_input)
-        form_layout.addRow("Port:", port_input)
-        form_layout.addRow("Client ID:", client_id_input)
-        form_layout.addRow("Username:", username_input)
-        form_layout.addRow("Password:", password_input)
-        
-        layout.addWidget(mqtt_group)
-        
-        # Connect Button
-        connect_btn = QPushButton("Connect")
-        connect_btn.setFixedHeight(40)
-        
-        # Use theme system for button styles
-        green_border_style = ConnectionStyles.connected()
-        red_border_style = ConnectionStyles.disconnected()
-        
-        # Update button state if already connected
-        is_connected = False
-        if hasattr(self, 'data_collection_controller'):
-            is_connected = self.data_collection_controller.interfaces.get('mqtt', {}).get('connected', False)
-            
-        if is_connected:
-            connect_btn.setText("Disconnect")
-            connect_btn.setStyleSheet(red_border_style)
-        else:
-            connect_btn.setStyleSheet(green_border_style)
-            
-        def handle_connect():
-            if not hasattr(self, 'data_collection_controller'):
-                QMessageBox.warning(dialog, "Error", "Data collection controller not ready")
-                return
-                
-            if self.data_collection_controller.interfaces.get('mqtt', {}).get('connected', False):
-                # Disconnect
-                self.data_collection_controller.disconnect_mqtt()
-                connect_btn.setText("Connect")
-                connect_btn.setStyleSheet(green_border_style)
-                self.update_mqtt_connected_status(False)
-            else:
-                # Connect
-                broker = broker_input.text().strip()
-                if not broker:
-                    QMessageBox.warning(dialog, "Missing Info", "Please enter a broker address")
-                    return
-                    
-                port_str = port_input.text().strip() or "1883"
-                try:
-                    port = int(port_str)
-                except ValueError:
-                    QMessageBox.warning(dialog, "Invalid Port", "Please enter a valid port number")
-                    return
-                    
-                client_id = client_id_input.text().strip()
-                user = username_input.text().strip() or None
-                pw = password_input.text().strip() or None
-                
-                success = self.data_collection_controller.connect_mqtt(
-                    broker=broker,
-                    port=port,
-                    client_id=client_id,
-                    username=user,
-                    password=pw
-                )
-                
-                if success:
-                    connect_btn.setText("Disconnect")
-                    connect_btn.setStyleSheet(red_border_style)
-                    self.update_mqtt_connected_status(True)
-                    dialog.accept()
-                else:
-                    QMessageBox.critical(dialog, "Connection Failed", "Could not connect to MQTT broker. Check settings and availability.")
-        
-        connect_btn.clicked.connect(handle_connect)
-        layout.addWidget(connect_btn)
-        
-        # Help Info
-        help_label = QLabel("<b>Tip:</b> Once connected, add sensors with interface type 'MQTT' and set the 'Port' to the MQTT topic name.")
-        help_label.setWordWrap(True)
-        help_label.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 10px; margin-top: 10px;")
-        layout.addWidget(help_label)
-        
-        # Add close button
-        button_layout = QHBoxLayout()
-        close_btn = QPushButton("Close")
-        close_btn.setStyleSheet(ButtonStyles.get("secondary", "medium"))
-        close_btn.clicked.connect(dialog.reject)
-        button_layout.addWidget(close_btn)
-        layout.addLayout(button_layout)
-        
-        dialog.setLayout(layout)
-        dialog.exec()
-
-    def show_labjack_settings_popup(self):
-        """Show LabJack settings in a popup dialog"""
-        print("=== Opening LabJack Settings Popup Dialog ===")
-        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QGridLayout, QLabel, 
-                                    QComboBox, QPushButton, QGroupBox, QHBoxLayout,
-                                    QSpinBox, QDoubleSpinBox, QCheckBox, QTextEdit,
-                                    QApplication) # <<< ADDED QApplication import
-        from PyQt6.QtCore import Qt
-        
-        # Define button styles using theme system
-        green_border_style = ConnectionStyles.connected()
-        red_border_style = ConnectionStyles.disconnected()
-        
-        # Create dialog
-        dialog = QDialog(self)
-        dialog.setWindowTitle("LabJack Settings")
-        dialog.setMinimumWidth(400)
-        dialog.setMinimumHeight(400)
-        dialog.setStyleSheet(DialogStyles.dark_dialog())
-        
-        # Main layout
-        layout = QVBoxLayout(dialog)
-        
-        # Create a group box for LabJack settings
-        connection_group = QGroupBox("Connection Settings")
-        connection_group.setStyleSheet(GroupBoxStyles.default())
-        connection_layout = QGridLayout(connection_group)
-        
-        # Device Type
-        connection_layout.addWidget(QLabel("Device Type:"), 0, 0)
-        device_type = QComboBox()
-        device_type.addItems(["U3", "U6", "T7", "UE9"])
-        if hasattr(self, 'labjack_type'):
-            device_type.setCurrentText(self.labjack_type.currentText())
-        else:
-            device_type.setCurrentText(self.settings.value("labjack_type", "U3"))
-        connection_layout.addWidget(device_type, 0, 1)
-
-        # Status label and value
-        status_label = QLabel("Status:")
-        connection_layout.addWidget(status_label, 1, 0)
-        status_value = QLabel("Not Connected")
-        if hasattr(self, 'sensor_controller') and \
-           hasattr(self.sensor_controller, 'labjack') and \
-           self.sensor_controller.labjack is not None:
-            status_value.setText("Connected")
-            status_value.setStyleSheet("color: green; font-weight: bold;")
-        else:
-            status_value.setStyleSheet("color: gray; font-weight: bold;")
-        connection_layout.addWidget(status_value, 1, 1)
-
-        # Auto-connect at program start checkbox
-        auto_connect_checkbox = QCheckBox("Auto-connect at program start")
-        auto_connect_checkbox.setChecked(self.settings.value("labjack_auto_connect", "false") == "true")
-        connection_layout.addWidget(auto_connect_checkbox, 2, 0, 1, 3)
-
-        # Connect Button
-        connect_btn = QPushButton("Connect")
-        connect_btn.setStyleSheet(green_border_style)
-        connection_layout.addWidget(connect_btn, 3, 2)
-
-        # Test Button
-        test_btn = QPushButton("Test")
-        connection_layout.addWidget(test_btn, 4, 2)
-        
-        # Add connection group to main layout
-        layout.addWidget(connection_group)
-        
-        # Channel configuration group
-        channel_group = QGroupBox("Acquisition Settings")
-        channel_group.setStyleSheet(GroupBoxStyles.default())
-        channel_layout = QGridLayout(channel_group)
-        
-        # Internal Sampling Rate (Hardware Polling Rate)
-        channel_layout.addWidget(QLabel("Internal Sampling Rate (Hz):"), 0, 0)
-        internal_rate = QDoubleSpinBox()
-        internal_rate.setRange(1.0, 5000.0)
-        internal_rate.setSingleStep(10.0)
-        internal_rate.setValue(float(self.settings.value("labjack_internal_rate", "100.0")))
-        internal_rate.setToolTip("Hardware polling frequency. Higher values allow better averaging but use more CPU.")
-        channel_layout.addWidget(internal_rate, 0, 1)
-        
-        # Use high resolution
-        high_res = QCheckBox("Use High Resolution")
-        high_res.setChecked(self.settings.value("labjack_high_res", "true") == "true")
-        channel_layout.addWidget(high_res, 1, 0, 1, 2)
-        
-        # Add channel group to main layout
-        layout.addWidget(channel_group)
-        
-        # Information section
-        info_text = QTextEdit()
-        info_text.setReadOnly(True)
-        info_text.setMaximumHeight(100)
-        
-        # Set information text
-        device_info = """
-        <b>Device Information:</b><br>
-        <i>Note: Connect to a device to see detailed information.</i>
-        """
-        
-        # --- ADDED DEBUG LOG ---
-        self.logger.log("DEBUG POPUP INIT: Checking for connected labjack...", "DEBUG")
-        has_sensor_controller = hasattr(self, 'sensor_controller')
-        has_labjack = has_sensor_controller and hasattr(self.sensor_controller, 'labjack')
-        is_labjack_not_none = has_labjack and self.sensor_controller.labjack is not None
-        self.logger.log(f"DEBUG POPUP INIT: has_sensor_controller={has_sensor_controller}, has_labjack={has_labjack}, is_labjack_not_none={is_labjack_not_none}", "DEBUG")
-        # ----------------------
-        
-        # If we're connected, get more detailed info
-        if has_sensor_controller and has_labjack and is_labjack_not_none:
-            self.logger.log("DEBUG POPUP INIT: LabJack is connected, trying to get device info", "DEBUG")
-            try:
-                # Try to get actual device info - this will vary by device type
-                # Get the numeric device type first
-                device_type_code = self.sensor_controller.get_labjack_info("device_type", -1)
-                # Translate the numeric code to a readable name
-                device_type_map = {7: "T7", 4: "T4", 3: "U3", 6: "U6", 9: "UE9"}
-                type_info = device_type_map.get(device_type_code, f"Unknown({device_type_code})")
-                
-                serial_info = self.sensor_controller.get_labjack_info("serial_number", "Unknown")
-                firmware_info = self.sensor_controller.get_labjack_info("firmware_version", "Unknown")
-                
-                self.logger.log(f"DEBUG POPUP INIT: Got device info - Type code: {device_type_code}, translated to: {type_info}, Serial: {serial_info}, Firmware: {firmware_info}", "DEBUG")
-                
-                device_info = """
-                <b>Device Information:</b><br>
-                Type: {}<br>
-                Serial Number: {}<br>
-                Firmware Version: {}<br>
-                """.format(type_info, serial_info, firmware_info)
-                
-                self.logger.log(f"DEBUG POPUP INIT: Formatted HTML: {device_info}", "DEBUG")
-            except Exception as e:
-                self.logger.log(f"DEBUG POPUP INIT: Error getting device info: {str(e)}", "ERROR")
-                import traceback
-                self.logger.log(traceback.format_exc(), "ERROR")
-        else:
-            self.logger.log("DEBUG POPUP INIT: LabJack is not connected, using default info text", "DEBUG")
-            
-        self.logger.log("DEBUG POPUP INIT: Setting HTML for info_text", "DEBUG")
-        info_text.setHtml(device_info)
-        QApplication.processEvents()  # Force UI update
-        self.logger.log("DEBUG POPUP INIT: Finished setting up info_text", "DEBUG")
-        layout.addWidget(info_text)
-        
-        # Add buttons at the bottom
-        button_layout = QHBoxLayout()
-        save_btn = QPushButton("Save Settings")
-        close_btn = QPushButton("Close")
-        
-        button_layout.addWidget(save_btn)
-        button_layout.addWidget(close_btn)
-        layout.addLayout(button_layout)
-        
-        # If we're already connected, change the button text and style
-        if hasattr(self, 'sensor_controller') and \
-           hasattr(self.sensor_controller, 'labjack') and \
-           self.sensor_controller.labjack is not None:
-            connect_btn.setText("Disconnect")
-            connect_btn.setStyleSheet(red_border_style)
-        
-        # Connect buttons
-        close_btn.clicked.connect(dialog.reject)
-        
-        # Connect save button
-        def save_settings():
-            # Save settings
-            device_type_value = device_type.currentText()
-            internal_rate_value = internal_rate.value()
-            self.settings.setValue("labjack_type", device_type_value)
-            self.settings.setValue("labjack_internal_rate", str(internal_rate_value))
-            self.settings.setValue("labjack_high_res", "true" if high_res.isChecked() else "false")
-            self.settings.setValue("labjack_auto_connect", "true" if auto_connect_checkbox.isChecked() else "false")
-            
-            # Update main window UI if applicable
-            if hasattr(self, 'labjack_type'):
-                self.labjack_type.setCurrentText(device_type_value)
-            
-            # Apply internal sampling rate to interface if connected
-            if hasattr(self, 'sensor_controller') and self.sensor_controller.labjack_interface:
-                self.sensor_controller.labjack_interface.set_sampling_rate(internal_rate_value)
-                
-            # Show confirmation dialog
-            from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.information(dialog, "Settings Saved", 
-                                  f"LabJack settings have been saved.\n\n"
-                                  f"Device type: {device_type_value}\n"
-                                  f"Internal Rate: {internal_rate_value} Hz\n"
-                                  f"HighRes: {'Enabled' if high_res.isChecked() else 'Disabled'}\n"
-                                  f"Auto-connect: {'Enabled' if auto_connect_checkbox.isChecked() else 'Disabled'}\n\n"
-                                  f"NOTE: If you changed the Internal Rate, you must disconnect and reconnect the LabJack for it to take effect.")
-        
-        save_btn.clicked.connect(save_settings)
-        
-        # Define connect action function
-        def connect_labjack():
-            self.logger.log("DEBUG POPUP: connect_labjack function called", "DEBUG")
-            
-            # Update the main window UI with values from the dialog
-            internal_rate_value = internal_rate.value()
-            self.settings.setValue("labjack_type", device_type.currentText())
-            self.settings.setValue("labjack_internal_rate", str(internal_rate_value))
-            self.settings.setValue("labjack_auto_connect", "true" if auto_connect_checkbox.isChecked() else "false")
-            self.logger.log(f"Saved LabJack device type: {device_type.currentText()} and internal rate: {internal_rate_value} Hz")
-            
-            # Determine desired action based on button text
-            action = connect_btn.text() # "Connect" or "Disconnect"
-            
-            if action == "Disconnect":
-                # Attempt to disconnect
-                self.logger.log("DEBUG POPUP: Attempting disconnect...", "DEBUG")
-                success = self.sensor_controller.disconnect_labjack()
-                if success:
-                    connect_btn.setText("Connect")
-                    connect_btn.setStyleSheet(green_border_style)
-                    status_value.setText("Not Connected")
-                    status_value.setStyleSheet("color: gray; font-weight: bold;")
-                    # Clear info box on disconnect
-                    info_text.setHtml("<b>Device Information:</b><br><i>Not connected</i>")
-                else:
-                    self.logger.log("DEBUG POPUP: Disconnect failed.", "WARN")
-                return # Done with disconnect action
-            
-            # --- If action is "Connect" --- 
-            self.logger.log("DEBUG POPUP: Attempting connect...", "DEBUG")
-            
-            # Make sure the global sampling rate is set from the sampling_rate_spinbox
-            if hasattr(self, 'sampling_rate_spinbox') and hasattr(self, 'data_collection_controller'):
-                sampling_rate_hz = self.sampling_rate_spinbox.value()
-                self.data_collection_controller.set_sampling_rate(sampling_rate_hz)
-                self.logger.log(f"Applied global sampling rate before connecting LabJack: {sampling_rate_hz:.2f} Hz")
-            
-            # Attempt to connect to LabJack
-            success = self.sensor_controller.connect_labjack(
-                device_identifier="ANY"  # Use ANY to auto-detect instead of specific device type
-            )
-            
-            # Update UI based on connection result (success or failure)
-            if success:
-                self.logger.log("DEBUG POPUP: Connection successful, updating UI.", "DEBUG")
-                
-                connect_btn.setText("Disconnect")
-                connect_btn.setStyleSheet(red_border_style)
-                status_value.setText("Connected")
-                status_value.setStyleSheet("color: green; font-weight: bold;")
-                
-                # --- Update device info box --- 
-                try:
-                    # Get info using the controller's method
-                    # Get the numeric device type first
-                    device_type_code = self.sensor_controller.get_labjack_info("device_type", -1)
-                    # Translate the numeric code to a readable name
-                    device_type_map = {7: "T7", 4: "T4", 3: "U3", 6: "U6", 9: "UE9"}
-                    type_info = device_type_map.get(device_type_code, f"Unknown({device_type_code})")
-                    
-                    serial_info = self.sensor_controller.get_labjack_info("serial_number", "Unknown")
-                    firmware_info = self.sensor_controller.get_labjack_info("firmware_version", "Unknown")
-                    
-                    # Debug log the retrieved info
-                    self.logger.log(f"DEBUG POPUP: Retrieved info - Type code: {device_type_code}, translated to: {type_info}, Serial: {serial_info}, FW: {firmware_info}", "DEBUG")
-                    
-                    device_info = """
-                    <b>Device Information:</b><br>
-                    Type: {}<br>
-                    Serial Number: {}<br>
-                    Firmware Version: {}<br>
-                    """.format(type_info, serial_info, firmware_info)
-                    
-                    info_text.setHtml(device_info)
-                    self.logger.log("DEBUG POPUP: Updated info_text successfully.", "DEBUG")
-                    QApplication.processEvents() # Force UI update
-                except Exception as e:
-                    self.logger.log(f"DEBUG POPUP: Error updating device info text: {str(e)}", "ERROR")
-                    import traceback
-                    self.logger.log(traceback.format_exc(), "ERROR")
-                    info_text.setHtml("<b>Device Information:</b><br><i>Error retrieving info</i>") # Show error in box
-            else:
-                self.logger.log("DEBUG POPUP: Connection failed.", "WARN")
-                connect_btn.setText("Connect") # Ensure button says Connect on failure
-                connect_btn.setStyleSheet(green_border_style)
-                status_value.setText("Connection Failed")
-                status_value.setStyleSheet("color: red; font-weight: bold;")
-                info_text.setHtml("<b>Device Information:</b><br><i>Connection failed</i>") # Show failure in box
-        
-        # Explicitly connect the button click signal to our function
-        connect_btn.clicked.connect(connect_labjack)
-        self.logger.log("DEBUG POPUP: Connected button click signal to connect_labjack function", "DEBUG")
-        
-        # Connect test button
-        def test_labjack_connection():
-            # Use sensor controller to test LabJack connection
-            if hasattr(self, 'sensor_controller'):
-                self.sensor_controller.test_labjack()
-        
-        test_btn.clicked.connect(test_labjack_connection)
-        
-        # --- ADDED DEBUG --- 
-        print(f"DEBUG POPUP: Is connect_labjack callable? {callable(connect_labjack)}")
-        # -------------------
-        
-        # Show dialog
-        dialog.exec()
-        
-    def apply_camera_focus_exposure(self):
-        """Apply camera focus and exposure settings"""
-        # Check if the camera controller exists
-        if not hasattr(self, 'camera_controller') or not self.camera_controller.is_connected:
-            self.logger.log("Cannot apply camera settings: camera not connected", "WARN")
+        """Show Arduino settings in a popup dialog (Harmonized)"""
+        InterfaceRegistry.initialize()
+        interface_class = InterfaceRegistry.get_interface_class("Arduino")
+        if not interface_class:
+            QMessageBox.critical(self, "Error", "Arduino interface not found in registry.")
             return
             
-        try:
-            # Check if the UI elements exist
-            if not hasattr(self, 'camera_tab_manual_focus') or not hasattr(self, 'camera_tab_focus_slider') or \
-               not hasattr(self, 'camera_tab_manual_exposure') or not hasattr(self, 'camera_tab_exposure_slider'):
-                self.logger.log("Camera UI elements not found", "WARN")
-                return
+        # Get current config
+        config = {
+            "port": self.settings.value("arduino_port", "COM3"),
+            "baud_rate": str(self.settings.value("arduino_baud", "9600")),
+            "mode": self.settings.value("arduino_mode", "polled"),
+            "poll_interval": float(self.settings.value("arduino_poll_interval", "1.0")),
+            "auto_connect": self.settings.value("arduino_auto_connect", "false") == "true",
+            "enabled": self.settings.value("arduino_enabled", "true") == "true"
+        }
+        
+        instance = None
+        if hasattr(self, 'data_collection_controller'):
+            instance = self.data_collection_controller.arduino_thread
+            
+        dialog = InterfaceConfigDialog(self, interface_class=interface_class, interface_instance=instance, config=config)
+        dialog.connection_status_changed.connect(self.update_device_connection_status_ui)
+        
+        # Add the existing help text to the dialog if it exists in the interface
+        if not hasattr(interface_class, "HELP_TEXT"):
+            interface_class.HELP_TEXT = """
+            <h3>Arduino Interface</h3>
+            <p>Handles communication with Arduino devices over Serial.</p>
+            <p><b>How to use:</b></p>
+            <ol>
+                <li>Upload the provided Arduino example code to your board.</li>
+                <li>Connect via USB and select the correct COM port and baud rate.</li>
+                <li>Data format: <code>SensorName1:value;SensorName2:value;...</code></li>
+            </ol>
+            """
+            
+        if dialog.exec():
+            new_config = dialog.get_config()
+            
+            # Save settings
+            self.settings.setValue("arduino_port", new_config.get("port"))
+            self.settings.setValue("arduino_baud", new_config.get("baud_rate"))
+            self.settings.setValue("arduino_mode", new_config.get("mode"))
+            self.settings.setValue("arduino_poll_interval", str(new_config.get("poll_interval")))
+            self.settings.setValue("arduino_auto_connect", "true" if new_config.get("auto_connect") else "false")
+            self.settings.setValue("arduino_enabled", "true" if new_config.get("enabled") else "false")
+            
+            # Update instance if it exists
+            if instance:
+                instance.port = new_config.get("port")
+                try:
+                    instance.baud_rate = int(new_config.get("baud_rate"))
+                except (ValueError, TypeError):
+                    pass
+                instance.mode = new_config.get("mode")
+                try:
+                    instance.poll_interval = float(new_config.get("poll_interval"))
+                except (ValueError, TypeError):
+                    pass
+            
+            # Update UI elements in main window if they exist
+            if hasattr(self, 'arduino_port'):
+                self.arduino_port.setCurrentText(new_config.get("port"))
+            if hasattr(self, 'arduino_baud'):
+                self.arduino_baud.setCurrentText(new_config.get("baud_rate"))
                 
-            # Get focus and exposure settings from the camera tab controls
-            manual_focus = self.camera_tab_manual_focus.isChecked()
-            focus_value = self.camera_tab_focus_slider.value()
-            manual_exposure = self.camera_tab_manual_exposure.isChecked()
-            exposure_value = self.camera_tab_exposure_slider.value()
+            self.logger.log(f"Arduino settings updated: Port={new_config.get('port')}, Baud={new_config.get('baud_rate')}", "INFO")
+
+    def show_mqtt_settings_popup(self):
+        """Show MQTT settings in a popup dialog (Harmonized)"""
+        InterfaceRegistry.initialize()
+        interface_class = InterfaceRegistry.get_interface_class("MQTT")
+        if not interface_class:
+            QMessageBox.critical(self, "Error", "MQTT interface not found in registry.")
+            return
             
-            # Update slider enabled states
-            self.camera_tab_focus_slider.setEnabled(manual_focus)
-            self.camera_tab_exposure_slider.setEnabled(manual_exposure)
+        # Get current config
+        config = {
+            "broker": self.settings.value("mqtt_broker", "localhost"),
+            "port": int(self.settings.value("mqtt_port", 1883)),
+            "client_id": self.settings.value("mqtt_client_id", f"ArtefaktDAQ_{int(time.time())}"),
+            "username": self.settings.value("mqtt_username", ""),
+            "password": self.settings.value("mqtt_password", ""),
+            "auto_connect": self.settings.value("mqtt_auto_connect", "false") == "true",
+            "enabled": self.settings.value("mqtt_enabled", "true") == "true"
+        }
+        
+        instance = None
+        if hasattr(self, 'data_collection_controller'):
+            if hasattr(self.data_collection_controller, 'mqtt_thread'):
+                instance = self.data_collection_controller.mqtt_thread
             
-            # Save to settings
-            self.settings.setValue("camera/manual_focus", "true" if manual_focus else "false")
-            self.settings.setValue("camera/focus_value", str(focus_value))
-            self.settings.setValue("camera/manual_exposure", "true" if manual_exposure else "false")
-            self.settings.setValue("camera/exposure_value", str(exposure_value))
+        dialog = InterfaceConfigDialog(self, interface_class=interface_class, interface_instance=instance, config=config)
+        dialog.connection_status_changed.connect(self.update_device_connection_status_ui)
+        
+        if not hasattr(interface_class, "HELP_TEXT"):
+            interface_class.HELP_TEXT = """
+            <h3>MQTT Interface</h3>
+            <p>Connects to an MQTT broker to receive sensor data.</p>
+            <p><b>How to use:</b></p>
+            <ol>
+                <li>Enter your broker address and port.</li>
+                <li>Set a unique Client ID.</li>
+                <li>Add sensors with interface type 'MQTT' and set the 'Topic' as the sensor name/port.</li>
+            </ol>
+            """
             
-            # Apply settings to camera directly
-            if self.camera_controller and self.camera_controller.camera_thread:
-                if hasattr(self.camera_controller.camera_thread, 'set_camera_properties'):
-                    self.camera_controller.camera_thread.set_camera_properties(
-                        manual_focus=manual_focus,
-                        focus_value=focus_value,
-                        manual_exposure=manual_exposure,
-                        exposure_value=exposure_value
-                    )
-                else:
-                    # Fallback for direct camera manipulation
-                    import cv2
-                    if hasattr(self.camera_controller.camera_thread, 'cap') and self.camera_controller.camera_thread.cap:
-                        if manual_focus:
-                            self.camera_controller.camera_thread.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)  # Disable autofocus
-                            self.camera_controller.camera_thread.cap.set(cv2.CAP_PROP_FOCUS, focus_value)
-                        else:
-                            self.camera_controller.camera_thread.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)  # Enable autofocus
-                        
-                        if manual_exposure:
-                            self.camera_controller.camera_thread.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Magic value for manual
-                            self.camera_controller.camera_thread.cap.set(cv2.CAP_PROP_EXPOSURE, exposure_value)
-                        else:
-                            self.camera_controller.camera_thread.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)  # Magic value for auto
+        if dialog.exec():
+            new_config = dialog.get_config()
             
-        except Exception as e:
-            self.logger.log(f"Error applying camera focus/exposure: {str(e)}", "ERROR")
-            import traceback
-            traceback.print_exc()
+            # Save settings
+            self.settings.setValue("mqtt_broker", new_config.get("broker"))
+            self.settings.setValue("mqtt_port", new_config.get("port"))
+            self.settings.setValue("mqtt_client_id", new_config.get("client_id"))
+            self.settings.setValue("mqtt_username", new_config.get("username"))
+            self.settings.setValue("mqtt_password", new_config.get("password"))
+            self.settings.setValue("mqtt_auto_connect", "true" if new_config.get("auto_connect") else "false")
+            self.settings.setValue("mqtt_enabled", "true" if new_config.get("enabled") else "false")
             
+            self.logger.log(f"MQTT settings updated: Broker={new_config.get('broker')}", "INFO")
+
+    def show_labjack_settings_popup(self):
+        """Show LabJack settings in a popup dialog (Harmonized)"""
+        InterfaceRegistry.initialize()
+        interface_class = InterfaceRegistry.get_interface_class("LabJack")
+        if not interface_class:
+            QMessageBox.critical(self, "Error", "LabJack interface not found in registry.")
+            return
+            
+        # Get current config
+        labjack_rate_val = self.settings.value("labjack_internal_rate", "100.0")
+        try:
+            labjack_rate = float(labjack_rate_val) if str(labjack_rate_val).lower() != 'none' else 100.0
+        except (ValueError, TypeError):
+            labjack_rate = 100.0
+
+        config = {
+            "device_type": self.settings.value("labjack_type", "T7"),
+            "connection_type": self.settings.value("labjack_connection", "ANY"),
+            "port": self.settings.value("labjack_port", "ANY"),
+            "auto_reconnect": self.settings.value("labjack_auto_reconnect", "false") == "true",
+            "sampling_rate": labjack_rate,
+            "auto_connect": self.settings.value("labjack_auto_connect", "false") == "true",
+            "enabled": self.settings.value("labjack_enabled", "true") == "true"
+        }
+        
+        instance = None
+        if hasattr(self, 'data_collection_controller'):
+            # First try the thread object which always contains the interface instance
+            if hasattr(self.data_collection_controller, 'labjack_thread'):
+                instance = self.data_collection_controller.labjack_thread
+            # Fallback to the interfaces dictionary
+            if not instance:
+                instance = self.data_collection_controller.interfaces.get('labjack', {}).get('interface')
+            
+        dialog = InterfaceConfigDialog(self, interface_class=interface_class, interface_instance=instance, config=config)
+        dialog.connection_status_changed.connect(self.update_device_connection_status_ui)
+        
+        if not hasattr(interface_class, "HELP_TEXT"):
+            interface_class.HELP_TEXT = """
+            <h3>LabJack Interface</h3>
+            <p>Handles communication with LabJack T-series devices (T4, T7).</p>
+            <p><b>How to use:</b></p>
+            <ol>
+                <li>Select your device type (T4, T7, or ANY).</li>
+                <li>Select connection type (USB, TCP, etc.).</li>
+                <li>Set the identifier (Serial Number or IP address) or use 'ANY'.</li>
+                <li>Once connected, AIN0-AIN3 and any configured EF channels will be available.</li>
+            </ol>
+            """
+            
+        if dialog.exec():
+            new_config = dialog.get_config()
+            
+            # Save settings
+            self.settings.setValue("labjack_type", new_config.get("device_type"))
+            self.settings.setValue("labjack_connection", new_config.get("connection_type"))
+            self.settings.setValue("labjack_port", new_config.get("port"))
+            self.settings.setValue("labjack_auto_reconnect", "true" if new_config.get("auto_reconnect") else "false")
+            self.settings.setValue("labjack_internal_rate", str(new_config.get("sampling_rate")))
+            self.settings.setValue("labjack_auto_connect", "true" if new_config.get("auto_connect") else "false")
+            self.settings.setValue("labjack_enabled", "true" if new_config.get("enabled") else "false")
+            
+            # Update internal rate if instance exists
+            if instance and hasattr(instance, 'set_sampling_rate'):
+                instance.set_sampling_rate(new_config.get("sampling_rate"))
+                
+            self.logger.log(f"LabJack settings updated: Type={new_config.get('device_type')}, Rate={new_config.get('sampling_rate')}", "INFO")
+
+    def apply_camera_focus_exposure(self):
+        """DEPRECATED: Now handled in camera_controller.py"""
+        pass
+
     def update_focus_value_label(self):
-        """Update the focus value label when the slider changes"""
-        if hasattr(self, 'camera_tab_focus_slider') and hasattr(self, 'camera_tab_focus_value'):
-            value = self.camera_tab_focus_slider.value()
-            self.camera_tab_focus_value.setText(str(value))
-    
+        """DEPRECATED: Now handled in camera_controller.py"""
+        pass
+
     def update_exposure_value_label(self):
-        """Update the exposure value label when the slider changes"""
-        if hasattr(self, 'camera_tab_exposure_slider') and hasattr(self, 'camera_tab_exposure_value'):
-            value = self.camera_tab_exposure_slider.value()
-            self.camera_tab_exposure_value.setText(str(value))
+        """DEPRECATED: Now handled in camera_controller.py"""
+        pass
         
     def show_camera_settings_popup(self):
         """Show camera settings in a popup dialog"""
@@ -3741,289 +3309,193 @@ class DAQApp(QMainWindow):
         # Create right column
         right_column = QVBoxLayout()
         
-        # Create camera parameters group
-        camera_settings_group = QGroupBox("Camera Parameters")
-        camera_settings_group.setStyleSheet(GroupBoxStyles.default())
-        camera_settings_layout = QGridLayout(camera_settings_group)
-        
-        # Resolution selection
-        camera_settings_layout.addWidget(QLabel("Resolution:"), 0, 0)
-        camera_resolution = QComboBox()
-        camera_resolution.addItems(["640x480", "800x600", "1280x720", "1920x1080"])
-        camera_resolution.setCurrentText(self.settings.value("camera/resolution", "1280x720"))
-        camera_settings_layout.addWidget(camera_resolution, 0, 1)
-        
-        # Framerate selection
-        camera_settings_layout.addWidget(QLabel("Framerate:"), 1, 0)
-        camera_framerate = QComboBox()
-        camera_framerate.addItems(["15", "30", "60"])
-        camera_framerate.setCurrentText(self.settings.value("camera/fps", "30"))
-        camera_settings_layout.addWidget(camera_framerate, 1, 1)
-        
-        # Set values from existing camera resolution and framerate
-        if hasattr(self, 'camera_resolution'):
-            camera_resolution.setCurrentText(self.camera_resolution.currentText())
-        if hasattr(self, 'camera_framerate'):
-            camera_framerate.setCurrentText(self.camera_framerate.currentText())
-        
-        # Add camera parameters group to left column
-        left_column.addWidget(camera_settings_group)
-        
-        # Recording settings group
-        recording_settings_group = QGroupBox("Recording Settings")
+        # --- Group 1: Global Recording Settings ---
+        recording_settings_group = QGroupBox("Global Recording Settings")
         recording_settings_group.setStyleSheet(GroupBoxStyles.default())
         recording_settings_layout = QGridLayout(recording_settings_group)
-        
-        # Auto-record on start
-        auto_record = QCheckBox("Auto-record when started")
-        auto_record.setChecked(self.settings.value("auto_record", "false") == "true")
-        recording_settings_layout.addWidget(auto_record, 0, 0, 1, 2)
-        
-        # Start camera on start
-        start_camera_on_start = QCheckBox("Start camera on start")
-        start_camera_on_start.setChecked(self.settings.value("start_camera_on_start", "false") == "true")
-        recording_settings_layout.addWidget(start_camera_on_start, 1, 0, 1, 2)
         
         # Include overlays in recording
         record_with_overlays = QCheckBox("Include overlays in recording")
         record_with_overlays.setChecked(self.settings.value("record_with_overlays", "true") == "true")
-        recording_settings_layout.addWidget(record_with_overlays, 2, 0, 1, 2)
+        recording_settings_layout.addWidget(record_with_overlays, 0, 0, 1, 2)
         
-        # Record audio
-        record_audio = QCheckBox("Record audio (microphone)")
-        record_audio.setChecked(self.settings_model.get_bool("record_audio", True))
-        recording_settings_layout.addWidget(record_audio, 3, 0, 1, 2)
+        # Video Quality slider
+        recording_settings_layout.addWidget(QLabel("Video Quality:"), 1, 0)
+        video_quality_slider = QSlider(Qt.Orientation.Horizontal)
+        video_quality_slider.setMinimum(20); video_quality_slider.setMaximum(100)
+        quality_value = self.settings_model.get_int("video_quality", 70)
+        video_quality_slider.setValue(quality_value)
+        video_quality_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        video_quality_slider.setTickInterval(10)
+        recording_settings_layout.addWidget(video_quality_slider, 1, 1)
         
-        # Audio source selection in popup
-        recording_settings_layout.addWidget(QLabel("Audio Source:"), 4, 0)
-        popup_audio_source = QComboBox()
-        popup_audio_source.addItem("Default Microphone", -1)
-        try:
-            devices = self.camera_controller.get_audio_devices()
-            for dev in devices:
-                popup_audio_source.addItem(dev['name'], dev['index'])
-            
-            saved_device = self.settings_model.get_int("record_audio_device", -1)
-            idx = popup_audio_source.findData(saved_device)
-            if idx != -1:
-                popup_audio_source.setCurrentIndex(idx)
-        except Exception:
-            pass
-        recording_settings_layout.addWidget(popup_audio_source, 4, 1)
-        
-        # Direct FFmpeg streaming
-        use_direct_streaming = QCheckBox("Use direct FFmpeg streaming (recommended)")
-        use_direct_streaming.setToolTip("Streams frames directly to FFmpeg instead of buffering them in memory. Requires FFmpeg to be correctly configured.")
-        use_direct_streaming.setChecked(self.settings_model.get_bool("use_direct_streaming", True))
-        recording_settings_layout.addWidget(use_direct_streaming, 5, 0, 1, 2)
-        
+        video_quality_label = QLabel(f"{quality_value}%")
+        video_quality_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        recording_settings_layout.addWidget(video_quality_label, 2, 1)
+        video_quality_slider.valueChanged.connect(lambda v: video_quality_label.setText(f"{v}%"))
+
         # Recording format
-        recording_settings_layout.addWidget(QLabel("Format:"), 6, 0)
+        recording_settings_layout.addWidget(QLabel("Format:"), 3, 0)
         recording_format = QComboBox()
         recording_format.addItems(["MP4 (H.264)", "AVI (MJPG)", "AVI (XVID)"])
         recording_format.setCurrentText(self.settings_model.get_value("recording_format", "MP4 (H.264)"))
-        recording_settings_layout.addWidget(recording_format, 6, 1)
-        
-        # Video Quality slider
-        recording_settings_layout.addWidget(QLabel("Video Quality:"), 7, 0)
-        video_quality_slider = QSlider(Qt.Orientation.Horizontal)
-        video_quality_slider.setMinimum(20)
-        video_quality_slider.setMaximum(100)
-        
-        quality_value = self.settings_model.get_int("video_quality", 70)
-        video_quality_slider.setValue(quality_value)
-        
-        video_quality_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        video_quality_slider.setTickInterval(10)
-        recording_settings_layout.addWidget(video_quality_slider, 7, 1)
-        
-        # Display current quality value
-        video_quality_label = QLabel(f"{quality_value}%")
-        video_quality_label.setAlignment(Qt.AlignmentFlag.AlignRight)
-        recording_settings_layout.addWidget(video_quality_label, 8, 1)
-        
-        # Connect quality slider to update the label
-        video_quality_slider.valueChanged.connect(lambda value: video_quality_label.setText(f"{value}%"))
-        
-        # Add recording settings group to left column
+        recording_settings_layout.addWidget(recording_format, 3, 1)
+
         left_column.addWidget(recording_settings_group)
         
-        # NDI Output Settings (moved from settings tab left column)
+        # --- Group 2: Audio Settings ---
+        audio_settings_group = QGroupBox("Global Audio Settings")
+        audio_settings_group.setStyleSheet(GroupBoxStyles.default())
+        audio_settings_layout = QGridLayout(audio_settings_group)
+        
+        # Audio controls for replay/streaming
+        audio_settings_layout.addWidget(QLabel("Media Volume:"), 0, 0)
+        media_volume = QSlider(Qt.Orientation.Horizontal)
+        media_volume.setRange(0, 100); media_volume.setValue(int(self.settings.value("media_volume", "100")))
+        audio_settings_layout.addWidget(media_volume, 0, 1)
+        
+        left_column.addWidget(audio_settings_group)
+        left_column.addStretch()
+
+        # --- Group 3: NDI Output Settings ---
         ndi_group = QGroupBox("NDI Output Settings")
         ndi_group.setStyleSheet(GroupBoxStyles.default())
         ndi_layout = QGridLayout(ndi_group)
         
-        # Enable NDI output
         enable_ndi = QCheckBox("Enable NDI Output")
         enable_ndi.setChecked(self.settings.value("enable_ndi", "false") == "true")
         ndi_layout.addWidget(enable_ndi, 0, 0, 1, 2)
         
-        # NDI Source Name
         ndi_layout.addWidget(QLabel("Source Name:"), 1, 0)
         ndi_source_name = QLineEdit(self.settings.value("ndi_source_name", "Artefakt DAQ"))
         ndi_layout.addWidget(ndi_source_name, 1, 1)
         
-        # Include overlays in NDI output
         ndi_with_overlays = QCheckBox("Include overlays in NDI output")
         ndi_with_overlays.setChecked(self.settings.value("ndi_with_overlays", "true") == "true")
         ndi_layout.addWidget(ndi_with_overlays, 2, 0, 1, 2)
         
-        # Add NDI group to left column
-        left_column.addWidget(ndi_group)
+        right_column.addWidget(ndi_group)
+
+        # --- Group 4: Performance & Hardware ---
+        perf_group = QGroupBox("Performance & Hardware")
+        perf_group.setStyleSheet(GroupBoxStyles.default())
+        perf_layout = QVBoxLayout(perf_group)
         
-        # Add stretch to push everything to the top
-        left_column.addStretch()
+        use_direct_streaming = QCheckBox("Use Direct Streaming (Required for >1 min)")
+        use_direct_streaming.setToolTip("Saves video directly to disk. Disabling this uses RAM (Burst Mode), which will crash the app for recordings longer than a minute.")
+        use_direct_streaming.setChecked(self.settings_model.get_bool("use_direct_streaming", True))
+        perf_layout.addWidget(use_direct_streaming)
         
-        # Motion detection group
-        motion_detection_group = QGroupBox("Motion Detection")
-        motion_detection_group.setStyleSheet(GroupBoxStyles.default())
-        motion_detection_layout = QVBoxLayout(motion_detection_group)
+        use_hw_accel = QCheckBox("Enable Hardware Acceleration (GPU)")
+        use_hw_accel.setToolTip("Uses your Graphics Card (Nvidia, Intel, or AMD) to reduce CPU load during recording.")
+        use_hw_accel.setChecked(self.settings_model.get_bool("use_hw_accel", True))
+        perf_layout.addWidget(use_hw_accel)
         
-        # Enable motion detection
-        motion_detection_enable = QCheckBox("Enable Motion Detection")
-        motion_detection_enable.setChecked(self.settings.value("camera/motion_detection", "false") == "true")
-        motion_detection_layout.addWidget(motion_detection_enable)
+        # Camera Auto-connect
+        camera_auto_connect = QCheckBox("Auto-connect Camera on Startup")
+        camera_auto_connect.setToolTip("Automatically connect to the selected camera source when the application starts.")
+        camera_auto_connect.setChecked(self.settings.value("camera_auto_connect", "false") == "true")
+        perf_layout.addWidget(camera_auto_connect)
         
-        # Sensitivity slider
-        motion_sensitivity_layout = QHBoxLayout()
-        motion_sensitivity_layout.addWidget(QLabel("Sensitivity:"))
-        motion_sensitivity = QSlider(Qt.Orientation.Horizontal)
-        motion_sensitivity.setMinimum(1)
-        motion_sensitivity.setMaximum(100)
-        motion_sensitivity.setValue(int(self.settings.value("camera/motion_sensitivity", "50")))
-        motion_sensitivity.setTickPosition(QSlider.TickPosition.TicksBelow)
-        motion_sensitivity.setTickInterval(10)
-        motion_sensitivity_layout.addWidget(motion_sensitivity, 1)
+        right_column.addWidget(perf_group)
         
-        # Value display for sensitivity
-        motion_sensitivity_value = QLabel(str(motion_sensitivity.value()))
-        motion_sensitivity.valueChanged.connect(lambda v: motion_sensitivity_value.setText(str(v)))
-        motion_sensitivity_value.setMinimumWidth(30)
-        motion_sensitivity_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        motion_sensitivity_layout.addWidget(motion_sensitivity_value)
-        
-        motion_detection_layout.addLayout(motion_sensitivity_layout)
-        
-        # Minimum area
-        min_area_layout = QHBoxLayout()
-        min_area_layout.addWidget(QLabel("Min Area:"))
-        motion_min_area = QSpinBox()
-        motion_min_area.setRange(100, 10000)
-        motion_min_area.setSingleStep(100)
-        motion_min_area.setValue(int(self.settings.value("camera/motion_min_area", "500")))
-        min_area_layout.addWidget(motion_min_area)
-        motion_detection_layout.addLayout(min_area_layout)
-        
-        # Add help text
-        motion_detection_help = QLabel("Motion detection can trigger automation sequences.\nHigher sensitivity detects smaller movements.")
-        motion_detection_help.setWordWrap(True)
-        motion_detection_help.setStyleSheet("font-size: 8pt; color: #888;")
-        motion_detection_layout.addWidget(motion_detection_help)
-        
-        # Set values if attributes exist
-        if hasattr(self, 'motion_detection_enable'):
-            motion_detection_enable.setChecked(self.motion_detection_enable.isChecked())
-        if hasattr(self, 'motion_detection_sensitivity'):
-            motion_sensitivity.setValue(self.motion_detection_sensitivity.value())
-        if hasattr(self, 'motion_detection_min_area'):
-            motion_min_area.setValue(self.motion_detection_min_area.value())
-        
-        # Add motion detection group to right column
-        right_column.addWidget(motion_detection_group)
-        
-        # Add stretch to right column to push everything to the top and align with left column
         right_column.addStretch()
         
         # Add both columns to the columns layout
         columns_layout.addLayout(left_column)
         columns_layout.addLayout(right_column)
         
-        # Add columns layout to main layout
         main_layout.addLayout(columns_layout)
         
         # Add buttons to save/cancel
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         button_box.accepted.connect(lambda: self.apply_camera_settings_from_popup(
-            camera_resolution.currentText(),
-            camera_framerate.currentText(),
-            motion_detection_enable.isChecked(),
-            motion_sensitivity.value(),
-            motion_min_area.value(),
-            auto_record.isChecked(),
-            start_camera_on_start.isChecked(),
             record_with_overlays.isChecked(),
-            record_audio.isChecked(),
             recording_format.currentText(),
             video_quality_slider.value(),
-            # Add NDI settings
+            media_volume.value(),
             enable_ndi.isChecked(),
             ndi_source_name.text(),
             ndi_with_overlays.isChecked(),
             use_direct_streaming.isChecked(),
-            popup_audio_source.itemData(popup_audio_source.currentIndex()),
+            use_hw_accel.isChecked(),
+            camera_auto_connect.isChecked(),
             dialog
         ))
         button_box.rejected.connect(dialog.reject)
         main_layout.addWidget(button_box)
         
-        # Show the dialog as modal
         dialog.exec()
+
+    def show_camera_config_dialog(self, slot_idx):
+        """Show a modeless dialog for camera-specific configuration"""
+        if hasattr(self, 'camera_config_dialog') and self.camera_config_dialog.isVisible():
+            self.camera_config_dialog.setWindowTitle(f"Configure Camera {slot_idx + 1}")
+            self.camera_config_dialog.raise_()
+            self.camera_config_dialog.activateWindow()
+            return
+
+        dialog = QDialog(self)
+        self.camera_config_dialog = dialog
+        dialog.setObjectName("camera_config_dialog")
+        dialog.setWindowTitle(f"Configure Camera {slot_idx + 1}")
+        dialog.setMinimumWidth(450)
+        dialog.setMinimumHeight(600)
+        dialog.setStyleSheet(DialogStyles.dark_dialog())
         
-    def apply_camera_settings_from_popup(self, resolution, framerate, motion_enabled, sensitivity, min_area, 
-                                        auto_record, start_camera_on_start, record_with_overlays, record_audio,
-                                        recording_format, video_quality, 
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(5, 5, 5, 5)
+        
+        # Move the tabs into the dialog
+        if hasattr(self, 'camera_side_tabs'):
+            # Reparent to dialog
+            self.camera_side_tabs.setParent(dialog)
+            layout.addWidget(self.camera_side_tabs)
+            self.camera_side_tabs.setVisible(True)
+            
+        def on_dialog_finished(result):
+            if hasattr(self, 'camera_side_tabs') and hasattr(self, 'camera_side_tabs_container'):
+                # Reparent back to hidden container in main window
+                self.camera_side_tabs.setParent(self.camera_side_tabs_container)
+                if self.camera_side_tabs_container.layout():
+                    self.camera_side_tabs_container.layout().addWidget(self.camera_side_tabs)
+                self.camera_side_tabs.setVisible(False)
+
+        dialog.finished.connect(on_dialog_finished)
+        
+        # Make it modeless
+        dialog.setModal(False)
+        dialog.show()
+        
+    def apply_camera_settings_from_popup(self, record_with_overlays, 
+                                        recording_format, video_quality, media_volume,
                                         enable_ndi, ndi_source_name, ndi_with_overlays,
-                                        use_direct_streaming, audio_device_index, dialog):
+                                        use_direct_streaming, use_hw_accel, 
+                                        camera_auto_connect, dialog):
         """Apply camera settings from the popup dialog"""
         # Update settings
-        self.settings.setValue("camera/resolution", resolution)
-        self.settings.setValue("camera/fps", framerate)
-        self.settings.setValue("camera/motion_detection", "true" if motion_enabled else "false")
-        self.settings.setValue("camera/motion_sensitivity", str(sensitivity))
-        self.settings.setValue("camera/motion_min_area", str(min_area))
-        
-        # Update recording settings
-        self.settings.setValue("auto_record", "true" if auto_record else "false")
-        self.settings.setValue("start_camera_on_start", "true" if start_camera_on_start else "false")
         self.settings.setValue("record_with_overlays", "true" if record_with_overlays else "false")
-        self.settings.setValue("record_audio", "true" if record_audio else "false")
-        self.settings.setValue("record_audio_device", str(audio_device_index))
         self.settings.setValue("recording_format", recording_format)
         self.settings.setValue("video_quality", str(video_quality))
+        self.settings.setValue("media_volume", str(media_volume))
         
-        # Update NDI settings
+        # Update NDI and performance settings
         self.settings.setValue("enable_ndi", "true" if enable_ndi else "false")
         self.settings.setValue("ndi_source_name", ndi_source_name)
         self.settings.setValue("ndi_with_overlays", "true" if ndi_with_overlays else "false")
         self.settings.setValue("use_direct_streaming", "true" if use_direct_streaming else "false")
+        self.settings.setValue("use_hw_accel", "true" if use_hw_accel else "false")
+        self.settings.setValue("camera_auto_connect", "true" if camera_auto_connect else "false")
 
-        # Update UI elements if they exist
-        if hasattr(self, 'camera_resolution'):
-            self.camera_resolution.setCurrentText(resolution)
-        if hasattr(self, 'camera_framerate'):
-            self.camera_framerate.setCurrentText(framerate)
-        if hasattr(self, 'motion_detection_enable'):
-            self.motion_detection_enable.setChecked(motion_enabled)
-        if hasattr(self, 'motion_detection_sensitivity'):
-            self.motion_detection_sensitivity.setValue(sensitivity)
-        if hasattr(self, 'motion_detection_min_area'):
-            self.motion_detection_min_area.setValue(min_area)
-            
-        # Update recording settings UI elements if they exist
-        if hasattr(self, 'auto_record'):
-            self.auto_record.setChecked(auto_record)
-        if hasattr(self, 'start_camera_on_start'):
-            self.start_camera_on_start.setChecked(start_camera_on_start)
+        dialog.accept()
         if hasattr(self, 'record_with_overlays'):
             self.record_with_overlays.setChecked(record_with_overlays)
-        if hasattr(self, 'record_audio'):
-            self.record_audio.setChecked(record_audio)
         if hasattr(self, 'recording_format'):
             self.recording_format.setCurrentText(recording_format)
         if hasattr(self, 'video_quality_slider'):
             self.video_quality_slider.setValue(video_quality)
             
-        # Update NDI UI elements if they exist
+        # Update UI elements if they exist
         if hasattr(self, 'enable_ndi'):
             self.enable_ndi.setChecked(enable_ndi)
         if hasattr(self, 'ndi_source_name'):
@@ -4032,18 +3504,14 @@ class DAQApp(QMainWindow):
             self.ndi_with_overlays.setChecked(ndi_with_overlays)
         if hasattr(self, 'use_direct_streaming'):
             self.use_direct_streaming.setChecked(use_direct_streaming)
+        if hasattr(self, 'use_hw_accel'):
+            self.use_hw_accel.setChecked(use_hw_accel)
             
         # Apply settings to camera controller if connected
-        if hasattr(self, 'camera_controller') and self.camera_controller.is_connected:
-            self.camera_controller.update_camera_settings(
-                motion_detection=motion_enabled,
-                motion_sensitivity=sensitivity,
-                motion_min_area=min_area
-            )
-            
-        # Initialize NDI if needed
-        if enable_ndi and hasattr(self, 'init_ndi'):
-            self.init_ndi()
+        if hasattr(self, 'camera_controller'):
+            # Trigger refresh of NDI if it changed
+            if enable_ndi:
+                self.camera_controller.init_ndi()
             
         # Close the dialog
         dialog.accept()
@@ -4174,17 +3642,31 @@ class DAQApp(QMainWindow):
                         self.graph_controller.start_live_dashboard_update(start_time)
     
     def _update_csv_virtual_sensors(self):
-        """Create or update virtual sensors based on CSV mappings."""
+        """Create, update or remove virtual sensors based on CSV mappings."""
         if not hasattr(self, 'sensor_controller'):
             return
             
-        # Collect all current CSV sensor names from mappings
+        # Collect all current CSV sensor names from mapping configs that are ENABLED
         active_csv_sensors = []
         for cfg in self.csv_configs:
+            # Check if this CSV interface is enabled
+            if not cfg.get('enabled', True):
+                continue
             for mapping in cfg.get('mappings', []):
                 active_csv_sensors.append(mapping['sensor_name'])
         
-        # Add new sensors or update existing ones
+        # 1. Remove sensors that are no longer in the active CSV configs but have interface_type="CSV"
+        sensors_to_remove = []
+        for sensor in self.sensor_controller.sensors:
+            if getattr(sensor, 'interface_type', '') == "CSV":
+                if sensor.name not in active_csv_sensors:
+                    sensors_to_remove.append(sensor)
+        
+        for sensor in sensors_to_remove:
+            print(f"DEBUG: Removing orphaned/disabled CSV sensor: {sensor.name}")
+            self.sensor_controller.sensors.remove(sensor)
+        
+        # 2. Add new sensors or update existing ones for active mappings
         for name in active_csv_sensors:
             # Check if sensor already exists
             existing = next((s for s in self.sensor_controller.sensors if s.name == name), None)
@@ -4232,6 +3714,9 @@ class DAQApp(QMainWindow):
             self.csv_status.setStyleSheet("color: orange; font-size: 9px; background-color: transparent; border: none;")
             is_connected = False
             
+        # Track connection status
+        self.interface_connections['csv'] = is_connected
+        
         # Update card style
         csv_container = self.csv_status.parent()
         if csv_container and hasattr(csv_container, 'setStyleSheet'):
@@ -4541,6 +4026,10 @@ class DAQApp(QMainWindow):
             self.optical_status.setText(f"{len(optical_sensors)} configured")
             self.optical_status.setStyleSheet("color: orange; font-size: 9px; background-color: transparent; border: none;")
             is_connected = False
+            
+        # Track connection status
+        self.interface_connections['opticalsensor'] = is_connected
+        self.interface_connections['optical_sensor'] = is_connected
         
         # Update device button frame style (like Arduino/LabJack)
         if hasattr(self, 'optical_status'):
@@ -4782,6 +4271,10 @@ class DAQApp(QMainWindow):
             self.audio_status.setStyleSheet("color: orange; font-size: 9px; background-color: transparent; border: none;")
             is_connected = False
         
+        # Track connection status
+        self.interface_connections['audiosensor'] = is_connected
+        self.interface_connections['audio_sensor'] = is_connected
+        
         # Update device button frame style (like Arduino/LabJack)
         if hasattr(self, 'audio_status'):
             audio_container = self.audio_status.parent()
@@ -4790,94 +4283,181 @@ class DAQApp(QMainWindow):
                 audio_container.update()
 
     def refresh_dashboard_camera_sources(self):
-        """Refresh the list of available camera sources in the dashboard dropdown"""
-        if not hasattr(self, 'dashboard_camera_source'):
+        """Refresh dashboard camera checkboxes based on controller state"""
+        if not hasattr(self, 'dashboard_camera_checkboxes') or not hasattr(self, 'camera_controller'):
             return
+            
+        for i, cb in enumerate(self.dashboard_camera_checkboxes):
+            cb.blockSignals(True)
+            # Check if camera i is active in any slot
+            is_active = i in self.camera_controller.dashboard_slots
+            cb.setChecked(is_active)
+            cb.blockSignals(False)
+            
+        # Trigger visibility update
+        for i in range(4):
+            self.switch_dashboard_camera_source(i)
         
-        # Remember current selection
-        current_data = self.dashboard_camera_source.currentData()
-        
-        # Clear and repopulate
-        self.dashboard_camera_source.blockSignals(True)
-        self.dashboard_camera_source.clear()
-        
-        # Add main camera
-        self.dashboard_camera_source.addItem("📷 Main Camera", "main")
-        
-        # Add optical sensors
-        if hasattr(self, 'sensor_controller'):
-            optical_sensors = self.sensor_controller.get_optical_sensors()
-            for sensor in optical_sensors:
-                # Check if connected
-                is_connected = False
-                if hasattr(self.sensor_controller, 'optical_sensor_interfaces'):
-                    is_connected = sensor.name in self.sensor_controller.optical_sensor_interfaces
-                
-                status = "🟢" if is_connected else "⚪"
-                self.dashboard_camera_source.addItem(
-                    f"{status} {sensor.name}", 
-                    f"optical:{sensor.name}"
-                )
-        
-        # Restore selection if possible
-        if current_data:
-            index = self.dashboard_camera_source.findData(current_data)
-            if index >= 0:
-                self.dashboard_camera_source.setCurrentIndex(index)
-        
-        self.dashboard_camera_source.blockSignals(False)
-    
-    def switch_dashboard_camera_source(self):
-        """Switch the camera source displayed in the dashboard"""
-        if not hasattr(self, 'dashboard_camera_source'):
+        # Ensure row visibilities are updated
+        self._update_row_visibilities()
+
+    def switch_dashboard_camera_source(self, slot_idx):
+        """Switch the camera visibility based on checkbox state"""
+        if not hasattr(self, 'dashboard_camera_checkboxes') or slot_idx >= len(self.dashboard_camera_checkboxes):
             return
+            
+        cb = self.dashboard_camera_checkboxes[slot_idx]
+        is_on = cb.isChecked()
         
-        source = self.dashboard_camera_source.currentData()
-        if not source:
-            return
+        # Get label and video widget for this slot
+        label = self.dashboard_camera_labels[slot_idx] if hasattr(self, 'dashboard_camera_labels') else None
         
-        if source == "main":
-            # Switch to main camera
-            if hasattr(self, 'camera_controller') and self.camera_controller:
-                # Ensure dashboard displays main camera feed
+        if not is_on:
+            if label: 
+                label.hide()
+                label.setText("No camera selected") # Reset text
+            # Update controller
+            if hasattr(self, 'camera_controller'):
+                if isinstance(self.camera_controller.dashboard_slots, list):
+                    self.camera_controller.dashboard_slots[slot_idx] = -1
+        else:
+            if label: 
+                label.show()
+                # If not connected, it will show its default "No camera connected"
+            # Update controller
+            if hasattr(self, 'camera_controller'):
+                if isinstance(self.camera_controller.dashboard_slots, list):
+                    # For simple 1:1 mapping if not otherwise set
+                    if self.camera_controller.dashboard_slots[slot_idx] == -1:
+                         self.camera_controller.dashboard_slots[slot_idx] = slot_idx
+                # Ensure dashboard display is enabled
                 self.camera_controller.set_dashboard_display(True)
-                self.logger.log("Dashboard: Switched to main camera", "INFO")
-        elif source.startswith("optical:"):
-            # Switch to optical sensor camera
-            sensor_name = source.replace("optical:", "")
-            self._display_optical_sensor_in_dashboard(sensor_name)
-    
-    def _display_optical_sensor_in_dashboard(self, sensor_name):
-        """Display an optical sensor's camera feed in the dashboard"""
-        if not hasattr(self, 'sensor_controller'):
+        
+        # Manage row visibility directly for faster response
+        row_idx = slot_idx // 2
+        if hasattr(self, 'dashboard_camera_row_widgets') and hasattr(self, 'dashboard_camera_checkboxes'):
+            row_checked = any(self.dashboard_camera_checkboxes[i].isChecked() 
+                            for i in range(row_idx*2, min((row_idx+1)*2, len(self.dashboard_camera_labels))))
+            self.dashboard_camera_row_widgets[row_idx].setVisible(row_checked)
+        
+        self._update_row_visibilities()
+
+    def _update_row_visibilities(self):
+        """Collapse or show rows based on active widgets and manage placeholder visibility"""
+        is_replay = getattr(self, "replay_mode_enabled", False)
+        
+        any_live_visible = False
+        # Live View Rows
+        if hasattr(self, 'dashboard_camera_row_widgets') and hasattr(self, 'dashboard_camera_labels') and hasattr(self, 'dashboard_camera_checkboxes'):
+            for row_idx in range(2):
+                row_checked = False
+                for i in range(row_idx*2, min((row_idx+1)*2, len(self.dashboard_camera_labels))):
+                    checked = self.dashboard_camera_checkboxes[i].isChecked()
+                    # In replay mode, labels are visible if checked. 
+                    # They will be hidden manually if a video segment is successfully loaded for the slot.
+                    label_should_be_visible = checked
+                    self.dashboard_camera_labels[i].setVisible(label_should_be_visible)
+                    if checked: row_checked = True
+                
+                # If we are in live mode, row visibility depends on checkboxes
+                if not is_replay:
+                    self.dashboard_camera_row_widgets[row_idx].setVisible(row_checked)
+                    if row_checked: 
+                        any_live_visible = True
+                        # Ensure row widget is shown if a camera is checked
+                        self.dashboard_camera_row_widgets[row_idx].show()
+                else:
+                    # In replay mode, handled by video widgets or "No video available" labels
+                    self.dashboard_camera_row_widgets[row_idx].setVisible(False)
+        
+        any_video_visible = False
+        # Replay View Rows
+        if hasattr(self, 'dashboard_video_row_widgets') and hasattr(self, 'dashboard_video_widgets'):
+            for row_idx in range(2):
+                row_has_video = False
+                for i in range(row_idx*2, min((row_idx+1)*2, len(self.dashboard_video_widgets))):
+                    # In replay mode, video is active if path exists AND checkbox is checked
+                    path_active = self.replay_active_video_paths[i] is not None
+                    checkbox_checked = False
+                    if hasattr(self, 'dashboard_camera_checkboxes'):
+                        checkbox_checked = self.dashboard_camera_checkboxes[i].isChecked()
+                    
+                    is_visible = path_active and checkbox_checked
+                    self.dashboard_video_widgets[i].setVisible(is_visible)
+                    if is_visible: 
+                        row_has_video = True
+                        # Force widget update to prevent black screens
+                        self.dashboard_video_widgets[i].update()
+                
+                if is_replay:
+                    row_visible = row_has_video
+                    # Also check for "No video available" labels
+                    for i in range(row_idx*2, min((row_idx+1)*2, len(self.dashboard_camera_labels))):
+                        if self.dashboard_camera_labels[i].isVisible():
+                            row_visible = True
+                            break
+                    
+                    self.dashboard_video_row_widgets[row_idx].setVisible(row_has_video)
+                    if hasattr(self, 'dashboard_camera_row_widgets'):
+                        self.dashboard_camera_row_widgets[row_idx].setVisible(not row_has_video and row_visible)
+                    
+                    if row_visible: any_video_visible = True
+                else:
+                    self.dashboard_video_row_widgets[row_idx].setVisible(False)
+
+        # Placeholder visibility
+        if hasattr(self, 'dashboard_camera_placeholder'):
+            any_checked = False
+            if hasattr(self, 'dashboard_camera_checkboxes'):
+                any_checked = any(cb.isChecked() for cb in self.dashboard_camera_checkboxes)
+            
+            show_placeholder = not any_checked
+            self.dashboard_camera_placeholder.setVisible(show_placeholder)
+            
+            if show_placeholder:
+                self.dashboard_camera_placeholder.setText("No camera selected")
+                if hasattr(self, 'dashboard_camera_row_widgets'):
+                    for rw in self.dashboard_camera_row_widgets: 
+                        rw.hide()
+                if hasattr(self, 'dashboard_video_row_widgets'):
+                    for rw in self.dashboard_video_row_widgets: 
+                        rw.hide()
+            else:
+                # If any checked, ensure the placeholder is hidden
+                self.dashboard_camera_placeholder.hide()
+        
+    def _display_optical_sensor_in_dashboard_slot(self, sensor_name, slot_idx):
+        """Display an optical sensor's camera feed in a specific dashboard slot"""
+        if not hasattr(self, 'sensor_controller') or not hasattr(self, 'dashboard_camera_labels'):
             return
+            
+        label = self.dashboard_camera_labels[slot_idx]
         
         # Check if the optical sensor is connected
         if not hasattr(self.sensor_controller, 'optical_sensor_interfaces'):
-            self.dashboard_camera_label.setText(f"Optical Sensor '{sensor_name}' not connected")
+            label.setText(f"Optical Sensor '{sensor_name}' not connected")
             return
-        
+            
         if sensor_name not in self.sensor_controller.optical_sensor_interfaces:
-            self.dashboard_camera_label.setText(f"Optical Sensor '{sensor_name}' not connected.\nConnect it in the Sensors tab first.")
+            label.setText(f"Optical Sensor '{sensor_name}' not connected.\nConnect it in the Sensors tab first.")
             return
-        
-        # Get the interface and connect its frame signal to dashboard
+            
+        # Get the interface and connect its frame signal to this slot
         interface = self.sensor_controller.optical_sensor_interfaces[sensor_name]
         if hasattr(interface, 'sensor_thread') and interface.sensor_thread:
-            # Disconnect main camera from dashboard if needed
-            if hasattr(self, 'camera_controller') and self.camera_controller:
-                self.camera_controller.set_dashboard_display(False)
-            
-            # Connect optical sensor frames to dashboard
+            # Connect optical sensor frames to dashboard with slot context
             try:
-                interface.sensor_thread.frame_for_display.disconnect()
-            except:
-                pass
-            interface.sensor_thread.frame_for_display.connect(self._update_dashboard_from_optical)
-            self.logger.log(f"Dashboard: Switched to optical sensor '{sensor_name}'", "INFO")
-    
-    def _update_dashboard_from_optical(self, frame_data):
-        """Update dashboard display from optical sensor frame"""
+                # We need to disconnect any previous connections to this slot or from this sensor to dashboard
+                # For simplicity, we'll use a wrapper that knows its slot
+                interface.sensor_thread.frame_for_display.connect(
+                    lambda frame_data, s=slot_idx: self._update_dashboard_slot_from_optical(frame_data, s)
+                )
+                self.logger.log(f"Dashboard Slot {slot_idx+1}: Switched to optical sensor '{sensor_name}'", "INFO")
+            except Exception as e:
+                self.logger.log(f"Failed to connect optical sensor to slot {slot_idx+1}: {e}", "ERROR")
+
+    def _update_dashboard_slot_from_optical(self, frame_data, slot_idx):
+        """Update a specific dashboard slot from optical sensor frame"""
         try:
             import cv2
             from PyQt6.QtGui import QImage, QPixmap
@@ -4885,7 +4465,7 @@ class DAQApp(QMainWindow):
             frame = frame_data.get('frame')
             if frame is None:
                 return
-            
+                
             # Convert BGR to RGB
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             height, width, channel = rgb_frame.shape
@@ -4893,16 +4473,19 @@ class DAQApp(QMainWindow):
             q_img = QImage(rgb_frame.data, width, height, bytes_per_line, QImage.Format.Format_RGB888)
             
             # Scale to fit dashboard label
-            if hasattr(self, 'dashboard_camera_label'):
+            if hasattr(self, 'dashboard_camera_labels') and slot_idx < len(self.dashboard_camera_labels):
+                lbl = self.dashboard_camera_labels[slot_idx]
+                if not lbl.isVisible(): return
+                
                 pixmap = QPixmap.fromImage(q_img)
                 scaled_pixmap = pixmap.scaled(
-                    self.dashboard_camera_label.size(),
+                    lbl.size(),
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation
                 )
-                self.dashboard_camera_label.setPixmap(scaled_pixmap)
+                lbl.setPixmap(scaled_pixmap)
         except Exception as e:
-            print(f"Error updating dashboard from optical sensor: {e}")
+            print(f"Error updating dashboard slot {slot_idx} from optical sensor: {e}")
 
     def handle_labjack_connect_button(self):
         """Handle clicking the LabJack connect button"""
@@ -4980,7 +4563,11 @@ class DAQApp(QMainWindow):
             
             # Set up the values update timer
             # Get the sampling rate from settings (default to 1.0Hz if not set)
-            sampling_rate = float(self.settings.value("global_sampling_rate", "1.0"))
+            val = self.settings.value("global_sampling_rate", "1.0")
+            try:
+                sampling_rate = float(val) if str(val).lower() != 'none' else 1.0
+            except (ValueError, TypeError):
+                sampling_rate = 1.0
             
             # Calculate update interval in milliseconds (minimum 100ms for UI responsiveness)
             update_interval = max(int(1000 / sampling_rate), 100)
@@ -5170,6 +4757,9 @@ class DAQApp(QMainWindow):
         """
         print(f"Direct LabJack status update: is_connected={is_connected}")
         
+        # Track connection status
+        self.interface_connections['labjack'] = is_connected
+        
         # First try to update the button if it exists
         if hasattr(self, 'labjack_connect_btn'):
             self.labjack_connect_btn.setText("Disconnect" if is_connected else "Connect")
@@ -5211,6 +4801,10 @@ class DAQApp(QMainWindow):
             is_connected (bool): Whether Serial Sensors are connected
         """
         print(f"Direct Serial Sensors status update: is_connected={is_connected}")
+        
+        # Track connection status
+        self.interface_connections['otherserial'] = is_connected
+        self.interface_connections['other_serial'] = is_connected
         
         # Set the text and color directly on the other_status label if it exists
         if hasattr(self, 'other_status'):
@@ -5370,6 +4964,10 @@ class DAQApp(QMainWindow):
                 self.logger.log(f"Loaded virtual sensors from current run: {current_run_path}")
                 self._apply_csv_configs()
                 self._connect_virtual_sensors()
+                
+                # Invalidate the DCC sensor cache after loading to ensure new sensors are mapped correctly
+                if hasattr(self, 'data_collection_controller'):
+                    self.data_collection_controller.invalidate_sensor_cache()
                 return
             except Exception as e:
                 self.logger.log(f"Error loading virtual sensors from current run: {e}", "ERROR")
@@ -5387,6 +4985,10 @@ class DAQApp(QMainWindow):
                     self.logger.log(f"Loaded virtual sensors from last run: {last_run_path}")
                     self._apply_csv_configs()
                     self._connect_virtual_sensors()
+                    
+                    # Invalidate the DCC sensor cache after loading to ensure new sensors are mapped correctly
+                    if hasattr(self, 'data_collection_controller'):
+                        self.data_collection_controller.invalidate_sensor_cache()
                     return
                 except Exception as e:
                     self.logger.log(f"Error loading virtual sensors from last run: {e}", "ERROR")
@@ -5396,12 +4998,27 @@ class DAQApp(QMainWindow):
             try:
                 with open(VIRTUAL_SENSORS_PATH, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                self.other_sensors = data.get("sensors", [])
+                
+                # Load and deduplicate sensors to prevent triplication
+                loaded_sensors = data.get("sensors", [])
+                seen_configs = set()
+                unique_sensors = []
+                for cfg in loaded_sensors:
+                    config_id = (cfg.get('name'), cfg.get('type'))
+                    if config_id not in seen_configs:
+                        seen_configs.add(config_id)
+                        unique_sensors.append(cfg)
+                self.other_sensors = unique_sensors
+                
                 self.other_sequences = data.get("sequences", [])
                 self.csv_configs = data.get("csv_configs", [])
-                self.logger.log(f"Loaded virtual sensors from fallback location: {VIRTUAL_SENSORS_PATH}")
+                self.logger.log(f"Loaded {len(self.other_sensors)} virtual sensors from fallback location: {VIRTUAL_SENSORS_PATH}")
                 self._apply_csv_configs()
                 self._connect_virtual_sensors()
+                
+                # Invalidate the DCC sensor cache after loading to ensure new sensors are mapped correctly
+                if hasattr(self, 'data_collection_controller'):
+                    self.data_collection_controller.invalidate_sensor_cache()
             except Exception as e:
                 self.logger.log(f"Error loading virtual sensors from fallback location: {e}", "ERROR")
                 self.other_sensors = []
@@ -5415,16 +5032,37 @@ class DAQApp(QMainWindow):
             self.logger.log("No virtual sensors file found, starting with empty configuration")
 
     def _connect_virtual_sensors(self):
-        """Connect to virtual sensors based on configured sequences"""
+        """Connect to virtual sensors based on configured sequences and plugins.
+        Following the blueprint for interface discovery and persistence.
+        """
+        def _as_bool(val, default: bool = False) -> bool:
+            """Normalize config values that may come from JSON/QSettings into a real bool."""
+            if val is None:
+                return default
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, (int, float)):
+                return bool(val)
+            if isinstance(val, str):
+                v = val.strip().lower()
+                if v in ("1", "true", "yes", "y", "on", "checked"):
+                    return True
+                if v in ("0", "false", "no", "n", "off", "unchecked", ""):
+                    return False
+                # Unknown string -> fall back to default (NOT truthiness)
+                return default
+            return default
+
         success = False
-        if not hasattr(self, 'other_sequences') or not self.other_sequences:
+        if not hasattr(self, 'other_sensors') or not self.other_sensors:
             return False
             
-        for sensor in self.other_sensors:
-            if sensor.get("mapping") and ":" in sensor.get("mapping", ""):
-                seq_name, var_name = sensor.get("mapping").split(":", 1)
+        for config in self.other_sensors:
+            # 1. Handle legacy Serial/Sequence sensors (which use 'mapping' with a colon)
+            if config.get("mapping") and ":" in config.get("mapping", ""):
+                seq_name, var_name = config.get("mapping").split(":", 1)
                 # Find the sequence by name
-                for sequence in self.other_sequences:
+                for sequence in getattr(self, "other_sequences", []):
                     if sequence.get("name") == seq_name:
                         # Connect the sequence if it has a port
                         port = sequence.get("port", "")
@@ -5447,9 +5085,68 @@ class DAQApp(QMainWindow):
                         if self.sensor_controller.reinitialize_other_serial_connections(is_explicit_reconnect=False):
                             print(f"DEBUG MainWindow: Successfully reinitialized (or confirmed) connection for sequence {seq_name}")
                             if hasattr(self, 'logger'): self.logger.log(f"Virtual sensor for sequence {seq_name} (port {port}) connected.", "INFO")
+                            success = True
                         else:
                             print(f"DEBUG MainWindow: Failed to reinitialize connection for sequence {seq_name} on port {port}")
                         break
+            
+            # 2. Handle generic plugins or newer unified sensor configs
+            else:
+                device_type = config.get("type")
+                # 2a. Handle harmonized Serial sensors (type="Serial") with auto_connect=True
+                if device_type in ("Serial", "OtherSerial"):
+                    enabled = _as_bool(config.get("enabled", True), default=True)
+                    # Serial/OtherSerial should default to True for auto_connect if enabled,
+                    # because the actual connection is further filtered by sequence auto_connect flags.
+                    auto_connect = _as_bool(config.get("auto_connect", True), default=True)
+                    if not enabled or not auto_connect:
+                        continue
+                    if hasattr(self, 'data_collection_controller'):
+                        dcc = self.data_collection_controller
+                        if dcc.other_serial_manually_disconnected:
+                            print("DEBUG MainWindow: Other serial manually disconnected, skipping auto-connect for Serial sensors")
+                            continue
+                    try:
+                        if hasattr(self, 'sensor_controller'):
+                            print("DEBUG MainWindow: Auto-connecting Serial sensors via reinitialize_other_serial_connections()")
+                            if self.sensor_controller.reinitialize_other_serial_connections(is_explicit_reconnect=False):
+                                success = True
+                    except Exception as e:
+                        if hasattr(self, 'logger'):
+                            self.logger.log(f"Error auto-connecting Serial sensors: {e}", "ERROR")
+                # 2b. Handle plugins
+                elif device_type and device_type not in ["Arduino", "LabJack", "Serial", "Read CSV", "OtherSerial"]:
+                    # This is likely a plugin sensor
+                    if hasattr(self, 'data_collection_controller'):
+                        # Check if it's a known plugin
+                        from app.core.interfaces.interface_registry import InterfaceRegistry
+                        if InterfaceRegistry.get_interface_class(device_type):
+                            enabled = _as_bool(config.get("enabled", True), default=True)
+                            auto_connect = _as_bool(config.get("auto_connect", False), default=False)
+
+                            # --- Robust Auto-connect Check (Harmonized) ---
+                            # For plugin/virtual sensors, we check BOTH the individual config 
+                            # AND the global QSettings for this interface type.
+                            settings_key = device_type.lower().replace(" ", "_")
+                            global_auto_connect = self.settings.value(f"{settings_key}_auto_connect", "false") == "true"
+                            global_enabled = self.settings.value(f"{settings_key}_enabled", "true") == "true"
+                            
+                            # Global settings take precedence for interface-wide behavior
+                            auto_connect = auto_connect or global_auto_connect
+                            enabled = enabled and global_enabled
+
+                            if not enabled:
+                                print(f"DEBUG MainWindow: Skipping plugin sensor '{config.get('name')}' because enabled is False")
+                                continue
+                            if not auto_connect:
+                                print(f"DEBUG MainWindow: Skipping auto-connect for plugin sensor '{config.get('name')}' because auto_connect is False")
+                                continue
+                                
+                            print(f"DEBUG MainWindow: Auto-connecting plugin sensor '{config.get('name')}' of type '{device_type}'")
+                            # Call add_sensor_from_config but don't re-persist since we are loading it
+                            if self.data_collection_controller.add_sensor_from_config(config, persist=False):
+                                success = True
+        
         return success
 
     def save_virtual_sensors(self):
@@ -5559,37 +5256,77 @@ class DAQApp(QMainWindow):
         self.update_run_context_text()
 
     def _toggle_replay_video_surface(self, show_video: bool):
-        """Swap dashboard camera preview between live label and replay video widget."""
-        if hasattr(self, "dashboard_video_widget"):
-            self.dashboard_video_widget.setVisible(show_video)
-        if hasattr(self, "dashboard_camera_label"):
-            self.dashboard_camera_label.setVisible(not show_video)
+        """Swap dashboard camera preview between live labels and replay video widgets."""
+        if hasattr(self, "dashboard_camera_labels"):
+            for i, lbl in enumerate(self.dashboard_camera_labels):
+                if not show_video:
+                    # Show live label if checkbox is checked
+                    if hasattr(self, 'dashboard_camera_checkboxes'):
+                        is_on = self.dashboard_camera_checkboxes[i].isChecked()
+                        lbl.setVisible(is_on)
+                else:
+                    lbl.hide()
+                    
+        if hasattr(self, "dashboard_video_widgets"):
+            for i, vw in enumerate(self.dashboard_video_widgets):
+                if show_video:
+                    # Show video widget if it has an active path
+                    is_active = self.replay_active_video_paths[i] is not None
+                    vw.setVisible(is_active)
+                else:
+                    vw.hide()
+        
+        self._update_row_visibilities()
+
+    def _clear_replay_video_slot(self, slot_idx: int):
+        """Clear a specific replay video slot."""
+        if slot_idx < len(self.media_players):
+            try:
+                self.media_players[slot_idx].stop()
+                self.media_players[slot_idx].setSource(QUrl())
+            except Exception: pass
+            
+            self.replay_active_video_paths[slot_idx] = None
+            if hasattr(self, "dashboard_video_widgets") and slot_idx < len(self.dashboard_video_widgets):
+                self.dashboard_video_widgets[slot_idx].hide()
+
+            # If we're still in replay mode, we might want to show the label again
+            if getattr(self, "replay_mode_enabled", False):
+                if hasattr(self, "dashboard_camera_labels") and slot_idx < len(self.dashboard_camera_labels):
+                    # ONLY show if checkbox is checked AND not connected to live camera
+                    is_checked = False
+                    if hasattr(self, 'dashboard_camera_checkboxes'):
+                        is_checked = self.dashboard_camera_checkboxes[slot_idx].isChecked()
+                    
+                    camera_active = False
+                    if hasattr(self, 'camera_controller') and self.camera_controller:
+                        camera_active = self.camera_controller.is_connected[slot_idx]
+                        
+                    if is_checked and not camera_active:
+                        lbl = self.dashboard_camera_labels[slot_idx]
+                        lbl.show()
+                        lbl.setText("No video available")
+                        from PyQt6.QtGui import QPixmap
+                        lbl.setPixmap(QPixmap())
+                    else:
+                        if hasattr(self, "dashboard_camera_labels") and slot_idx < len(self.dashboard_camera_labels):
+                            self.dashboard_camera_labels[slot_idx].hide()
+            
+            self._update_row_visibilities()
 
     def _clear_replay_video(self):
-        """Clear video display when no video data is available for current replay time."""
+        """Clear all current replay videos from the dashboard players."""
         try:
-            if hasattr(self, "media_player"):
-                self.media_player.stop()
-                self.media_player.setSource(QUrl())
-            if hasattr(self, "dashboard_video_widget"):
-                self.dashboard_video_widget.hide()
-            if hasattr(self, "dashboard_camera_label"):
-                self.dashboard_camera_label.show()
-                self.dashboard_camera_label.setText("No video available")
-                # Clear any existing pixmap
-                from PyQt6.QtGui import QPixmap
-                self.dashboard_camera_label.setPixmap(QPixmap())
+            for i in range(len(self.media_players)):
+                self._clear_replay_video_slot(i)
             self.replay_active_video_path = None
-            self.replay_video_offset = None
+            self.replay_active_video_paths = [None] * 4
         except Exception as e:
-            try:
-                if hasattr(self, "logger"):
-                    self.logger.log(f"Error clearing replay video: {e}", "WARN")
-            except Exception:
-                pass
+            if hasattr(self, "logger"):
+                self.logger.log(f"Error clearing replay video: {e}", "WARN")
 
     def _select_replay_segment_for_time(self, rel_time: float, force_load: bool = False):
-        """Choose the correct video segment for the given replay time and load it if needed."""
+        """Choose the correct video segments for all cameras for the given replay time and load them if needed."""
         if not getattr(self, "replay_video_segments", None):
             # No segments available - clear video display
             self._clear_replay_video()
@@ -5600,135 +5337,143 @@ class DAQApp(QMainWindow):
         except (TypeError, ValueError):
             rel_time = 0.0
 
-        segments = sorted(
-            self.replay_video_segments, key=lambda s: float(s.get("start_rel", 0.0))
-        )
-        chosen = None
-        for seg in segments:
-            try:
-                start_rel = float(seg.get("start_rel", 0.0) or 0.0)
-                end_rel = seg.get("end_rel")
-                if end_rel is not None:
-                    end_rel = float(end_rel)
-                
-                # Check if current time falls within this segment
-                if end_rel is not None:
-                    if start_rel <= rel_time <= end_rel:
+        # Group segments by camera_index
+        cameras_segments = {}
+        for seg in self.replay_video_segments:
+            cam_idx = seg.get("camera_index", 0)
+            if cam_idx not in cameras_segments:
+                cameras_segments[cam_idx] = []
+            cameras_segments[cam_idx].append(seg)
+
+        # For each camera, find the best segment for the current time
+        chosen_segments = {}
+        for cam_idx, segments in cameras_segments.items():
+            # Sort by start_rel DESCENDING so we check the latest segments first if there are overlaps
+            segments = sorted(segments, key=lambda s: float(s.get("start_rel", 0.0)), reverse=True)
+            chosen = None
+            for seg in segments:
+                try:
+                    start_rel = float(seg.get("start_rel", 0.0) or 0.0)
+                    end_rel = seg.get("end_rel")
+                    
+                    if end_rel is not None:
+                        end_rel = float(end_rel)
+                        if start_rel <= rel_time <= end_rel:
+                            chosen = seg
+                            break
+                    elif rel_time >= start_rel:
+                        # If no end_rel, it matches anything after start_rel
+                        # Since we are checking DESCENDING start_rel, this is the most recent segment that started before rel_time
                         chosen = seg
                         break
-                elif rel_time >= start_rel:
-                    # No end time, so it spans from start to the end of run
-                    chosen = seg
-                    # We continue the loop to see if there's a more specific segment 
-                    # that starts later and might also match, though unlikely.
-            except (TypeError, ValueError):
+                except (TypeError, ValueError):
+                    continue
+            
+            if chosen:
+                chosen_segments[cam_idx] = chosen
+
+        # Update each slot
+        for cam_idx in range(4):
+            chosen = chosen_segments.get(cam_idx)
+            current_path = self.replay_active_video_paths[cam_idx]
+            chosen_path = chosen.get("path") if chosen else None
+            
+            if not chosen:
+                self._clear_replay_video_slot(cam_idx)
+                continue
+                
+            if (
+                not force_load
+                and current_path
+                and chosen_path
+                and os.path.abspath(current_path) == os.path.abspath(chosen_path)
+            ):
+                self.replay_video_offsets[cam_idx] = float(chosen.get("start_rel", 0.0) or 0.0)
                 continue
 
-        if not chosen:
-            # No valid segment found for this time - clear video display
-            self._clear_replay_video()
+            self._activate_replay_segment_in_slot(chosen, cam_idx, seek_rel_time=rel_time)
+
+    def _activate_replay_segment_in_slot(self, segment: dict, slot_idx: int, seek_rel_time: float | None = None):
+        """Load a specific video segment into a specific media player slot and seek to the desired time."""
+        if slot_idx >= len(self.media_players):
             return
 
-        current_path = getattr(self, "replay_active_video_path", None)
-        chosen_path = chosen.get("path")
-        if (
-            not force_load
-            and current_path
-            and chosen_path
-            and os.path.abspath(current_path) == os.path.abspath(chosen_path)
-        ):
-            # Update offset in case the segment changed but path did not
-            self.replay_video_offset = float(chosen.get("start_rel", 0.0) or 0.0)
-            return
-
-        self._activate_replay_segment(chosen, seek_rel_time=rel_time)
-
-    def _activate_replay_segment(self, segment: dict, seek_rel_time: float | None = None):
-        """Load a specific video segment into the media player and seek to the desired time."""
-        if not segment or not hasattr(self, "media_player"):
-            self._clear_replay_video()
-            return
-
-        # Check if camera is active - if so, don't load video
-        camera_active = False
-        if hasattr(self, 'camera_controller') and self.camera_controller:
-            camera_active = getattr(self.camera_controller, 'is_connected', False)
+        player = self.media_players[slot_idx]
         
-        if camera_active:
-            # Camera is active - don't load video, just clear display
-            self._clear_replay_video()
-            return
-
         path = segment.get("path")
         if not path or not os.path.exists(path):
-            # File doesn't exist - clear video
-            self._clear_replay_video()
-            try:
-                if hasattr(self, "logger"):
-                    self.logger.log(f"Replay segment missing file: {path}", "WARN")
-            except Exception:
-                pass
+            self._clear_replay_video_slot(slot_idx)
             return
 
         try:
-            self.replay_active_video_path = path
-            self.replay_video_offset = float(segment.get("start_rel", 0.0) or 0.0)
-            # Extend known video span with this segment's end if available
-            end_rel = segment.get("end_rel")
-            try:
-                end_rel_val = float(end_rel) if end_rel is not None else None
-            except (TypeError, ValueError):
-                end_rel_val = None
-            if end_rel_val is not None:
-                self.replay_video_duration = max(self.replay_video_duration, end_rel_val)
-
-            # Ensure an audio output is present before loading the source
+            self.replay_active_video_paths[slot_idx] = path
+            # Compatibility attribute update
+            if slot_idx == 0: self.replay_active_video_path = path
+            
+            self.replay_video_offsets[slot_idx] = float(segment.get("start_rel", 0.0) or 0.0)
+            
+            # Ensure audio output
             self._ensure_media_audio_output()
-            if hasattr(self, "dashboard_video_widget"):
-                self.media_player.setVideoOutput(self.dashboard_video_widget)
-            elif hasattr(self, "video_display") and isinstance(self.video_display, QVideoWidget):
-                self.media_player.setVideoOutput(self.video_display)
+            
+            # Video output is already linked in __init__ for dashboard_video_widgets
+            # But let's re-verify it to be sure (some backends need this "bump")
+            if hasattr(self, "dashboard_video_widgets") and slot_idx < len(self.dashboard_video_widgets):
+                vw = self.dashboard_video_widgets[slot_idx]
+                player.setVideoOutput(vw)
+            
+            player.setSource(QUrl.fromLocalFile(path))
+            
+            # Show the video widget and hide the camera label
+            if hasattr(self, "dashboard_video_widgets") and slot_idx < len(self.dashboard_video_widgets):
+                # Ensure the widget is properly initialized
+                self.dashboard_video_widgets[slot_idx].show()
+                self.dashboard_video_widgets[slot_idx].update()
+                self.dashboard_video_widgets[slot_idx].repaint()
 
-            self.media_player.setSource(QUrl.fromLocalFile(path))
+            if hasattr(self, "dashboard_camera_labels") and slot_idx < len(self.dashboard_camera_labels):
+                self.dashboard_camera_labels[slot_idx].hide()
+            
+            self._update_row_visibilities()
+
             self._set_media_playback_rate()
-            self._refresh_media_duration()
             self._apply_media_audio_state()
-            self._toggle_replay_video_surface(True)
 
             # Seek to the requested replay time within this segment
             if seek_rel_time is None:
                 seek_rel_time = self.replay_current_time
-            self._sync_replay_video(seek_rel_time, force_seek=True)
+            self._sync_replay_video_slot(slot_idx, seek_rel_time, force_seek=True)
 
-            # Handle playback state for the new segment
+            # Handle playback state
             if getattr(self, "replay_is_playing", False):
-                try:
-                    # If we were already playing, make sure the new segment starts playing
-                    self.media_player.play()
-                    self._set_media_playback_rate()
-                except Exception:
-                    pass
+                player.play()
             else:
-                try:
-                    # Prime first frame to display immediately by playing then pausing
-                    self.media_player.play()
-                    self._set_media_playback_rate()
-                    # A tiny delay sometimes helps the backend actually render the first frame
-                    QTimer.singleShot(50, self.media_player.pause)
-                except Exception:
-                    pass
+                # To avoid black frames on start, we play briefly then pause.
+                # Hardware accelerated videos might need a bit more "encouragement" to show the first frame.
+                player.play()
+                
+                # We use a sequence of pauses to ensure it sticks after the first frame is rendered
+                def ensure_pause(p=player, attempt=1):
+                    if not getattr(self, "replay_is_playing", False):
+                        p.pause()
+                        # For hardware videos, sometimes seeking to 1ms forces a render
+                        if attempt == 1:
+                            p.setPosition(1)
+                        elif attempt == 2:
+                            # Re-sync to actual requested time
+                            self._sync_replay_video_slot(slot_idx, seek_rel_time, force_seek=True)
+                        
+                        # If it's still not LoadedMedia, we might need to check again later
+                        if attempt < 4:
+                            QTimer.singleShot(200, lambda: ensure_pause(p, attempt + 1))
+                
+                QTimer.singleShot(200, ensure_pause)
 
-            try:
-                if hasattr(self, "logger"):
-                    self.logger.log(f"Loaded replay video segment: {path}", "INFO")
-            except Exception:
-                pass
         except Exception as e:
-            try:
-                if hasattr(self, "logger"):
-                    self.logger.log(f"Could not load replay video segment: {e}", "WARN")
-            except Exception:
-                pass
+            self.logger.log(f"Could not load replay video for slot {slot_idx+1}: {e}", "WARN")
+
+    def _activate_replay_segment(self, segment: dict, seek_rel_time: float | None = None):
+        """Compatibility wrapper: Load a specific video segment into slot 0."""
+        self._activate_replay_segment_in_slot(segment, 0, seek_rel_time)
 
     def _set_media_controls_enabled(self, enabled: bool):
         """Enable/disable all media volume/mute controls."""
@@ -5748,13 +5493,20 @@ class DAQApp(QMainWindow):
                     pass
 
     def _refresh_media_duration(self):
-        """Fetch current media duration and apply to replay timeline if longer."""
+        """Fetch current media duration from all active slots and apply the longest to replay timeline."""
         try:
-            if not hasattr(self, "media_player"):
+            if not hasattr(self, "media_players"):
                 return
-            dur_ms = self.media_player.duration()
-            if dur_ms and dur_ms > 0:
-                self._on_media_duration_changed(dur_ms)
+            max_dur_ms = 0
+            for player in self.media_players:
+                try:
+                    dur = player.duration()
+                    if dur > max_dur_ms:
+                        max_dur_ms = dur
+                except Exception:
+                    pass
+            if max_dur_ms > 0:
+                self._on_media_duration_changed(max_dur_ms)
         except Exception:
             pass
 
@@ -5798,12 +5550,28 @@ class DAQApp(QMainWindow):
             except Exception:
                 pass
 
+    def _on_media_error(self, error, error_str, slot_idx):
+        """Log media errors for debugging."""
+        try:
+            self.logger.log(f"Media error in slot {slot_idx+1}: {error_str} (code: {error})", "ERROR")
+        except:
+            print(f"Media error in slot {slot_idx+1}: {error_str} (code: {error})")
+
     def _on_media_status_changed(self, status):
         """
         Media status callback to refresh duration once media is buffered/loaded.
         """
         try:
             from PyQt6.QtMultimedia import QMediaPlayer
+            
+            # Identify which player triggered the status change
+            sender = self.sender()
+            slot_idx = -1
+            if hasattr(self, "media_players"):
+                try:
+                    slot_idx = self.media_players.index(sender)
+                except ValueError: pass
+
             if status in (
                 QMediaPlayer.MediaStatus.BufferedMedia,
                 QMediaPlayer.MediaStatus.LoadedMedia,
@@ -5814,10 +5582,14 @@ class DAQApp(QMainWindow):
                 self._refresh_media_duration()
                 # Apply playback rate again when media is loaded, as some backends reset it
                 self._set_media_playback_rate()
-                # If we are in replay mode, force a sync now that it's loaded to show the frame
+                
+                # If we are in replay mode, force a sync for this slot or all slots
                 if getattr(self, "replay_mode_enabled", False):
                     try:
-                        self._sync_replay_video(self.replay_current_time, force_seek=True)
+                        if slot_idx != -1:
+                            self._sync_replay_video_slot(slot_idx, self.replay_current_time, force_seek=True)
+                        else:
+                            self._sync_replay_video(self.replay_current_time, force_seek=True)
                     except Exception:
                         pass
         except Exception:
@@ -5865,38 +5637,48 @@ class DAQApp(QMainWindow):
 
     def _ensure_media_audio_output(self):
         """
-        Ensure a QAudioOutput is attached to the media player.
-        This is helpful if initialization failed earlier or the backend was missing.
+        Ensure QAudioOutputs are attached to all media players.
         """
         try:
-            if (not hasattr(self, "media_audio_output")) or (self.media_audio_output is None):
-                from PyQt6.QtMultimedia import QMediaDevices
-                self.media_audio_output = QAudioOutput()
-                try:
-                    # Explicitly select system default output (e.g., FIIO headphones)
-                    default_device = QMediaDevices.defaultAudioOutput()
-                    if default_device and self.media_audio_output:
-                        self.media_audio_output.setDevice(default_device)
-                except Exception:
-                    pass
-                if hasattr(self, "media_player"):
-                    self.media_player.setAudioOutput(self.media_audio_output)
+            if not hasattr(self, "media_audio_outputs") or not self.media_audio_outputs:
+                self.media_audio_outputs = [None] * 4
+                
+            from PyQt6.QtMultimedia import QMediaDevices
+            default_device = QMediaDevices.defaultAudioOutput()
+            
+            for i in range(4):
+                if self.media_audio_outputs[i] is None:
+                    output = QAudioOutput()
+                    if default_device:
+                        output.setDevice(default_device)
+                    self.media_audio_outputs[i] = output
+                    
+                    if i < len(self.media_players):
+                        self.media_players[i].setAudioOutput(output)
+            
+            # Compatibility
+            self.media_audio_output = self.media_audio_outputs[0]
+            
             return True
         except Exception as e:
             try:
                 if hasattr(self, "logger"):
-                    self.logger.log(f"Failed to create media audio output: {e}", "WARN")
+                    self.logger.log(f"Failed to create media audio outputs: {e}", "WARN")
             except Exception:
                 pass
             return False
 
     def _set_media_playback_rate(self):
-        """Apply the current replay speed to the media player."""
-        if not hasattr(self, "media_player"):
+        """Apply the current replay speed to all media players."""
+        if not hasattr(self, "media_players"):
             return
         try:
-            rate = float(self.replay_speed_factor)
-            self.media_player.setPlaybackRate(rate)
+            rate = float(getattr(self, "replay_speed_factor", 1.0))
+            for player in self.media_players:
+                try:
+                    player.setPlaybackRate(rate)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -5964,6 +5746,7 @@ class DAQApp(QMainWindow):
 
         # Prepare automation replay data for the dashboard status table
         self.automation_replay_active = True
+        self.replay_mode_enabled = True
         self._prepare_replay_automation_events()
 
         # Load snapshots for the run (after automation events prepped, in case we need start_ts)
@@ -5990,7 +5773,6 @@ class DAQApp(QMainWindow):
         self.replay_duration = end_rel
         self.replay_current_time = 0.0
         self.last_sync_snapshot_index = -1
-        self.replay_mode_enabled = True
         self.replay_is_playing = False
         self.replay_timer.stop()
         self._set_media_controls_enabled(True)
@@ -6016,27 +5798,15 @@ class DAQApp(QMainWindow):
                 slider.blockSignals(False)
 
         # Check if camera is active before loading replay video
+        # We now allow loading replay video even if camera is active, as they are in separate widgets
+        # and live labels are hidden anyway during replay.
         camera_active = False
         if hasattr(self, 'camera_controller') and self.camera_controller:
-            camera_active = getattr(self.camera_controller, 'is_connected', False)
+            camera_active = any(getattr(self.camera_controller, 'is_connected', [False]))
         
-        if camera_active:
-            # Camera is active - show warning and skip video loading
-            QMessageBox.warning(
-                self,
-                "Camera Active",
-                "The camera is currently active. The replay video cannot be displayed because the video window is in use.\n\n"
-                "Please disconnect the camera first if you want to view the replay video."
-            )
-            # Load metadata but don't try to display video
-            self._load_replay_video_metadata(run_dir)
-            # Clear any video display
-            self._clear_replay_video()
-        else:
-            # Camera is not active - safe to load video
-            self._load_replay_video_metadata(run_dir)
-            # Draw first frame
-            self._update_replay_frame(0.0, update_sliders=True, force_video_seek=True)
+        # Load metadata and sync first frame
+        self._load_replay_video_metadata(run_dir)
+        self._update_replay_frame(0.0, update_sliders=True, force_video_seek=True)
         
         # Ensure audio UI is in sync after loading
         self._apply_media_audio_state()
@@ -6071,6 +5841,11 @@ class DAQApp(QMainWindow):
             path = entry.get("path") or entry.get("video_path")
             if not path:
                 continue
+            
+            # Ensure path is absolute for QMediaPlayer stability
+            if not os.path.isabs(path) and run_dir:
+                path = os.path.abspath(os.path.join(run_dir, path))
+
             if not os.path.exists(path):
                 # If the absolute path is missing, try to find the same filename in the run directory
                 candidate = os.path.join(run_dir, os.path.basename(path)) if run_dir else None
@@ -6106,6 +5881,7 @@ class DAQApp(QMainWindow):
             segments.append(
                 {
                     "path": path,
+                    "camera_index": entry.get("camera_index", 0),
                     "start_epoch": start_epoch,
                     "end_epoch": end_epoch_val,
                     "duration_sec": duration_val,
@@ -6160,7 +5936,7 @@ class DAQApp(QMainWindow):
         self._select_replay_segment_for_time(self.replay_current_time, force_load=True)
 
     def on_replay_play_toggle(self):
-        """Toggle play/pause for replay timeline."""
+        """Toggle play/pause for all synchronized replay slots."""
         if not self.replay_mode_enabled:
             self.on_replay_load_clicked()
             if not self.replay_mode_enabled:
@@ -6174,7 +5950,7 @@ class DAQApp(QMainWindow):
                 self.replay_play_btn.setChecked(False)
             return
         if self.replay_is_playing:
-            # Refresh duration now that playback is starting (video duration often appears after play)
+            # Refresh duration now that playback is starting
             self._refresh_media_duration()
             try:
                 QTimer.singleShot(200, self._refresh_media_duration)
@@ -6182,19 +5958,17 @@ class DAQApp(QMainWindow):
                 pass
             self.replay_last_tick = time.monotonic()
             self.replay_timer.start()
-            if hasattr(self, "media_player"):
+            if hasattr(self, "media_players"):
                 self._set_media_playback_rate()
                 # Ensure audio output is aligned with UI state
                 self._apply_media_audio_state()
-                # Unmute proactively if volume > 0 to avoid silent playback
-                try:
-                    if hasattr(self, "media_audio_output") and self.media_audio_output:
-                        if self.media_audio_output.volume() > 0:
-                            self.media_audio_output.setMuted(False)
-                except Exception:
-                    pass
-                self.media_player.play()
-                # Re-apply playback rate after play starts, as some backends reset it
+                
+                for player in self.media_players:
+                    try:
+                        player.play()
+                    except Exception:
+                        pass
+                # Re-apply playback rate after play starts
                 self._set_media_playback_rate()
             if hasattr(self, "replay_play_btn"):
                 self.replay_play_btn.setText("Pause")
@@ -6202,8 +5976,12 @@ class DAQApp(QMainWindow):
         else:
             self.replay_timer.stop()
             self.replay_last_tick = None
-            if hasattr(self, "media_player"):
-                self.media_player.pause()
+            if hasattr(self, "media_players"):
+                for player in self.media_players:
+                    try:
+                        player.pause()
+                    except Exception:
+                        pass
             if hasattr(self, "replay_play_btn"):
                 self.replay_play_btn.setText("Play")
                 self.replay_play_btn.setChecked(False)
@@ -6248,14 +6026,20 @@ class DAQApp(QMainWindow):
         self.replay_last_tick = now
         new_time = self.replay_current_time + dt
         media_dur = self._current_media_duration_seconds()
-        has_video = self.replay_video_offset is not None or (self.replay_video_duration > 0.0) or media_dur > 0.0
+        
+        # Check if any video slot is active
+        has_video = any(p is not None for p in self.replay_active_video_paths) or (self.replay_video_duration > 0.0) or media_dur > 0.0
+        
         effective_total = self._compute_replay_total(candidate_time=new_time)
 
         # Stop only when we know we're at the end (data-only replay or media reports duration/end)
         should_stop = False
         try:
             from PyQt6.QtMultimedia import QMediaPlayer
-            status = self.media_player.mediaStatus() if hasattr(self, "media_player") else None
+            
+            # Check status of master player (slot 0)
+            status = self.media_players[0].mediaStatus() if hasattr(self, "media_players") and self.media_players else None
+            
             if new_time >= effective_total:
                 if not has_video:
                     should_stop = True
@@ -6273,8 +6057,9 @@ class DAQApp(QMainWindow):
             new_time = effective_total
             self.replay_is_playing = False
             self.replay_timer.stop()
-            if hasattr(self, "media_player"):
-                self.media_player.pause()
+            if hasattr(self, "media_players"):
+                for p in self.media_players:
+                    p.pause()
             if hasattr(self, "replay_play_btn"):
                 self.replay_play_btn.setText("Play")
                 self.replay_play_btn.setChecked(False)
@@ -6307,7 +6092,9 @@ class DAQApp(QMainWindow):
             if hasattr(self, "data_replay_controller"):
                 row = self.data_replay_controller.get_row_at(rel_time)
                 if row:
-                    self.update_dashboard_metrics(row)
+                    # Enrich the row with source tag so it passes the idle gating
+                    row_data = self._row_to_data_dict(row)
+                    self.update_dashboard_metrics(row_data)
             
             self._update_replay_events_list(rel_time)
 
@@ -6652,17 +6439,19 @@ class DAQApp(QMainWindow):
         table.viewport().update()
         self.update()
 
-    def _sync_replay_video(self, rel_time: float, force_seek: bool = False):
-        """Seek video to match replay timeline if metadata is available."""
-        if self.replay_video_offset is None:
+    def _sync_replay_video_slot(self, slot_idx: int, rel_time: float, force_seek: bool = False):
+        """Seek a specific video slot to match replay timeline if metadata is available."""
+        if slot_idx >= len(self.replay_video_offsets) or slot_idx >= len(self.media_players):
             return
-        if not hasattr(self, "media_player"):
-            return
+            
+        offset = self.replay_video_offsets[slot_idx]
+        player = self.media_players[slot_idx]
+        
         try:
-            target_ms = max(0.0, (rel_time - self.replay_video_offset) * 1000.0)
+            target_ms = max(0.0, (rel_time - offset) * 1000.0)
             current_ms = 0.0
             try:
-                current_ms = float(self.media_player.position())
+                current_ms = float(player.position())
             except Exception:
                 pass
 
@@ -6670,36 +6459,30 @@ class DAQApp(QMainWindow):
             drift_ms = abs(target_ms - current_ms)
             threshold_ms = getattr(self, "replay_video_drift_threshold_ms", 150)
 
-            # Increase threshold when playing at non-normal speeds to avoid excessive seeking
-            # if the backend takes time to adjust or if setPlaybackRate is slightly off.
             if is_playing and abs(getattr(self, "replay_speed_factor", 1.0) - 1.0) > 0.1:
                 threshold_ms = max(threshold_ms, 500)
 
-            # During playback, avoid tiny auto-correct seeks to prevent audible glitches.
-            # Seek when forced, when paused, or when drift exceeds the threshold.
             should_seek = force_seek or not is_playing or (drift_ms > threshold_ms)
 
             if should_seek:
-                self.media_player.setPosition(int(target_ms))
+                player.setPosition(int(target_ms))
         except Exception:
             pass
 
+    def _sync_replay_video(self, rel_time: float, force_seek: bool = False):
+        """Seek all video slots to match replay timeline."""
+        for i in range(len(self.media_players)):
+            self._sync_replay_video_slot(i, rel_time, force_seek)
+
     def _apply_media_audio_state(self, source_widget=None):
-        """Apply current UI/settings volume and mute to the media output."""
-        if not hasattr(self, "media_player"):
+        """Apply current UI/settings volume and mute to all media outputs."""
+        if not hasattr(self, "media_players"):
             return
         try:
-            # Recreate audio output if needed (e.g., backend became available later)
+            # Recreate audio output if needed
             if not self._ensure_media_audio_output():
                 return
-            # Ensure device stays on system default (e.g., FIIO headphones)
-            try:
-                from PyQt6.QtMultimedia import QMediaDevices
-                default_device = QMediaDevices.defaultAudioOutput()
-                if default_device and self.media_audio_output:
-                    self.media_audio_output.setDevice(default_device)
-            except Exception:
-                pass
+                
             # Allow caller to specify the originating widget; fall back to sender
             if source_widget is None:
                 try:
@@ -6710,7 +6493,7 @@ class DAQApp(QMainWindow):
             vol = None
             muted = None
 
-            # Build ordered candidates for volume: source widget first, then visible sliders, then any slider
+            # Build ordered candidates for volume
             volume_candidates = []
             if isinstance(source_widget, QSlider):
                 volume_candidates.append(source_widget)
@@ -6719,7 +6502,6 @@ class DAQApp(QMainWindow):
                 if widget and widget not in volume_candidates:
                     volume_candidates.append(widget)
 
-            # Prefer the originating widget, otherwise the first visible slider, otherwise any available slider
             for widget in volume_candidates:
                 try:
                     if widget is source_widget or widget.isVisible():
@@ -6728,17 +6510,10 @@ class DAQApp(QMainWindow):
                 except Exception:
                     continue
             if vol is None:
-                for widget in volume_candidates:
-                    try:
-                        vol = float(widget.value())
-                        break
-                    except Exception:
-                        continue
-            if vol is None:
                 vol = float(self.settings.value("media_volume", "100"))
             vol = max(0.0, min(100.0, vol))
 
-            # Build ordered candidates for mute: source widget first, then visible checkboxes, then any checkbox
+            # Build ordered candidates for mute
             mute_candidates = []
             if isinstance(source_widget, QCheckBox):
                 mute_candidates.append(source_widget)
@@ -6755,23 +6530,23 @@ class DAQApp(QMainWindow):
                 except Exception:
                     continue
             if muted is None:
-                for widget in mute_candidates:
-                    try:
-                        muted = bool(widget.isChecked())
-                        break
-                    except Exception:
-                        continue
-            if muted is None:
                 muted = str(self.settings.value("media_muted", "false")).lower() == "true"
 
-            self.media_audio_output.setVolume(vol / 100.0)
-            self.media_audio_output.setMuted(muted)
+            # Apply to all audio outputs
+            if hasattr(self, "media_audio_outputs"):
+                for output in self.media_audio_outputs:
+                    if output:
+                        try:
+                            output.setVolume(vol / 100.0)
+                            output.setMuted(muted)
+                        except Exception:
+                            pass
 
             # Persist settings
             self.settings.setValue("media_volume", str(int(vol)))
             self.settings.setValue("media_muted", "true" if muted else "false")
 
-            # Keep all UI sliders/checkboxes in sync without fighting the user's change
+            # Keep all UI sliders/checkboxes in sync
             for widget_name in ["video_volume_slider", "camera_volume_slider", "dashboard_volume_slider"]:
                 widget = getattr(self, widget_name, None)
                 if widget:
@@ -6791,6 +6566,7 @@ class DAQApp(QMainWindow):
                     except Exception:
                         pass
         except Exception as e:
+            print(f"Error applying media audio state: {e}")
             try:
                 if hasattr(self, "logger"):
                     self.logger.log(f"Failed to apply media audio state: {e}", "WARN")

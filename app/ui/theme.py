@@ -1012,6 +1012,38 @@ class CardStyles:
             """
     
     @staticmethod
+    def plugin_card(connected: bool = False) -> str:
+        """
+        Custom card style for plugin-based interfaces.
+        Uses a light blue border when not connected.
+        """
+        base_top = "rgba(50, 45, 75, 0.9)"
+        base_bottom = "rgba(35, 35, 55, 0.85)"
+        
+        if connected:
+            return CardStyles.device_card(connected=True)
+        else:
+            return f"""
+                QFrame {{
+                    background: qlineargradient(x1:0, y1:0, x2:0.5, y2:1,
+                        stop:0 {base_top},
+                        stop:1 {base_bottom});
+                    border-radius: 8px;
+                    border: 2px solid {COLORS.INFO};
+                }}
+                QFrame:hover {{
+                    background: qlineargradient(x1:0, y1:0, x2:0.5, y2:1,
+                        stop:0 rgba(65, 60, 95, 0.95),
+                        stop:1 rgba(45, 45, 75, 0.9));
+                    border: 2px solid {COLORS.INFO_BRIGHT};
+                }}
+                QLabel {{
+                    background: transparent;
+                    border: none;
+                }}
+            """
+
+    @staticmethod
     def info_panel() -> str:
         """Großes Info-Panel für Details"""
         return f"""

@@ -20,6 +20,29 @@ from app.core.interfaces.base_interface import BaseInterface
 class MQTTInterface(BaseInterface):
     """Interface for MQTT brokers"""
     
+    DISPLAY_NAME = "MQTT"
+    DESCRIPTION = "Connect to an MQTT broker"
+    ICON = "☁️"
+    
+    HELP_TEXT = """
+    <h3>MQTT Interface</h3>
+    <p>Connects to an MQTT broker to receive sensor data.</p>
+    <p><b>How to use:</b></p>
+    <ol>
+        <li>Enter your broker address and port.</li>
+        <li>Set a unique Client ID.</li>
+        <li>Add sensors with interface type 'MQTT' and set the 'Topic' as the sensor port.</li>
+    </ol>
+    """
+    
+    CONFIG_SCHEMA = {
+        "broker": {"type": "string", "label": "Broker Address", "default": "localhost"},
+        "port": {"type": "number", "label": "Port", "default": 1883},
+        "client_id": {"type": "string", "label": "Client ID", "default": "ArtefaktDAQ"},
+        "username": {"type": "string", "label": "Username", "default": ""},
+        "password": {"type": "string", "label": "Password", "default": ""}
+    }
+
     # Connection lost callback
     on_connection_lost = None
     
@@ -101,7 +124,13 @@ class MQTTInterface(BaseInterface):
             return True
             
         except Exception as e:
-            self.error_message = f"Failed to connect to MQTT broker: {e}"
+            err_str = str(e)
+            if "refused" in err_str or "10061" in err_str:
+                self.error_message = f"Connection refused by {self.broker}:{self.port}. Is the broker running?"
+            elif "timed out" in err_str.lower():
+                self.error_message = f"Connection to {self.broker} timed out. Check your network settings."
+            else:
+                self.error_message = f"MQTT error: {err_str}"
             self.connected = False
             return False
             

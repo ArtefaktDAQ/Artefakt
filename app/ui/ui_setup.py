@@ -1,15 +1,16 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, 
                            QLabel, QPushButton, QTabWidget, QTableWidget, QTableWidgetItem,
                            QComboBox, QGroupBox, QGridLayout, QLineEdit, QSpinBox, QDoubleSpinBox,
-                           QCheckBox, QTabWidget, QTextEdit, QSizePolicy, QColorDialog, QFrame,
+                           QCheckBox, QTextEdit, QSizePolicy, QColorDialog, QFrame,
                            QScrollArea, QListWidget, QListWidgetItem, QSplitter, QGraphicsDropShadowEffect,
                            QHeaderView, QSlider, QTreeView, QFormLayout, QSpacerItem, QStackedWidget,
-                           QToolButton, QAbstractItemView)
+                           QToolButton, QAbstractItemView, QButtonGroup, QDialog, QDialogButtonBox)
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QPixmap, QColor, QIcon, QPainter
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 import pyqtgraph as pyqtgraph
 from PyQt6.QtGui import QStandardItemModel
+from app.core.interfaces.interface_registry import InterfaceRegistry
 import cv2
 import os
 import sys
@@ -42,6 +43,44 @@ def resource_path(relative_path):
 
     return os.path.join(base_path, relative_path)
 
+class CameraDisplayLabel(QLabel):
+    """A QLabel that scales its pixmap efficiently to fill the available space during paintEvent."""
+    def __init__(self, text="No camera connected", parent=None):
+        super().__init__(text, parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._pixmap = None
+        self.setStyleSheet("background-color: #111; color: #888; border: 1px solid #333; border-radius: 4px; font-size: 14px;")
+
+    def setPixmap(self, pixmap):
+        self._pixmap = pixmap
+        # Clear internal QLabel pixmap to avoid redundant drawing
+        super().setPixmap(QPixmap())
+        self.update()
+
+    def setText(self, text):
+        self._pixmap = None
+        super().setText(text)
+
+    def paintEvent(self, event):
+        if self._pixmap and not self._pixmap.isNull():
+            painter = QPainter(self)
+            # Use SmoothPixmapTransform for better quality when resizing
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            
+            label_size = self.size()
+            if label_size.width() <= 0 or label_size.height() <= 0:
+                return
+                
+            pixmap_size = self._pixmap.size()
+            scaled_size = pixmap_size.scaled(label_size, Qt.AspectRatioMode.KeepAspectRatio)
+            
+            x = (label_size.width() - scaled_size.width()) // 2
+            y = (label_size.height() - scaled_size.height()) // 2
+            
+            painter.drawPixmap(x, y, scaled_size.width(), scaled_size.height(), self._pixmap)
+        else:
+            super().paintEvent(event)
+
 class DashMetricCard(QFrame):
     """A compact card for displaying a single sensor's current value on the dashboard"""
     def __init__(self, sensor_name, unit, color="#fff", parent=None):
@@ -51,11 +90,12 @@ class DashMetricCard(QFrame):
         self.accent_color = color
         
         self.setStyleSheet(CardStyles.metric_card(color))
-        self.setMinimumHeight(70) # Reduced from 80
-        self.setMaximumHeight(90) # Reduced from 100
+        self.setMinimumHeight(70) # Reverted
+        self.setMaximumHeight(90) # Reverted
+        self.setFixedWidth(130)   # Reduced from 150 to 130 to make cards even narrower
         
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setContentsMargins(10, 8, 10, 8) 
         layout.setSpacing(2)
         
         # Name and trend
@@ -173,7 +213,7 @@ def setup_ui(self):
     
     main_layout = QHBoxLayout(central_widget)
     main_layout.setSpacing(12)
-    main_layout.setContentsMargins(12, 12, 12, 12)
+    main_layout.setContentsMargins(12, 0, 2, 0) # Removed top/bottom margins to allow edge-to-edge content
 
     # Left sidebar
     sidebar = QWidget()
@@ -190,7 +230,7 @@ def setup_ui(self):
     sidebar_layout.setContentsMargins(0, 10, 0, 20)
 
     # Sidebar toggle button
-    self.sidebar_collapsed = False
+    self.sidebar_collapsed = True  # Start collapsed by default for more space
     toggle_container = QHBoxLayout()
     toggle_container.setContentsMargins(5, 5, 10, 5)
     toggle_container.addStretch()
@@ -311,9 +351,6 @@ def setup_ui(self):
     self.sidebar_separator2.setStyleSheet(SidebarTheme.SEPARATOR)
     sidebar_layout.addWidget(self.sidebar_separator2)
     
-    # Add spacer to push controls to bottom
-    sidebar_layout.addStretch()
-
     # Navigation buttons with SVG icons instead of emoji
     nav_buttons = [
         "Projects",
@@ -537,16 +574,19 @@ def setup_ui(self):
     content_area = QWidget()
     content_layout = QHBoxLayout(content_area)
     content_layout.setSpacing(10)
-    content_layout.setContentsMargins(10, 10, 10, 10)
+    content_layout.setContentsMargins(10, 0, 2, 0) # Removed top/bottom margins to allow edge-to-edge content
 
-    # Create stacked widget with visible tab bar
+    # Create stacked widget
     self.stacked_widget = QStackedWidget()
+    # Flatten stacked widget to remove any internal padding/margins
+    self.stacked_widget.setStyleSheet("QStackedWidget { padding: 0px; margin: 0px; border: none; }")
 
     # Dashboard tab
     dashboard_tab = QWidget()
     self.dashboard_tab = dashboard_tab
     dashboard_layout = QVBoxLayout(dashboard_tab)
-    dashboard_layout.setContentsMargins(10, 10, 10, 10)
+    # Reduced top/bottom margins to 0 to maximize space for dashboard content
+    dashboard_layout.setContentsMargins(10, 0, 2, 0) 
     dashboard_layout.setSpacing(10)
 
     # --- NEW: Dashboard Header (Status & Project Info) ---
@@ -790,25 +830,25 @@ def setup_ui(self):
     self.dash_snapshot_btn = QPushButton()
     self.dash_snapshot_btn.setToolTip("Take Snapshot")
     self.dash_snapshot_btn.setStyleSheet(ButtonStyles.secondary("small"))
-    self.dash_snapshot_btn.setFixedSize(48, 48)
+    self.dash_snapshot_btn.setFixedSize(36, 36)
     self.dash_snapshot_btn.setIcon(QIcon(resource_path("app/ui/Camera.svg")))
-    self.dash_snapshot_btn.setIconSize(QSize(36, 36))
+    self.dash_snapshot_btn.setIconSize(QSize(22, 22))
     header_actions.addWidget(self.dash_snapshot_btn)
     
     self.dash_note_btn = QPushButton()
     self.dash_note_btn.setToolTip("Quick Note")
     self.dash_note_btn.setStyleSheet(ButtonStyles.secondary("small"))
-    self.dash_note_btn.setFixedSize(48, 48)
+    self.dash_note_btn.setFixedSize(36, 36)
     self.dash_note_btn.setIcon(QIcon(resource_path("app/ui/Notes.svg")))
-    self.dash_note_btn.setIconSize(QSize(36, 36))
+    self.dash_note_btn.setIconSize(QSize(22, 22))
     header_actions.addWidget(self.dash_note_btn)
     
     self.dash_settings_btn = QPushButton()
     self.dash_settings_btn.setToolTip("Dashboard Settings")
     self.dash_settings_btn.setStyleSheet(ButtonStyles.secondary("small"))
-    self.dash_settings_btn.setFixedSize(48, 48)
+    self.dash_settings_btn.setFixedSize(36, 36)
     self.dash_settings_btn.setIcon(QIcon(resource_path("app/ui/Settings.svg")))
-    self.dash_settings_btn.setIconSize(QSize(36, 36))
+    self.dash_settings_btn.setIconSize(QSize(22, 22))
     header_actions.addWidget(self.dash_settings_btn)
     
     header_layout.addLayout(header_actions)
@@ -851,13 +891,16 @@ def setup_ui(self):
     self.metrics_scroll.setStyleSheet("background: transparent; border: none;")
     self.metrics_container = QWidget()
     self.metrics_container.setStyleSheet("background: transparent;")
-    self.metrics_grid = QVBoxLayout(self.metrics_container)
+    self.metrics_grid = QGridLayout(self.metrics_container)
     self.metrics_grid.setContentsMargins(0, 0, 0, 0)
     self.metrics_grid.setSpacing(8)
-    self.metrics_grid.addStretch()
+    self.metrics_grid.setAlignment(Qt.AlignmentFlag.AlignTop)
     
     self.metrics_scroll.setWidget(self.metrics_container)
     metrics_layout.addWidget(self.metrics_scroll)
+    
+    # Add an event filter to the container to handle responsive column layout
+    self.metrics_container.installEventFilter(self)
     
     upper_splitter.addWidget(metrics_group)
     
@@ -1009,46 +1052,27 @@ def setup_ui(self):
     self.dashboard_camera_group.setStyleSheet(GroupBoxStyles.default())
     dashboard_camera_layout = QVBoxLayout(self.dashboard_camera_group)
     
-    # Camera source selection
+    # Camera source selection (4 checkboxes)
     camera_source_layout = QHBoxLayout()
-    camera_source_label = QLabel("Source:")
-    camera_source_label.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 11px;")
-    camera_source_layout.addWidget(camera_source_label)
+    camera_source_layout.setSpacing(12)
     
-    self.dashboard_camera_source = QComboBox()
-    self.dashboard_camera_source.setStyleSheet(f"""
-        QComboBox {{
-            background: {COLORS.BG_INPUT};
-            color: {COLORS.TEXT_PRIMARY};
-            border: 1px solid {COLORS.BORDER_DEFAULT};
-            border-radius: 4px;
-            padding: 4px 8px;
-            min-width: 150px;
-        }}
-    """)
-    self.dashboard_camera_source.addItem("📷 Main Camera", "main")
-    # Optical Sensors will be added dynamically when they are created
-    self.dashboard_camera_source.currentIndexChanged.connect(
-        lambda: self.switch_dashboard_camera_source() if hasattr(self, 'switch_dashboard_camera_source') else None
-    )
-    camera_source_layout.addWidget(self.dashboard_camera_source)
-    
-    self.refresh_camera_sources_btn = QPushButton("🔄")
-    self.refresh_camera_sources_btn.setToolTip("Refresh camera sources")
-    self.refresh_camera_sources_btn.setFixedSize(28, 28)
-    self.refresh_camera_sources_btn.setStyleSheet(ButtonStyles.secondary("small"))
-    self.refresh_camera_sources_btn.clicked.connect(
-        lambda: self.refresh_dashboard_camera_sources() if hasattr(self, 'refresh_dashboard_camera_sources') else None
-    )
-    camera_source_layout.addWidget(self.refresh_camera_sources_btn)
+    self.dashboard_camera_checkboxes = []
+    for i in range(4):
+        cb = QCheckBox(f"Cam {i+1}")
+        cb.setStyleSheet(f"color: {COLORS.TEXT_PRIMARY}; font-size: 11px; font-weight: bold;")
+        # Connect with slot index
+        cb.toggled.connect(
+            lambda _, idx=i: self.switch_dashboard_camera_source(idx) if hasattr(self, 'switch_dashboard_camera_source') else None
+        )
+        self.dashboard_camera_checkboxes.append(cb)
+        camera_source_layout.addWidget(cb)
 
     # Dashboard video audio controls
-    camera_source_layout.addSpacing(12)
-    camera_source_layout.addWidget(QLabel("Vol.:"))
+    camera_source_layout.addSpacing(8)
     self.dashboard_volume_slider = QSlider(Qt.Orientation.Horizontal)
     self.dashboard_volume_slider.setRange(0, 100)
     self.dashboard_volume_slider.setValue(100)
-    self.dashboard_volume_slider.setFixedWidth(100) # Slightly reduced
+    self.dashboard_volume_slider.setFixedWidth(80)
     self.dashboard_volume_slider.setEnabled(True)
     camera_source_layout.addWidget(self.dashboard_volume_slider)
     self.dashboard_mute_checkbox = QCheckBox("🔇")
@@ -1059,18 +1083,81 @@ def setup_ui(self):
     camera_source_layout.addStretch()
     dashboard_camera_layout.addLayout(camera_source_layout)
     
-    # Camera preview label
-    self.dashboard_camera_label = QLabel("No camera connected")
-    self.dashboard_camera_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    self.dashboard_camera_label.setStyleSheet("background-color: #222; color: white;")
-    self.dashboard_camera_label.setMinimumHeight(80) # Reduced from 150
-    dashboard_camera_layout.addWidget(self.dashboard_camera_label)
+    # Placeholder for when no cameras are selected
+    self.dashboard_camera_placeholder = CameraDisplayLabel("No camera selected")
+    self.dashboard_camera_placeholder.setStyleSheet("background-color: #111; color: #888; border: 1px solid #333; border-radius: 4px; font-size: 14px;")
+    self.dashboard_camera_placeholder.setMinimumHeight(80)
+    self.dashboard_camera_placeholder.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    dashboard_camera_layout.addWidget(self.dashboard_camera_placeholder)
+    
+    # Camera preview labels (4-slot Dynamic Layout)
+    self.dashboard_camera_rows_layout = QVBoxLayout()
+    self.dashboard_camera_rows_layout.setSpacing(4)
+    self.dashboard_camera_rows_layout.setContentsMargins(0, 0, 0, 0)
+    
+    self.dashboard_camera_row_widgets = []
+    self.dashboard_camera_row_layouts = []
+    
+    self.dashboard_camera_labels = []
+    for row in range(2):
+        row_widget = QWidget()
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setSpacing(4)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        self.dashboard_camera_row_widgets.append(row_widget)
+        self.dashboard_camera_row_layouts.append(row_layout)
+        self.dashboard_camera_rows_layout.addWidget(row_widget)
+        
+        for col in range(2):
+            lbl = CameraDisplayLabel("No camera connected")
+            lbl.setMinimumHeight(80)
+            lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            self.dashboard_camera_labels.append(lbl)
+            row_layout.addWidget(lbl)
+            
+            # Start hidden so placeholder shows
+            lbl.hide()
+        
+        # Start hidden
+        row_widget.hide()
 
-    # Video playback widget for review mode (hidden by default)
-    self.dashboard_video_widget = QVideoWidget()
-    self.dashboard_video_widget.setMinimumHeight(80) # Reduced from 150
-    self.dashboard_video_widget.hide()
-    dashboard_camera_layout.addWidget(self.dashboard_video_widget)
+    # Compatibility attributes
+    self.dashboard_camera_label_1 = self.dashboard_camera_labels[0]
+    self.dashboard_camera_label_2 = self.dashboard_camera_labels[1]
+    self.dashboard_camera_label_3 = self.dashboard_camera_labels[2]
+    self.dashboard_camera_label_4 = self.dashboard_camera_labels[3]
+    self.dashboard_camera_label = self.dashboard_camera_label_1
+    
+    dashboard_camera_layout.addLayout(self.dashboard_camera_rows_layout)
+
+    # Video playback widgets for review mode (4-slot Dynamic Layout)
+    self.dashboard_video_rows_layout = QVBoxLayout()
+    self.dashboard_video_rows_layout.setSpacing(4)
+    self.dashboard_video_rows_layout.setContentsMargins(0, 0, 0, 0)
+    
+    self.dashboard_video_row_widgets = []
+    
+    self.dashboard_video_widgets = []
+    for row in range(2):
+        row_widget = QWidget()
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setSpacing(4)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        self.dashboard_video_row_widgets.append(row_widget)
+        self.dashboard_video_rows_layout.addWidget(row_widget)
+        
+        for col in range(2):
+            vw = QVideoWidget()
+            vw.setMinimumHeight(80)
+            vw.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            vw.hide()
+            self.dashboard_video_widgets.append(vw)
+            row_layout.addWidget(vw, 1)
+        
+        row_widget.hide()
+    
+    self.dashboard_video_widget = self.dashboard_video_widgets[0] # Compatibility
+    dashboard_camera_layout.addLayout(self.dashboard_video_rows_layout)
     
     # Add camera group to the splitter
     lower_splitter.addWidget(self.dashboard_camera_group)
@@ -1090,14 +1177,12 @@ def setup_ui(self):
     # Add splitter to dashboard layout
     dashboard_layout.addWidget(self.dashboard_splitter, 1)
     
-    # Add tabs in correct order with visible text
-    self.stacked_widget.addWidget(dashboard_tab)
-    
     # Create Camera Tab
     camera_tab = QWidget()
+    self.camera_tab = camera_tab
     camera_tab.setStyleSheet(f"background-color: {COLORS.BG_DARK};")
     camera_layout = QHBoxLayout(camera_tab)
-    camera_layout.setContentsMargins(15, 15, 15, 15)
+    camera_layout.setContentsMargins(15, 0, 15, 0)
     camera_layout.setSpacing(12)
     
     # Define button styles using theme system
@@ -1149,43 +1234,57 @@ def setup_ui(self):
     camera_splitter = QSplitter(Qt.Orientation.Horizontal)
     camera_layout.addWidget(camera_splitter)
     
-    # Left side - Camera settings (Tabbed Interface)
+    # Left side - Camera settings (Global & Hidden Slot Settings)
     camera_settings_container = QWidget()
-    camera_settings_container.setMinimumWidth(380) # Increased from 320
-    camera_settings_container.setMaximumWidth(500) # Increased from 400
+    camera_settings_container.setMinimumWidth(200) # Reduced from 380
+    camera_settings_container.setMaximumWidth(250) # Reduced from 500
     camera_settings_main_layout = QVBoxLayout(camera_settings_container)
     camera_settings_main_layout.setContentsMargins(0, 0, 5, 0)
-    camera_settings_main_layout.setSpacing(0)
+    camera_settings_main_layout.setSpacing(10)
 
-    # Main Tab Widget for categorized settings
-    self.camera_side_tabs = QTabWidget()
-    self.camera_side_tabs.setStyleSheet(TabStyles.default())
-    camera_settings_main_layout.addWidget(self.camera_side_tabs)
-
-    # --- TAB 1: SOURCE & STATUS ---
-    source_tab = QWidget()
-    source_layout = QVBoxLayout(source_tab)
-    source_layout.setContentsMargins(10, 15, 10, 10)
-    source_layout.setSpacing(12)
-    
-    # Help and Settings button at the top
-    top_buttons_layout = QHBoxLayout()
+    # Help and Settings button at the top (Now these are the main global settings)
+    global_buttons_group = QGroupBox("Global Settings")
+    global_buttons_group.setStyleSheet(GroupBoxStyles.default())
+    global_buttons_layout = QVBoxLayout(global_buttons_group)
     
     self.camera_settings_btn = QPushButton("⚙️ Advanced Settings")
     self.camera_settings_btn.setFixedHeight(32)
     self.camera_settings_btn.setStyleSheet(ButtonStyles.get("secondary", "small"))
     self.camera_settings_btn.setFont(Typography.button())
     self.camera_settings_btn.clicked.connect(self.show_camera_settings_popup)
-    top_buttons_layout.addWidget(self.camera_settings_btn, 1)
+    global_buttons_layout.addWidget(self.camera_settings_btn)
     
     self.camera_help_btn = QPushButton("❓ Help")
     self.camera_help_btn.setCheckable(True)
     self.camera_help_btn.setFixedHeight(32)
-    self.camera_help_btn.setFixedWidth(70)
     self.camera_help_btn.setStyleSheet(ButtonStyles.get("secondary", "small"))
-    top_buttons_layout.addWidget(self.camera_help_btn)
+    global_buttons_layout.addWidget(self.camera_help_btn)
     
-    source_layout.addLayout(top_buttons_layout)
+    self.disconnect_all_btn = QPushButton("🔌 Disconnect All")
+    self.disconnect_all_btn.setFixedHeight(32)
+    self.disconnect_all_btn.setStyleSheet(ButtonStyles.danger("small"))
+    self.disconnect_all_btn.setFont(Typography.button())
+    global_buttons_layout.addWidget(self.disconnect_all_btn)
+    
+    camera_settings_main_layout.addWidget(global_buttons_group)
+    camera_settings_main_layout.addStretch()
+
+    # Hidden container for camera-specific tabs (will be moved to popup)
+    self.camera_side_tabs_container = QWidget()
+    self.camera_side_tabs_container.setVisible(False)
+    tabs_layout = QVBoxLayout(self.camera_side_tabs_container)
+    tabs_layout.setContentsMargins(0, 0, 0, 0)
+    
+    # Main Tab Widget for categorized settings
+    self.camera_side_tabs = QTabWidget()
+    self.camera_side_tabs.setStyleSheet(TabStyles.default())
+    tabs_layout.addWidget(self.camera_side_tabs)
+
+    # --- TAB 1: SOURCE & STATUS ---
+    source_tab = QWidget()
+    source_layout = QVBoxLayout(source_tab)
+    source_layout.setContentsMargins(10, 15, 10, 10)
+    source_layout.setSpacing(12)
     
     # Camera connection settings - modernized
     camera_connection_group = QGroupBox("📹 Camera Connection")
@@ -1206,15 +1305,12 @@ def setup_ui(self):
     
     camera_connection_layout.addWidget(QLabel("Source:"), 1, 0)
     source_row_layout = QHBoxLayout()
+    source_row_layout.setSpacing(5)
     # Use a very unique name to avoid any shadowing
     self.camera_source_combo = QComboBox() 
     self.camera_id = self.camera_source_combo # Compatibility
     self.camera_id_dropdown = self.camera_source_combo # Compatibility
     self.camera_source_combo.setObjectName("camera_source_dropdown_widget")
-    
-    print(f"UI_SETUP: Created camera_source_combo (id={id(self.camera_source_combo)})")
-    print(f"UI_SETUP: Assigned to self.camera_id (id={id(self.camera_id)})")
-    
     self.camera_source_combo.setStyleSheet(InputStyles.default())
     self.camera_source_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     source_row_layout.addWidget(self.camera_source_combo)
@@ -1224,32 +1320,80 @@ def setup_ui(self):
     self.camera_refresh_btn.setToolTip("Refresh camera list")
     self.camera_refresh_btn.setStyleSheet(ButtonStyles.get("secondary", "small"))
     source_row_layout.addWidget(self.camera_refresh_btn)
-    camera_connection_layout.addLayout(source_row_layout, 1, 1)
+    camera_connection_layout.addLayout(source_row_layout, 1, 1, 1, 2)
     
-    # Connect button
+    # Connect and Apply buttons in their own row
+    connect_layout = QHBoxLayout()
+    connect_layout.setSpacing(10)
     self.camera_connect_btn = QPushButton("Connect")
-    self.camera_connect_btn.setFixedSize(85, 28)
+    self.camera_connect_btn.setFixedHeight(28)
+    self.camera_connect_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     self.camera_connect_btn.setStyleSheet(ButtonStyles.success("small"))
-    camera_connection_layout.addWidget(self.camera_connect_btn, 1, 2)
+    connect_layout.addWidget(self.camera_connect_btn)
+    
+    self.camera_apply_settings_btn = QPushButton("Apply")
+    self.camera_apply_settings_btn.setFixedHeight(28)
+    self.camera_apply_settings_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    self.camera_apply_settings_btn.setStyleSheet(ButtonStyles.get("secondary", "small"))
+    self.camera_apply_settings_btn.setToolTip("Apply resolution and FPS changes to the active camera")
+    connect_layout.addWidget(self.camera_apply_settings_btn)
+    
+    camera_connection_layout.addLayout(connect_layout, 2, 1, 1, 2)
+
+    # Resolution
+    camera_connection_layout.addWidget(QLabel("Res:"), 3, 0)
+    self.camera_resolution = QComboBox()
+    self.camera_resolution.addItems(["640x480", "800x600", "1280x720", "1920x1080"])
+    self.camera_resolution.setStyleSheet(InputStyles.default())
+    camera_connection_layout.addWidget(self.camera_resolution, 3, 1, 1, 2)
+
+    # Framerate
+    camera_connection_layout.addWidget(QLabel("FPS:"), 4, 0)
+    self.camera_framerate = QComboBox()
+    self.camera_framerate.addItems(["15", "30", "60"])
+    self.camera_framerate.setStyleSheet(InputStyles.default())
+    camera_connection_layout.addWidget(self.camera_framerate, 4, 1, 1, 2)
 
     # FPS Display
-    fps_label = QLabel("Frame Rate:")
+    fps_label = QLabel("Actual Rate:")
     fps_label.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY};")
-    camera_connection_layout.addWidget(fps_label, 2, 0)
+    camera_connection_layout.addWidget(fps_label, 5, 0)
     
     self.camera_fps_display = QLabel("0.0 / 0.0 FPS")
     self.camera_fps_display.setStyleSheet(f"color: {COLORS.PRIMARY_LIGHT}; font-weight: bold;")
     self.camera_fps_display.setToolTip("Actual FPS / Target FPS")
-    camera_connection_layout.addWidget(self.camera_fps_display, 2, 1, 1, 2)
+    camera_connection_layout.addWidget(self.camera_fps_display, 5, 1, 1, 2)
     
     # Sync Note
-    sync_note = QLabel("Note: If actual FPS is lower than target, frames are duplicated to maintain sync with sensor data.")
+    sync_note = QLabel("Note: If actual FPS is lower than target, frames are duplicated.")
     sync_note.setWordWrap(True)
     sync_note.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 10px; font-style: italic;")
-    camera_connection_layout.addWidget(sync_note, 3, 0, 1, 3)
+    camera_connection_layout.addWidget(sync_note, 6, 0, 1, 3)
     
-    # Add camera connection group to source layout
+    # Recording settings for individual cameras
+    recording_settings_group = QGroupBox("⏺️ Recording Settings")
+    recording_settings_group.setStyleSheet(GroupBoxStyles.tight())
+    recording_settings_layout = QGridLayout(recording_settings_group)
+    recording_settings_layout.setContentsMargins(10, 10, 10, 10)
+    recording_settings_layout.setSpacing(8)
+    
+    self.record_video_checkbox = QCheckBox("Record Video")
+    self.record_video_checkbox.setChecked(True)
+    recording_settings_layout.addWidget(self.record_video_checkbox, 0, 0)
+    
+    self.record_audio_checkbox = QCheckBox("Record Audio")
+    self.record_audio_checkbox.setChecked(False)
+    recording_settings_layout.addWidget(self.record_audio_checkbox, 0, 1)
+
+    recording_settings_layout.addWidget(QLabel("Audio Device:"), 1, 0)
+    self.camera_audio_device = QComboBox()
+    self.camera_audio_device.addItem("Default Mic", -1)
+    self.camera_audio_device.setStyleSheet(InputStyles.default())
+    recording_settings_layout.addWidget(self.camera_audio_device, 1, 1)
+    
+    # Add to source layout
     source_layout.addWidget(camera_connection_group)
+    source_layout.addWidget(recording_settings_group)
     
     # Motion indicator in camera tab - modernized
     motion_status_group = QGroupBox("🔍 Motion Detection")
@@ -1269,12 +1413,10 @@ def setup_ui(self):
     motion_status_text.setStyleSheet(StatusText.success())
     motion_status_layout.addWidget(motion_status_text)
     motion_status_layout.addStretch()
-    
-    # Add motion status group to source layout
-    source_layout.addWidget(motion_status_group)
+
     source_layout.addStretch()
     self.camera_side_tabs.addTab(source_tab, "Source")
-
+    
     # --- TAB 2: ADJUSTMENTS ---
     adjust_tab = QWidget()
     adjust_layout = QVBoxLayout(adjust_tab)
@@ -1367,10 +1509,52 @@ def setup_ui(self):
     
     # Add camera controls group to adjust layout
     adjust_layout.addWidget(camera_controls_group)
+    
+    # Motion Detection Settings for the active camera
+    motion_settings_group = QGroupBox("🔍 Motion Detection")
+    motion_settings_group.setStyleSheet(GroupBoxStyles.tight())
+    motion_settings_layout = QGridLayout(motion_settings_group)
+    motion_settings_layout.setContentsMargins(10, 10, 10, 10)
+    motion_settings_layout.setSpacing(10)
+    
+    self.motion_detection_enabled = QCheckBox("Enable Motion Detection")
+    self.motion_detection_enabled.setStyleSheet(f"color: {COLORS.TEXT_PRIMARY}; font-weight: 500;")
+    motion_settings_layout.addWidget(self.motion_detection_enabled, 0, 0, 1, 2)
+    
+    motion_settings_layout.addWidget(QLabel("Sensitivity:"), 1, 0)
+    self.motion_detection_sensitivity = QSlider(Qt.Orientation.Horizontal)
+    self.motion_detection_sensitivity.setStyleSheet(slider_style)
+    self.motion_detection_sensitivity.setRange(1, 100)
+    self.motion_detection_sensitivity.setValue(20)
+    motion_settings_layout.addWidget(self.motion_detection_sensitivity, 1, 1)
+    
+    motion_settings_layout.addWidget(QLabel("Min Area:"), 2, 0)
+    self.motion_detection_min_area = QSpinBox()
+    self.motion_detection_min_area.setStyleSheet(InputStyles.default())
+    self.motion_detection_min_area.setRange(10, 10000)
+    self.motion_detection_min_area.setSingleStep(100)
+    self.motion_detection_min_area.setValue(500)
+    motion_settings_layout.addWidget(self.motion_detection_min_area, 2, 1)
+    
     adjust_layout.addStretch()
     self.camera_side_tabs.addTab(adjust_tab, "Adjust")
 
-    # --- TAB 3: OVERLAY ---
+    # --- TAB 3: MOTION DETECTION ---
+    motion_tab = QWidget()
+    motion_layout = QVBoxLayout(motion_tab)
+    motion_layout.setContentsMargins(10, 15, 10, 10)
+    motion_layout.setSpacing(12)
+    
+    # Update group box titles
+    motion_status_group.setTitle("🔍 Motion Status")
+    motion_settings_group.setTitle("🔍 Motion Configuration")
+    
+    motion_layout.addWidget(motion_status_group)
+    motion_layout.addWidget(motion_settings_group)
+    motion_layout.addStretch()
+    self.camera_side_tabs.addTab(motion_tab, "Motion Detection")
+
+    # --- TAB 4: OVERLAY ---
     overlay_tab = QWidget()
     overlay_main_layout = QVBoxLayout(overlay_tab)
     overlay_main_layout.setContentsMargins(0, 0, 0, 0)
@@ -1537,47 +1721,80 @@ def setup_ui(self):
     camera_view_layout.setContentsMargins(10, 0, 0, 0)
     camera_view_layout.setSpacing(10)
     
-    # Camera view with modern frame
+    # Main content area with thumbnails on the left and large view on the right
+    content_hbox = QHBoxLayout()
+    
+    # Vertical thumbnail list
+    thumb_scroll = QScrollArea()
+    thumb_scroll.setFixedWidth(200) # Increased from 180 to fit longer button text
+    thumb_scroll.setWidgetResizable(True)
+    thumb_scroll.setFrameShape(QFrame.Shape.NoFrame)
+    thumb_container = QWidget()
+    thumb_vbox = QVBoxLayout(thumb_container)
+    thumb_vbox.setContentsMargins(0, 0, 5, 0)
+    thumb_vbox.setSpacing(10)
+    
+    self.camera_preview_labels = []
+    for i in range(4):
+        slot_frame = QFrame()
+        slot_frame.setStyleSheet(f"background: {COLORS.BG_DARK}; border: 1px solid {COLORS.BORDER_DEFAULT}; border-radius: 4px;")
+        slot_layout = QVBoxLayout(slot_frame)
+        slot_layout.setContentsMargins(2, 2, 2, 2)
+        
+        lbl = QLabel(f"C{i+1}")
+        lbl.setFixedSize(180, 135) # Slightly larger
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setStyleSheet("background: black; color: white;")
+        lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+        lbl.setToolTip(f"Click to view Camera {i+1}")
+        # Make the preview clickable
+        lbl.mousePressEvent = lambda e, idx=i: self.camera_controller.set_main_view(idx)
+        slot_layout.addWidget(lbl)
+        self.camera_preview_labels.append(lbl)
+        
+        cfg_btn = QPushButton(f"Configure Camera {i+1}")
+        cfg_btn.setFixedHeight(28)
+        cfg_btn.setStyleSheet(camera_button_style)
+        def handle_cfg_click(checked, idx=i):
+            self.camera_controller.set_active_config_slot(idx)
+            self.show_camera_config_dialog(idx)
+        cfg_btn.clicked.connect(handle_cfg_click)
+        slot_layout.addWidget(cfg_btn)
+        
+        thumb_vbox.addWidget(slot_frame)
+    thumb_vbox.addStretch()
+    thumb_scroll.setWidget(thumb_container)
+    content_hbox.addWidget(thumb_scroll)
+    
+    # Large Camera view
     camera_view_frame = QFrame()
-    camera_view_frame.setStyleSheet(f"""
-        QFrame {{
-            background: {COLORS.BG_CARD};
-            border: 2px solid {COLORS.BORDER_DEFAULT};
-            border-radius: 8px;
-        }}
-    """)
+    camera_view_frame.setStyleSheet(f"background: {COLORS.BG_CARD}; border: 2px solid {COLORS.BORDER_DEFAULT}; border-radius: 8px;")
     camera_frame_layout = QVBoxLayout(camera_view_frame)
     camera_frame_layout.setContentsMargins(4, 4, 4, 4)
     
     self.camera_label = QLabel("📷 No camera connected")
     self.camera_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    self.camera_label.setStyleSheet(f"""
-        background-color: {COLORS.BG_DARK};
-        color: {COLORS.TEXT_MUTED};
-        font-size: 16px;
-        border-radius: 8px;
-    """)
-    self.camera_label.setMinimumSize(320, 240) # Reduced from 640, 480 to allow window shrinking
-    
-    # Enable mouse tracking for overlay dragging
+    self.camera_label.setStyleSheet(f"background-color: {COLORS.BG_DARK}; color: {COLORS.TEXT_MUTED}; font-size: 16px; border-radius: 8px;")
+    self.camera_label.setMinimumSize(320, 240)
     self.camera_label.setMouseTracking(True)
     self.camera_label.mousePressEvent = self.camera_mouse_press
     self.camera_label.mouseReleaseEvent = self.camera_mouse_release
     self.camera_label.mouseMoveEvent = self.camera_mouse_move
     
     camera_frame_layout.addWidget(self.camera_label)
-    camera_view_layout.addWidget(camera_view_frame)
+    content_hbox.addWidget(camera_view_frame, 1)
+    camera_view_layout.addLayout(content_hbox)
     
     # Camera controls - modern button bar with fixed height
     camera_controls_bar = QFrame()
     camera_controls_bar.setFixedHeight(50)
-    camera_controls_bar.setStyleSheet("""
-        QFrame {
+    camera_controls_bar.setStyleSheet(f"""
+        QFrame {{
             background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
                 stop:0 {COLORS.BG_ELEVATED}, stop:1 #1e1e35);
             border: 1px solid #3a3a5a;
             border-radius: 8px;
-        }
+        }}
     """)
     camera_controls = QHBoxLayout(camera_controls_bar)
     camera_controls.setContentsMargins(12, 8, 12, 8)
@@ -1667,15 +1884,14 @@ def setup_ui(self):
     self.camera_help_btn.clicked.connect(toggle_camera_help)
     self.camera_help_panel.close_requested.connect(toggle_camera_help)
     
-    # Set initial sizes for the splitter (30% for settings, 70% for camera view)
-    camera_splitter.setSizes([300, 700, 0])
-    
-    # Add camera tab to stacked widget
-    self.stacked_widget.addWidget(camera_tab)
+    # Set initial sizes for the splitter (20% for settings, 80% for camera view)
+    camera_splitter.setSizes([200, 800, 0])
     
     # Video tab
     video_tab = QWidget()
+    self.video_tab = video_tab
     video_layout = QVBoxLayout(video_tab)
+    video_layout.setContentsMargins(10, 0, 10, 0)
     
     # Video player section
     video_player_group = QGroupBox("Video Player")
@@ -1738,13 +1954,11 @@ def setup_ui(self):
     # Add video player group to the layout
     video_layout.addWidget(video_player_group)
     
-    # Add the video tab to the stacked widget
-    self.stacked_widget.addWidget(video_tab)
-    
     # Create Sensors Tab
     sensors_tab = QWidget()
+    self.sensors_tab = sensors_tab
     sensors_layout = QHBoxLayout(sensors_tab)
-    sensors_layout.setContentsMargins(10, 10, 10, 10)
+    sensors_layout.setContentsMargins(10, 0, 10, 0)
     sensors_layout.setSpacing(10)
     
     # Main content container
@@ -1766,6 +1980,12 @@ def setup_ui(self):
         }}
     """)
     
+    # Left sidebar container for devices and info text
+    sidebar_wrapper = QWidget()
+    sidebar_layout = QVBoxLayout(sidebar_wrapper)
+    sidebar_layout.setContentsMargins(0, 0, 0, 0)
+    sidebar_layout.setSpacing(10)
+
     # Device cards section with proper styling (matching automation tab)
     devices_section = QGroupBox("Interfaces")
     devices_section.setStyleSheet(GroupBoxStyles.default())
@@ -1776,287 +1996,241 @@ def setup_ui(self):
     # Device cards container with vertical layout for stacking cards
     devices_cards_container = QWidget()
     devices_cards_container.setStyleSheet("background: transparent; border: none;")
-    devices_cards_layout = QVBoxLayout(devices_cards_container)
+    devices_cards_layout = QGridLayout(devices_cards_container)
     devices_cards_layout.setContentsMargins(0, 0, 0, 0)
     devices_cards_layout.setSpacing(8)
+    devices_cards_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+    
+    # Custom Interfaces Info - Now moved outside the group box later
+    custom_interface_info = QLabel("💡 Create custom interfaces with small Python scripts. See Help for info.")
+    custom_interface_info.setWordWrap(True)
+    custom_interface_info.setStyleSheet("color: #666; font-size: 10px; margin-left: 5px; margin-right: 5px;")
     
     # Modern card style for devices - matching theme system
     device_card_style = CardStyles.device_card(connected=False)
     
     # Card size - reduced to allow better height compression
-    card_width, card_height = 100, 78 
+    card_width, card_height = 90, 78 
     
-    # Arduino container
-    arduino_container = QFrame()
-    arduino_container.setFixedSize(card_width, card_height)
-    arduino_container.setStyleSheet(device_card_style)
-    arduino_container.setCursor(Qt.CursorShape.PointingHandCursor)
-    arduino_layout = QVBoxLayout(arduino_container)
-    arduino_layout.setContentsMargins(6, 6, 6, 6)
-    arduino_layout.setSpacing(2)
+    # Card content styles
+    card_label_style = "font-size: 10px; font-weight: bold; color: #fff; border: none; background-color: transparent;"
+    card_status_style = "font-size: 9px; color: #888; border: none; background-color: transparent;"
+    card_icon_style = "font-size: 28px; background-color: transparent; border: none;"
+    device_icon_height = 36
+    device_image_icon_size = 34
+    
+    ui_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Map for built-in interface settings popups
+    settings_popups = {
+        "Arduino": getattr(self, "show_arduino_settings_popup", None),
+        "LabJack": getattr(self, "show_labjack_settings_popup", None),
+        "Optical": getattr(self, "show_optical_sensor_popup", None),
+        "Audio": getattr(self, "show_audio_sensor_popup", None),
+        "MQTT": getattr(self, "show_mqtt_settings_popup", None),
+        "Read CSV": getattr(self, "show_csv_settings_popup", None),
+        "Serial": getattr(self, "show_other_settings_popup", None)
+    }
 
-    # Labjack container
-    labjack_container = QFrame()
-    labjack_container.setFixedSize(card_width, card_height)
-    labjack_container.setStyleSheet(device_card_style)
-    labjack_container.setCursor(Qt.CursorShape.PointingHandCursor)
-    labjack_layout = QVBoxLayout(labjack_container)
-    labjack_layout.setContentsMargins(6, 6, 6, 6)
-    labjack_layout.setSpacing(2)
+    # Helper to create an interface card
+    def create_card(name, icon_resource, popup_func, is_plugin=False):
+        container = QFrame()
+        container.setFixedSize(card_width, card_height)
+        
+        # Use plugin-specific style if requested
+        if is_plugin:
+            container.setStyleSheet(CardStyles.plugin_card(connected=False))
+        else:
+            container.setStyleSheet(device_card_style)
+            
+        container.setCursor(Qt.CursorShape.PointingHandCursor)
+        card_layout = QVBoxLayout(container)
+        card_layout.setContentsMargins(6, 6, 6, 6)
+        card_layout.setSpacing(2)
+        
+        icon_label = QLabel()
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_label.setFixedHeight(device_icon_height)
+        icon_label.setStyleSheet("background-color: transparent; border: none;")
+        
+        # 1. Check if icon_resource is an absolute path (resolved plugin icon)
+        if icon_resource and os.path.isabs(icon_resource) and os.path.exists(icon_resource):
+            pixmap = QPixmap(icon_resource)
+            scaled_pixmap = pixmap.scaled(device_image_icon_size, device_image_icon_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            icon_label.setPixmap(scaled_pixmap)
+            
+        # 2. Check for custom plugin icon in plugins/ folder (display name.png) - LEGACY CONVENTION
+        elif os.path.exists(os.path.join(os.getcwd(), "plugins", f"{name}.png")):
+            custom_icon_path = os.path.join(os.getcwd(), "plugins", f"{name}.png")
+            pixmap = QPixmap(custom_icon_path)
+            scaled_pixmap = pixmap.scaled(device_image_icon_size, device_image_icon_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            icon_label.setPixmap(scaled_pixmap)
+            
+        # 3. Check if icon is an image file or an emoji
+        elif icon_resource:
+            if icon_resource.endswith(".png") or icon_resource.endswith(".svg"):
+                img_path = os.path.join(ui_dir, icon_resource)
+                if os.path.exists(img_path):
+                    pixmap = QPixmap(img_path)
+                    scaled_pixmap = pixmap.scaled(device_image_icon_size, device_image_icon_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                    icon_label.setPixmap(scaled_pixmap)
+                else:
+                    icon_label.setText("🔌")
+                    icon_label.setStyleSheet(card_icon_style)
+            else:
+                icon_label.setText(icon_resource)
+                icon_label.setStyleSheet(card_icon_style)
+        
+        # 4. If no icon provided and it's NOT a plugin, show fallback
+        elif not is_plugin:
+            icon_label.setText("🔌")
+            icon_label.setStyleSheet(card_icon_style)
+        else:
+            # Explicitly clear icon for plugins if nothing else matches
+            # This ensures no lightning bolt or plug is shown by default
+            icon_label.setText("")
+            icon_label.setPixmap(QPixmap())
+            icon_label.setStyleSheet("background-color: transparent; border: none;")
+        
+        card_layout.addWidget(icon_label)
+        
+        name_label = QLabel(name)
+        name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        name_label.setStyleSheet(card_label_style)
+        card_layout.addWidget(name_label)
+        
+        status_label = QLabel("Not connected")
+        status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        status_label.setStyleSheet(card_status_style)
+        status_label.setObjectName(f"{name.lower().replace(' ', '_')}_status_label")
+        card_layout.addWidget(status_label)
+        
+        if popup_func:
+            def handle_mouse_press(event):
+                # Ensure we don't return the result of popup_func() to Qt
+                # as it can cause sipBadCatcherResult if it's a boolean
+                popup_func()
+                # Accept the event
+                if event:
+                    event.accept()
+            container.mousePressEvent = handle_mouse_press
+        
+        return container, status_label
 
-    # Optical Sensor container
-    optical_container = QFrame()
-    optical_container.setFixedSize(card_width, card_height)
-    optical_container.setStyleSheet(device_card_style)
-    optical_container.setCursor(Qt.CursorShape.PointingHandCursor)
-    optical_layout = QVBoxLayout(optical_container)
-    optical_layout.setContentsMargins(6, 6, 6, 6)
-    optical_layout.setSpacing(2)
+    # Discover and add cards for all registered interfaces
+    InterfaceRegistry.initialize()
+    interfaces = InterfaceRegistry.get_interfaces()
+    
+    self.interface_status_labels = {} # Store labels for status updates
+    self.interface_connect_buttons = {} # Store connect buttons for status updates
+    
+    # Sort interfaces to keep consistent order (Arduino first, etc.)
+    ordered_names = ["Arduino", "LabJack", "Serial", "Read CSV", "Optical", "Audio", "MQTT"]
+    all_names = list(interfaces.keys())
+    sorted_names = [n for n in ordered_names if n in all_names] + [n for n in all_names if n not in ordered_names]
 
-    # Audio Sensor container
-    audio_container = QFrame()
-    audio_container.setFixedSize(card_width, card_height)
-    audio_container.setStyleSheet(device_card_style)
-    audio_container.setCursor(Qt.CursorShape.PointingHandCursor)
-    audio_layout = QVBoxLayout(audio_container)
-    audio_layout.setContentsMargins(6, 6, 6, 6)
-    audio_layout.setSpacing(2)
+    for i, name in enumerate(sorted_names):
+        interface_class = interfaces[name]
+        icon = getattr(interface_class, "ICON", "🔌")
+        
+        # Detect if it's a plugin based on module name
+        # Built-in interfaces are in app.core.interfaces.*
+        # Plugins are imported from the plugins/ directory directly
+        module_name = getattr(interface_class, "__module__", "")
+        is_plugin = not module_name.startswith("app.core.interfaces")
+        
+        print(f"DEBUG UI: Interface '{name}' module='{module_name}' is_plugin={is_plugin}")
+        
+        # Handle icons for plugins
+        if is_plugin:
+            # 1. Resolve icon path if it's a file
+            if icon and (icon.endswith(".png") or icon.endswith(".svg")):
+                try:
+                    import inspect
+                    plugin_file = inspect.getfile(interface_class)
+                    plugin_dir = os.path.dirname(plugin_file)
+                    potential_path = os.path.join(plugin_dir, icon)
+                    if os.path.exists(potential_path):
+                        icon = potential_path # Pass absolute path to create_card
+                except Exception:
+                    pass
+            
+            # 2. Clear default icon if not explicitly set in the plugin class
+            # This preserves the "clean" look for plugins that don't want an icon
+            # unless they specifically override ICON or have a .png file.
+            elif icon == "🔌" and "ICON" not in interface_class.__dict__:
+                icon = ""
+            
+        popup = settings_popups.get(name)
+        
+        # If it's a new plugin without a custom popup, use add_sensor with pre-selection
+        if not popup:
+            # We use a captured 'name' variable in the lambda to ensure it calls with the right one
+            popup = lambda n=name: self.sensor_controller.add_sensor(preselected_type=n)
+            
+        card, status_label = create_card(name, icon, popup, is_plugin=is_plugin)
+        card.setProperty("is_plugin", is_plugin)
+        # Ensure name is stored on card for status lookups
+        card.setProperty("interface_name", name)
+        
+        # Add to grid layout (2 columns)
+        row = i // 2
+        col = i % 2
+        devices_cards_layout.addWidget(card, row, col)
+        
+        # Keep references for updates
+        self.interface_status_labels[name] = status_label
+        
+        # Also maintain legacy attribute names for backward compatibility with status update methods
+        legacy_name_map = {
+            "Serial": "other",
+            "Read CSV": "csv"
+        }
+        attr_name = legacy_name_map.get(name, name.lower().replace(' ', '_'))
+        legacy_attr = f"{attr_name}_status"
+        setattr(self, legacy_attr, status_label)
 
-    # MQTT container
-    mqtt_container = QFrame()
-    mqtt_container.setFixedSize(card_width, card_height)
-    mqtt_container.setStyleSheet(device_card_style)
-    mqtt_container.setCursor(Qt.CursorShape.PointingHandCursor)
-    mqtt_layout = QVBoxLayout(mqtt_container)
-    mqtt_layout.setContentsMargins(6, 6, 6, 6)
-    mqtt_layout.setSpacing(2)
-
-    # CSV Data container
-    csv_container = QFrame()
-    csv_container.setFixedSize(card_width, card_height)
-    csv_container.setStyleSheet(device_card_style)
-    csv_container.setCursor(Qt.CursorShape.PointingHandCursor)
-    csv_layout = QVBoxLayout(csv_container)
-    csv_layout.setContentsMargins(6, 6, 6, 6)
-    csv_layout.setSpacing(2)
-
-    # Other sensors container (last position)
-    other_container = QFrame()
-    other_container.setFixedSize(card_width, card_height)
-    other_container.setStyleSheet(device_card_style)
-    other_container.setCursor(Qt.CursorShape.PointingHandCursor)
-    other_layout = QVBoxLayout(other_container)
-    other_layout.setContentsMargins(6, 6, 6, 6)
-    other_layout.setSpacing(2)
-
-    # Add cards to vertical layout - stacked from top to bottom, Arduino first
-    devices_cards_layout.addWidget(arduino_container)
-    devices_cards_layout.addWidget(labjack_container)
-    devices_cards_layout.addWidget(other_container)
-    devices_cards_layout.addWidget(csv_container)
-    devices_cards_layout.addWidget(optical_container)
-    devices_cards_layout.addWidget(audio_container)
-    devices_cards_layout.addWidget(mqtt_container)
     # Note: Remote DAQ will be added by StreamController at the end
     
-    # Add stretch to push cards to top
-    devices_cards_layout.addStretch()
+    # Add stretch to grid to push cards to top
+    devices_cards_layout.setRowStretch(devices_cards_layout.rowCount(), 1)
     
     # Wrap device cards in a scroll area to prevent height blocking
     devices_scroll = QScrollArea()
     devices_scroll.setWidgetResizable(True)
     devices_scroll.setFrameShape(QFrame.Shape.NoFrame)
-    # Remove stylesheet that was forcing transparency on children
     devices_scroll.setWidget(devices_cards_container)
+    devices_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
     
     # Store reference for StreamController to add Remote DAQ button
     self.devices_cards_layout = devices_cards_layout
     self.device_card_style = device_card_style
     self.device_card_size = (card_width, card_height)
     
+    # Assembly of the sidebar
     devices_section_layout.addWidget(devices_scroll)
     
-    # Set maximum width for devices section to prevent it from taking too much space
-    devices_section.setMaximumWidth(200)
-    devices_section.setMinimumWidth(0) # Allow it to be collapsed completely
-    devices_section.setMinimumHeight(100) # Allow it to shrink vertically
+    # Ensure devices section expands to fill height
+    devices_section.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
     
-    # Add devices section to horizontal splitter (left side)
-    self.sensors_splitter.addWidget(devices_section)
-
-    # Card content styles (smaller for compact cards)
-    card_label_style = "font-size: 10px; font-weight: bold; color: #fff; border: none; background-color: transparent;"
-    card_status_style = "font-size: 9px; color: #888; border: none; background-color: transparent;"
-    card_icon_style = "font-size: 28px; background-color: transparent; border: none;"
+    sidebar_layout.addWidget(devices_section)
     
-    # Slightly larger image icons for Arduino/LabJack/Other without resizing cards
-    device_icon_height = 36
-    device_image_icon_size = 34
+    # Info text bottom layout to match right side
+    sidebar_bottom_container = QWidget()
+    sidebar_bottom_container.setFixedHeight(32) # Match height of help button on right
+    sidebar_bottom_layout = QHBoxLayout(sidebar_bottom_container)
+    sidebar_bottom_layout.setContentsMargins(0, 0, 0, 0)
+    sidebar_bottom_layout.addWidget(custom_interface_info, alignment=Qt.AlignmentFlag.AlignVCenter)
+    sidebar_bottom_layout.addStretch()
     
-    # Get paths to image files
-    ui_dir = os.path.dirname(os.path.abspath(__file__))
-    arduino_img_path = os.path.join(ui_dir, "Arduino.png")
-    labjack_img_path = os.path.join(ui_dir, "Labjack.png")
-    other_img_path = os.path.join(ui_dir, "Other.png")
+    sidebar_layout.addWidget(sidebar_bottom_container)
     
-    # Arduino content - use image if available
-    arduino_icon = QLabel()
-    arduino_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    arduino_icon.setFixedHeight(device_icon_height)  # Fixed height for consistent label alignment
-    arduino_icon.setStyleSheet("background-color: transparent; border: none;")
-    if os.path.exists(arduino_img_path):
-        pixmap = QPixmap(arduino_img_path)
-        # Scale to fit the small card while appearing larger than default
-        scaled_pixmap = pixmap.scaled(device_image_icon_size, device_image_icon_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        arduino_icon.setPixmap(scaled_pixmap)
-    else:
-        arduino_icon.setText("🔌")
-        arduino_icon.setStyleSheet(card_icon_style)
-    arduino_layout.addWidget(arduino_icon)
+    # Set maximum width for sidebar to allow 2 columns of cards + info text
+    sidebar_wrapper.setMaximumWidth(270)
+    sidebar_wrapper.setMinimumWidth(0)
     
-    arduino_label = QLabel("Arduino")
-    arduino_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    arduino_label.setStyleSheet(card_label_style)
-    arduino_layout.addWidget(arduino_label)
-
-    self.arduino_status = QLabel("Not connected")
-    self.arduino_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    self.arduino_status.setStyleSheet(card_status_style)
-    self.arduino_status.setObjectName("arduino_status_label")
-    arduino_layout.addWidget(self.arduino_status)
-
-    # Labjack content - use image if available
-    labjack_icon = QLabel()
-    labjack_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    labjack_icon.setFixedHeight(device_icon_height)  # Fixed height for consistent label alignment
-    labjack_icon.setStyleSheet("background-color: transparent; border: none;")
-    if os.path.exists(labjack_img_path):
-        pixmap = QPixmap(labjack_img_path)
-        # Scale to fit the small card while appearing larger than default
-        scaled_pixmap = pixmap.scaled(device_image_icon_size, device_image_icon_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        labjack_icon.setPixmap(scaled_pixmap)
-    else:
-        labjack_icon.setText("📊")
-        labjack_icon.setStyleSheet(card_icon_style)
-    labjack_layout.addWidget(labjack_icon)
-    
-    labjack_label = QLabel("LabJack")
-    labjack_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    labjack_label.setStyleSheet(card_label_style)
-    labjack_layout.addWidget(labjack_label)
-
-    self.labjack_status = QLabel("Not connected")
-    self.labjack_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    self.labjack_status.setStyleSheet(card_status_style)
-    self.labjack_status.setObjectName("labjack_status_label")
-    labjack_layout.addWidget(self.labjack_status)
-
-    # Optical Sensor content
-    optical_icon = QLabel("🎥")
-    optical_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    optical_icon.setFixedHeight(30)  # Fixed height for consistent label alignment
-    optical_icon.setStyleSheet(card_icon_style)
-    optical_layout.addWidget(optical_icon)
-    
-    optical_label = QLabel("Optical")
-    optical_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    optical_label.setStyleSheet(card_label_style)
-    optical_layout.addWidget(optical_label)
-
-    self.optical_status = QLabel("Not configured")
-    self.optical_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    self.optical_status.setStyleSheet(card_status_style)
-    self.optical_status.setObjectName("optical_status_label")
-    optical_layout.addWidget(self.optical_status)
-
-    # Audio Sensor content
-    audio_icon = QLabel("🎤")
-    audio_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    audio_icon.setFixedHeight(30)  # Fixed height for consistent label alignment
-    audio_icon.setStyleSheet(card_icon_style)
-    audio_layout.addWidget(audio_icon)
-    
-    audio_label = QLabel("Audio")
-    audio_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    audio_label.setStyleSheet(card_label_style)
-    audio_layout.addWidget(audio_label)
-
-    self.audio_status = QLabel("Not configured")
-    self.audio_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    self.audio_status.setStyleSheet(card_status_style)
-    self.audio_status.setObjectName("audio_status_label")
-    audio_layout.addWidget(self.audio_status)
-
-    # MQTT content
-    mqtt_icon = QLabel("☁️")
-    mqtt_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    mqtt_icon.setFixedHeight(30)
-    mqtt_icon.setStyleSheet(card_icon_style)
-    mqtt_layout.addWidget(mqtt_icon)
-    
-    mqtt_label = QLabel("MQTT")
-    mqtt_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    mqtt_label.setStyleSheet(card_label_style)
-    mqtt_layout.addWidget(mqtt_label)
-
-    self.mqtt_status = QLabel("Not connected")
-    self.mqtt_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    self.mqtt_status.setStyleSheet(card_status_style)
-    self.mqtt_status.setObjectName("mqtt_status_label")
-    mqtt_layout.addWidget(self.mqtt_status)
-
-    # CSV Data content
-    csv_icon = QLabel("📄")
-    csv_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    csv_icon.setFixedHeight(30)
-    csv_icon.setStyleSheet(card_icon_style)
-    csv_layout.addWidget(csv_icon)
-    
-    csv_label = QLabel("Read CSV")
-    csv_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    csv_label.setStyleSheet(card_label_style)
-    csv_layout.addWidget(csv_label)
-
-    self.csv_status = QLabel("Not configured")
-    self.csv_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    self.csv_status.setStyleSheet(card_status_style)
-    self.csv_status.setObjectName("csv_status_label")
-    csv_layout.addWidget(self.csv_status)
-
-    # Other sensors content (last position) - use image if available
-    other_icon = QLabel()
-    other_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    other_icon.setFixedHeight(device_icon_height)  # Fixed height for consistent label alignment
-    other_icon.setStyleSheet("background-color: transparent; border: none;")
-    if os.path.exists(other_img_path):
-        pixmap = QPixmap(other_img_path)
-        # Scale to fit the small card while appearing larger than default
-        scaled_pixmap = pixmap.scaled(device_image_icon_size, device_image_icon_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        other_icon.setPixmap(scaled_pixmap)
-    else:
-        other_icon.setText("🔧")
-        other_icon.setStyleSheet(card_icon_style)
-    other_layout.addWidget(other_icon)
-    
-    other_label = QLabel("Serial")
-    other_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    other_label.setStyleSheet(card_label_style)
-    other_layout.addWidget(other_label)
-
-    self.other_status = QLabel("Not connected")
-    self.other_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    self.other_status.setStyleSheet(card_status_style)
-    self.other_status.setObjectName("other_status_label")
-    other_layout.addWidget(self.other_status)
-
-    # Add click events to open settings when clicked
-    arduino_container.mousePressEvent = lambda event: self.show_arduino_settings_popup()
-    labjack_container.mousePressEvent = lambda event: self.show_labjack_settings_popup()
-    other_container.mousePressEvent = lambda event: self.show_other_settings_popup()
-    mqtt_container.mousePressEvent = lambda event: self.show_mqtt_settings_popup()
-    csv_container.mousePressEvent = lambda event: self.show_csv_settings_popup()
-    optical_container.mousePressEvent = lambda event: self.show_optical_sensor_popup()
-    audio_container.mousePressEvent = lambda event: self.show_audio_sensor_popup()
+    # Add sidebar to horizontal splitter (left side)
+    self.sensors_splitter.addWidget(sidebar_wrapper)
     
     # Sensor Management section - modernized (matching theme)
     # Wrap it in a container so we can put the help area below it on the right side only
@@ -2068,7 +2242,7 @@ def setup_ui(self):
     sensor_container = QGroupBox("Sensor Management")
     sensor_container.setStyleSheet(GroupBoxStyles.default())
     sensor_container_layout = QVBoxLayout(sensor_container)
-    sensor_container_layout.setContentsMargins(10, 10, 10, 10)
+    sensor_container_layout.setContentsMargins(10, 10, 2, 10) # Reduced right margin from 10 to 2
     sensor_container_layout.setSpacing(10)
     
     # Sensor data table with modern styling
@@ -2136,7 +2310,7 @@ def setup_ui(self):
     sensors_bottom_layout = QHBoxLayout()
     
     # Explanation text
-    explanation_label = QLabel("💡 'Show in Graph' only controls visualization. All enabled sensors are recorded.")
+    explanation_label = QLabel("💡 'Use' checkbox controls visualization in graphs. All enabled sensors are recorded.")
     explanation_label.setStyleSheet("color: #666; font-size: 10px;")
     sensors_bottom_layout.addWidget(explanation_label)
     
@@ -2154,8 +2328,8 @@ def setup_ui(self):
     # Add sensor right wrapper to horizontal splitter (right side)
     self.sensors_splitter.addWidget(sensor_right_wrapper)
     
-    # Set initial sizes for the sensors splitter (e.g., 200px for devices, remainder for table)
-    self.sensors_splitter.setSizes([200, 1000])
+    # Set initial sizes for the sensors splitter (e.g., 270px for sidebar, remainder for table)
+    self.sensors_splitter.setSizes([270, 1000])
     
     # Add horizontal splitter to main vertical layout
     sensors_main_layout.addWidget(self.sensors_splitter)
@@ -2200,13 +2374,11 @@ def setup_ui(self):
     self.sensors_help_btn.clicked.connect(toggle_sensors_help)
     self.sensors_help_panel.close_requested.connect(toggle_sensors_help)
     
-    # Add sensors tab
-    self.stacked_widget.addWidget(sensors_tab)
-    
     # Create Graphs Tab
     graphs_tab = QWidget()
     self.graphs_tab = graphs_tab  # Store reference to avoid hardcoded indexing
     graphs_layout = QVBoxLayout(graphs_tab)
+    graphs_layout.setContentsMargins(10, 0, 10, 0)
     
     # Create a splitter for the graphs tab
     graphs_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -2511,13 +2683,11 @@ def setup_ui(self):
     graphs_splitter.addWidget(graph_display_widget)
     graphs_splitter.setSizes([400, 800])  # Initial sizes
     
-    # Add graphs tab to stacked widget
-    self.stacked_widget.addWidget(graphs_tab)
-    
     # Create Automation Tab
     automation_tab = QWidget()
+    self.automation_tab = automation_tab
     automation_layout = QHBoxLayout(automation_tab)
-    automation_layout.setContentsMargins(10, 10, 10, 10)
+    automation_layout.setContentsMargins(10, 0, 10, 0)
     automation_layout.setSpacing(10)
     
     # Center spacer left
@@ -2683,17 +2853,15 @@ def setup_ui(self):
     # Center spacer right
     automation_layout.addStretch()
     
-    # Add automation tab to stacked widget
-    self.stacked_widget.addWidget(automation_tab)
-    
     # Create Settings Tab
     settings_tab = QWidget()
+    self.settings_tab = settings_tab
     settings_layout = QVBoxLayout(settings_tab)
     
     # Create a horizontal layout for the two columns with less spacing
     settings_columns_layout = QHBoxLayout()
     settings_columns_layout.setSpacing(20)  # Reduce spacing between columns
-    settings_columns_layout.setContentsMargins(20, 50, 20, 50)  # Add vertical padding to center content
+    settings_columns_layout.setContentsMargins(20, 10, 20, 10)  # Reduced vertical padding
     
     # Create left column layout
     left_column_layout = QVBoxLayout()
@@ -2718,7 +2886,15 @@ def setup_ui(self):
     self.arduino_poll_interval = QDoubleSpinBox()
     self.arduino_poll_interval.setRange(0.1, 60.0)
     self.arduino_poll_interval.setSingleStep(0.1)
-    self.arduino_poll_interval.setValue(float(self.settings.value("arduino_poll_interval", "1.0")))
+    
+    val = self.settings.value("arduino_poll_interval", "1.0")
+    try:
+        if val is not None and str(val).lower() != 'none':
+            self.arduino_poll_interval.setValue(float(val))
+        else:
+            self.arduino_poll_interval.setValue(1.0)
+    except (ValueError, TypeError):
+        self.arduino_poll_interval.setValue(1.0)
     self.arduino_poll_interval.setVisible(False)
     
     self.arduino_connect_btn = QPushButton("Connect")
@@ -2832,11 +3008,9 @@ def setup_ui(self):
     # Add the columns layout to the main settings layout
     settings_layout.addLayout(settings_columns_layout)
     
-    # Add settings tab to stacked widget
-    self.stacked_widget.addWidget(settings_tab)
-    
     # Add Projects Tab
     projects_tab = QWidget()
+    self.projects_tab = projects_tab
     projects_tab.setObjectName("projects_tab")
     projects_layout = QVBoxLayout(projects_tab)
     
@@ -2844,7 +3018,7 @@ def setup_ui(self):
     project_container = QWidget()
     project_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)  # Allow expansion
     project_container_layout = QVBoxLayout(project_container)
-    project_container_layout.setContentsMargins(10, 5, 10, 5)  # Reduced margins
+    project_container_layout.setContentsMargins(10, 0, 10, 0)  # Removed top/bottom margins
     project_container_layout.setSpacing(8)  # Reduced spacing
     
     # Add container to tab with stretch factor to fill space
@@ -3313,9 +3487,6 @@ def setup_ui(self):
     # Add graphs tab to stacked widget
     self.stacked_widget.addWidget(graphs_tab)
     
-    # Add the video tab to the stacked widget (no button, will be accessed differently)
-    self.stacked_widget.addWidget(video_tab)
-    
     # Add stacked widget to content layout
     content_layout.addWidget(self.stacked_widget)
     
@@ -3391,7 +3562,7 @@ def setup_ui(self):
         }}
     """)
     notes_layout = QVBoxLayout(notes_tab)
-    notes_layout.setContentsMargins(10, 10, 10, 10)
+    notes_layout.setContentsMargins(10, 0, 10, 0)
     notes_layout.setSpacing(10)
     
     # HTML editor with modern theme styling
@@ -3454,6 +3625,11 @@ def setup_ui(self):
     self.data_flow_widget = DataFlowWidget()
     self.stacked_widget.addWidget(self.data_flow_widget)
     self.data_flow_page_index = self.stacked_widget.count() - 1  # Store index for access
+    
+    # Apply collapsed sidebar state (since sidebar_collapsed is True by default)
+    # Set to False first, then toggle to apply the collapsed state
+    self.sidebar_collapsed = False
+    toggle_sidebar()
 
 def update_focus_value_label(self):
     """Update the focus value label when the slider changes"""
@@ -3489,28 +3665,31 @@ def apply_camera_focus_exposure(self):
         self.settings.set_value("camera/exposure_value", str(exposure_value))
         
         # Apply settings to camera directly
-        if self.camera_controller and self.camera_controller.camera_thread:
-            if hasattr(self.camera_controller.camera_thread, 'set_camera_properties'):
-                self.camera_controller.camera_thread.set_camera_properties(
-                    manual_focus=manual_focus,
-                    focus_value=focus_value,
-                    manual_exposure=manual_exposure,
-                    exposure_value=exposure_value
-                )
-            else:
-                # Fallback for direct camera manipulation
-                if hasattr(self.camera_controller.camera_thread, 'cap') and self.camera_controller.camera_thread.cap:
-                    if manual_focus:
-                        self.camera_controller.camera_thread.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)  # Disable autofocus
-                        self.camera_controller.camera_thread.cap.set(cv2.CAP_PROP_FOCUS, focus_value)
-                    else:
-                        self.camera_controller.camera_thread.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)  # Enable autofocus
-                    
-                    if manual_exposure:
-                        self.camera_controller.camera_thread.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Magic value for manual
-                        self.camera_controller.camera_thread.cap.set(cv2.CAP_PROP_EXPOSURE, exposure_value)
-                    else:
-                        self.camera_controller.camera_thread.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)  # Magic value for auto
+        if self.camera_controller:
+            idx = self.camera_controller.active_camera_index
+            thread = self.camera_controller.camera_threads[idx]
+            if thread and thread.isRunning():
+                if hasattr(thread, 'set_camera_properties'):
+                    thread.set_camera_properties(
+                        manual_focus=manual_focus,
+                        focus_value=focus_value,
+                        manual_exposure=manual_exposure,
+                        exposure_value=exposure_value
+                    )
+                else:
+                    # Fallback for direct camera manipulation
+                    if hasattr(thread, 'cap') and thread.cap:
+                        if manual_focus:
+                            thread.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)  # Disable autofocus
+                            thread.cap.set(cv2.CAP_PROP_FOCUS, focus_value)
+                        else:
+                            thread.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)  # Enable autofocus
+                        
+                        if manual_exposure:
+                            thread.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Magic value for manual
+                            thread.cap.set(cv2.CAP_PROP_EXPOSURE, exposure_value)
+                        else:
+                            thread.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)  # Magic value for auto
             
     except Exception as e:
         print(f"Error applying camera focus/exposure: {str(e)}")

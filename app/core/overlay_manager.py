@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 
 class BaseOverlay(ABC):
     def __init__(self, overlay_id, name, position=(0.1, 0.1), visible=True, 
-                 text_color=(0, 255, 0), bg_color=(0, 0, 0), bg_alpha=0.5):
+                 text_color=(255, 255, 255), bg_color=(0, 0, 0), bg_alpha=0.5):
         self.id = overlay_id
         self.name = name
         self.position = position  # (rel_x, rel_y) normalized 0.0 to 1.0
@@ -25,6 +25,30 @@ class BaseOverlay(ABC):
         x = int(self.position[0] * frame_w)
         y = int(self.position[1] * frame_h)
         return x, y
+
+    def _get_smooth_text_params(self, text, frame_w, frame_h):
+        """Calculate smooth positioning that keeps text on screen based on position (0-1)"""
+        (text_width, text_height), baseline = cv2.getTextSize(
+            text, cv2.FONT_HERSHEY_SIMPLEX, self.font_scale, self.thickness)
+        
+        padding_x = 8
+        padding_y = 8
+        
+        x_rel, y_rel = self.position
+        full_width = text_width + 2 * padding_x
+        full_height = text_height + 2 * padding_y
+        
+        # Calculate x and y for _draw_text_with_bg
+        x = x_rel * frame_w - x_rel * full_width + padding_x
+        y = y_rel * frame_h - y_rel * full_height + padding_y + text_height
+        
+        return int(x), int(y), full_width, full_height, text_width, text_height
+
+    def get_bounds(self, frame_w, frame_h):
+        """Return (x1, y1, x2, y2) in relative coordinates (0-1)"""
+        # Default implementation for non-text overlays
+        return (self.position[0] - 0.05, self.position[1] - 0.05, 
+                self.position[0] + 0.05, self.position[1] + 0.05)
 
     def to_dict(self):
         return {
@@ -63,13 +87,13 @@ class BaseOverlay(ABC):
         else:
             return None
 
-        obj.position = data.get("position", (0.1, 0.1))
-        obj.visible = data.get("visible", True)
-        obj.text_color = tuple(data.get("text_color", (0, 255, 0)))
-        obj.bg_color = tuple(data.get("bg_color", (0, 0, 0)))
-        obj.bg_alpha = data.get("bg_alpha", 0.5)
-        obj.font_scale = data.get("font_scale", 0.7)
-        obj.thickness = data.get("thickness", 2)
+        obj.position = data.get("position", obj.position)
+        obj.visible = data.get("visible", obj.visible)
+        obj.text_color = tuple(data.get("text_color", obj.text_color))
+        obj.bg_color = tuple(data.get("bg_color", obj.bg_color))
+        obj.bg_alpha = data.get("bg_alpha", obj.bg_alpha)
+        obj.font_scale = data.get("font_scale", obj.font_scale)
+        obj.thickness = data.get("thickness", obj.thickness)
         return obj
 
     def _draw_text_with_bg(self, frame, text, x, y):
@@ -108,8 +132,17 @@ class TextOverlay(BaseOverlay):
     def draw(self, frame):
         if not self.visible: return
         h, w = frame.shape[:2]
-        x, y = self.get_draw_params(h, w)
+        x, y, _, _, _, _ = self._get_smooth_text_params(self.text, w, h)
         self._draw_text_with_bg(frame, self.text, x, y)
+
+    def get_bounds(self, frame_w, frame_h):
+        x, y, full_width, full_height, _, _ = self._get_smooth_text_params(self.text, frame_w, frame_h)
+        padding_x = 8
+        x1 = (x - padding_x) / frame_w
+        y1 = (y - (full_height - 8)) / frame_h # 8 is padding_y
+        x2 = (x - padding_x + full_width) / frame_w
+        y2 = (y + 8) / frame_h
+        return (x1, y1, x2, y2)
 
     def to_dict(self):
         d = super().to_dict()
@@ -118,22 +151,34 @@ class TextOverlay(BaseOverlay):
 
 class TimestampOverlay(BaseOverlay):
     def __init__(self, overlay_id, name, time_format="%Y-%m-%d %H:%M:%S"):
-        super().__init__(overlay_id, name)
+        super().__init__(overlay_id, name, position=(1.0, 1.0))
         self.format = time_format
         self.font_scale = 1.0  # Default font scale for timestamps is 1.0 as requested
 
     def get_type(self): return "timestamp"
 
+    def _get_time_text(self):
+        try:
+            return datetime.datetime.now().strftime(self.format)
+        except (ValueError, TypeError):
+            return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     def draw(self, frame):
         if not self.visible: return
         h, w = frame.shape[:2]
-        x, y = self.get_draw_params(h, w)
-        try:
-            time_text = datetime.datetime.now().strftime(self.format)
-        except (ValueError, TypeError):
-            # Fallback to default format if the format string is invalid
-            time_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._draw_text_with_bg(frame, time_text, x, y)
+        text = self._get_time_text()
+        x, y, _, _, _, _ = self._get_smooth_text_params(text, w, h)
+        self._draw_text_with_bg(frame, text, x, y)
+
+    def get_bounds(self, frame_w, frame_h):
+        text = self._get_time_text()
+        x, y, full_width, full_height, _, _ = self._get_smooth_text_params(text, frame_w, frame_h)
+        padding_x = 8
+        x1 = (x - padding_x) / frame_w
+        y1 = (y - (full_height - 8)) / frame_h
+        x2 = (x - padding_x + full_width) / frame_w
+        y2 = (y + 8) / frame_h
+        return (x1, y1, x2, y2)
 
     def to_dict(self):
         d = super().to_dict()
@@ -149,14 +194,28 @@ class SensorOverlay(BaseOverlay):
 
     def get_type(self): return "sensor"
 
-    def draw(self, frame):
-        if not self.visible: return
-        h, w = frame.shape[:2]
-        x, y = self.get_draw_params(h, w)
+    def _get_sensor_text(self):
         sensor_text = f"{self.sensor_name}: {self.sensor_value}"
         if self.sensor_unit:
             sensor_text += f" {self.sensor_unit}"
-        self._draw_text_with_bg(frame, sensor_text, x, y)
+        return sensor_text
+
+    def draw(self, frame):
+        if not self.visible: return
+        h, w = frame.shape[:2]
+        text = self._get_sensor_text()
+        x, y, _, _, _, _ = self._get_smooth_text_params(text, w, h)
+        self._draw_text_with_bg(frame, text, x, y)
+
+    def get_bounds(self, frame_w, frame_h):
+        text = self._get_sensor_text()
+        x, y, full_width, full_height, _, _ = self._get_smooth_text_params(text, frame_w, frame_h)
+        padding_x = 8
+        x1 = (x - padding_x) / frame_w
+        y1 = (y - (full_height - 8)) / frame_h
+        x2 = (x - padding_x + full_width) / frame_w
+        y2 = (y + 8) / frame_h
+        return (x1, y1, x2, y2)
 
     def to_dict(self):
         d = super().to_dict()
@@ -190,6 +249,10 @@ class RectangleOverlay(BaseOverlay):
             
         cv2.rectangle(frame, (x, y), (x2, y2), self.text_color, self.thickness)
 
+    def get_bounds(self, frame_w, frame_h):
+        x1, y1 = self.position
+        return (x1, y1, x1 + self.width, y1 + self.height)
+
     def to_dict(self):
         d = super().to_dict()
         d["width"] = self.width
@@ -219,6 +282,13 @@ class MotionOverlay(BaseOverlay):
         
         cv2.circle(frame, (x, y), indicator_size // 2, color, -1)
         cv2.circle(frame, (x, y), indicator_size // 2, (255, 255, 255), 2)
+
+    def get_bounds(self, frame_w, frame_h):
+        indicator_size = 20
+        rel_size_x = indicator_size / frame_w
+        rel_size_y = indicator_size / frame_h
+        x, y = self.position
+        return (x - rel_size_x, y - rel_size_y, x + rel_size_x, y + rel_size_y)
 
     def to_dict(self):
         d = super().to_dict()

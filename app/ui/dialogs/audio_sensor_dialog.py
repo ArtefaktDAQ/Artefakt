@@ -359,6 +359,10 @@ class AudioSensorConfigDialog(QDialog):
         self.noise_gate_spin.setToolTip("Ignore signals below this level")
         proc_layout.addRow("Noise Gate:", self.noise_gate_spin)
         
+        self.auto_connect_cb = QCheckBox("Auto-connect on Startup")
+        self.auto_connect_cb.setToolTip("Automatically connect this sensor when the application starts")
+        proc_layout.addRow("", self.auto_connect_cb)
+        
         right_column.addWidget(proc_group)
         
         # Live preview
@@ -548,6 +552,7 @@ class AudioSensorConfigDialog(QDialog):
         self.noise_gate_spin.setValue(self.settings.get("noise_gate", 0.01))
         self.rpm_ppr_spin.setValue(self.settings.get("rpm_pulses_per_rev", 1.0))
         self.rpm_min_freq_spin.setValue(self.settings.get("min_frequency_hz", 5.0))
+        self.auto_connect_cb.setChecked(self.settings.get("auto_connect", True))
         
         # Frequency band
         self.band_low_spin.setValue(self.settings.get("band_low", 100))
@@ -565,6 +570,7 @@ class AudioSensorConfigDialog(QDialog):
             "band_high": self.band_high_spin.value(),
             "rpm_pulses_per_rev": self.rpm_ppr_spin.value(),
             "min_frequency_hz": self.rpm_min_freq_spin.value(),
+            "auto_connect": self.auto_connect_cb.isChecked(),
         }
     
     def _apply_settings(self):
@@ -679,6 +685,10 @@ class AudioSensorAddDialog(QDialog):
             self.mode_combo.addItem(f"{mode_info['icon']} {mode_info['name']}", mode_key)
         form_layout.addRow("Measurement:", self.mode_combo)
         
+        self.auto_connect_cb = QCheckBox("Auto-connect on Startup")
+        self.auto_connect_cb.setChecked(True)
+        form_layout.addRow("", self.auto_connect_cb)
+        
         layout.addLayout(form_layout)
         
         # Info
@@ -723,5 +733,6 @@ class AudioSensorAddDialog(QDialog):
             "name": self.name_edit.text().strip(),
             "device_id": self.device_combo.currentData(),
             "mode": self.mode_combo.currentData(),
+            "auto_connect": self.auto_connect_cb.isChecked(),
         }
 

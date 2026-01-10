@@ -185,6 +185,12 @@ class OpticalSensorThread(QObject):
             "fill_threshold": 128,
             "fill_direction": "horizontal",  # "horizontal" or "vertical"
             
+            # Brightness measurement
+            "brightness_roi_x": 0,
+            "brightness_roi_y": 0,
+            "brightness_roi_width": 640,
+            "brightness_roi_height": 480,
+            
             # RPM detection
             "rpm_roi_x": 0,
             "rpm_roi_y": 0,
@@ -510,12 +516,28 @@ class OpticalSensorThread(QObject):
         return result
     
     def _measure_brightness(self, gray, settings):
-        """Measure overall brightness"""
+        """Measure brightness in the ROI"""
+        h_frame, w_frame = gray.shape
+        x = int(settings.get("brightness_roi_x", 0))
+        y = int(settings.get("brightness_roi_y", 0))
+        w = int(settings.get("brightness_roi_width", w_frame))
+        h = int(settings.get("brightness_roi_height", h_frame))
+        
+        # Clamp ROI to frame bounds
+        x = max(0, min(x, w_frame - 1))
+        y = max(0, min(y, h_frame - 1))
+        w = max(1, min(w, w_frame - x))
+        h = max(1, min(h, h_frame - y))
+        
+        roi = gray[y:y+h, x:x+w]
+        
         return {
-            "brightness_mean": float(np.mean(gray)),
-            "brightness_max": float(np.max(gray)),
-            "brightness_min": float(np.min(gray)),
-            "brightness_std": float(np.std(gray)),
+            "brightness_mean": float(np.mean(roi)),
+            "brightness_max": float(np.max(roi)),
+            "brightness_min": float(np.min(roi)),
+            "brightness_std": float(np.std(roi)),
+            "brightness_roi_w": int(w),
+            "brightness_roi_h": int(h)
         }
     
     def _track_color(self, frame, hsv, settings):
@@ -731,6 +753,31 @@ class OpticalSensorInterface(BaseInterface):
     - fill_level: Detect fill level changes
     """
     
+    DISPLAY_NAME = "Optical"
+    DESCRIPTION = "Use a camera as a measurement sensor"
+    ICON = "🎥"
+    
+    HELP_TEXT = """
+    <h3>Optical Sensor Interface</h3>
+    <p>Uses a camera as a measurement sensor for brightness, color tracking, particle counting, etc.</p>
+    <p><b>How to use:</b></p>
+    <ol>
+        <li>Select the camera device (Camera ID).</li>
+        <li>Select the detection mode (Brightness, Color, etc.).</li>
+        <li>Once configured, add sensors with interface type 'Optical' and select the desired measurement output.</li>
+    </ol>
+    """
+    
+    CONFIG_SCHEMA = {
+        "camera_id": {"type": "number", "label": "Camera ID", "default": 0},
+        "mode": {
+            "type": "list", 
+            "label": "Detection Mode", 
+            "options": ["light_events", "brightness", "color", "position", "particle_count", "fill_level", "rpm"],
+            "default": "light_events"
+        }
+    }
+
     # Class-level tracking of which cameras are in use
     _cameras_in_use = set()
     _cameras_lock = Lock()

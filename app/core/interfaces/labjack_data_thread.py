@@ -20,8 +20,13 @@ class LabJackDataThread(QThread):
         super().__init__(parent)
         self._labjack_interface = labjack_interface
         self._sampling_rate = sampling_rate
+        self.device_type = "ANY"
+        self.connection_type = "ANY"
+        self.port = "ANY"
+        self.auto_reconnect = False
         self._running = False
         self._connected = False
+        self._last_error = ""
         self._mutex = QMutex()
         self._stop_event = threading.Event()
 
@@ -35,27 +40,61 @@ class LabJackDataThread(QThread):
 
     def connect(self):
         """Connects to the LabJack device within the thread."""
+        self._last_error = ""
         if not LabJackInterface:
-             self.error_signal.emit("LabJackInterface library not available.")
+             self._last_error = "LabJackInterface library not available."
+             self.error_signal.emit(self._last_error)
              self.connection_status_signal.emit(False, "LabJack library missing")
              return False
              
         if not self._labjack_interface:
-            self.error_signal.emit("LabJack interface object not set.")
-            self.connection_status_signal.emit(False, "Interface not set")
-            return False
+            try:
+                # If no interface set, create one using thread's attributes
+                # This happens when connecting from the settings dialog for the first time
+                self._labjack_interface = LabJackInterface(
+                    device_type=self.device_type, 
+                    connection_type=self.connection_type, 
+                    port=self.port,
+                    auto_reconnect=self.auto_reconnect
+                )
+                print(f"DEBUG LabJackThread: Created new LabJackInterface: {self.device_type}/{self.connection_type}/{self.port}")
+            except Exception as e:
+                self._last_error = f"Failed to initialize LabJack interface: {e}"
+                print(f"ERROR: {self._last_error}")
+                self.error_signal.emit(self._last_error)
+                self.connection_status_signal.emit(False, self._last_error)
+                return False
             
         try:
-            print("DEBUG LabJackThread: Attempting connection...")
-            self._labjack_interface.connect()
-            self._connected = True
-            print("DEBUG LabJackThread: Connection successful.")
-            self.connection_status_signal.emit(True, "Connected successfully")
-            return True
+            # Sync thread attributes to interface before connecting if they changed from UI
+            self._labjack_interface.device_type = self.device_type
+            self._labjack_interface.connection_type = self.connection_type
+            self._labjack_interface.identifier = self.port
+            self._labjack_interface.auto_reconnect = self.auto_reconnect
+            
+            print(f"DEBUG LabJackThread: Attempting connection to {self.device_type} via {self.connection_type} ({self.port})...")
+            success = self._labjack_interface.connect()
+            if success:
+                self._connected = True
+                print("DEBUG LabJackThread: Connection successful.")
+                self.connection_status_signal.emit(True, "Connected successfully")
+                
+                # Automatically start the thread if not running
+                if not self.isRunning():
+                    print("DEBUG LabJackThread: Starting thread for data reading")
+                    self.start()
+                    
+                return True
+            else:
+                self._last_error = getattr(self._labjack_interface, 'error_message', "Connection failed")
+                print(f"DEBUG LabJackThread: Connection failed: {self._last_error}")
+                self._connected = False
+                self.connection_status_signal.emit(False, "Connection failed")
+                return False
         except Exception as e:
-            error_msg = f"LabJackThread connection error: {e}"
-            print(f"ERROR: {error_msg}")
-            self.error_signal.emit(error_msg)
+            self._last_error = f"LabJackThread connection error: {e}"
+            print(f"ERROR: {self._last_error}")
+            self.error_signal.emit(self._last_error)
             self.connection_status_signal.emit(False, f"Connection failed: {e}")
             self._connected = False
             return False
@@ -77,6 +116,25 @@ class LabJackDataThread(QThread):
                  self.error_signal.emit(error_msg)
         self._connected = False
         self.connection_status_signal.emit(False, "Disconnected")
+
+    def is_connected(self):
+        """Check if connected to LabJack"""
+        return self._connected and self._labjack_interface and self._labjack_interface.is_connected()
+        
+    @property
+    def error_message(self):
+        """Get the last error message from the interface"""
+        if self._last_error:
+            return self._last_error
+        if not LabJackInterface:
+            return "LabJack library (labjack-ljm) not installed or drivers missing."
+        if self._labjack_interface:
+            return getattr(self._labjack_interface, 'error_message', "Unknown error")
+        return "Interface not initialized"
+
+    def get_error(self):
+        """Get the last error message (legacy)"""
+        return self.error_message
 
     def run(self):
         """Main thread loop for reading data."""
@@ -123,6 +181,7 @@ class LabJackDataThread(QThread):
                         continue
                 else:
                     print("DEBUG LabJackThread: Exiting run loop - not connected.")
+                    self.connection_status_signal.emit(False, "Connection lost")
                     break
 
             try:

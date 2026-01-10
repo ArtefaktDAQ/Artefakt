@@ -617,38 +617,19 @@ class NotesController(QObject):
                 # This avoids capturing any overlay indicators like the recording symbol
                 pixmap = None
                 
-                # Try to get the current frame directly from the camera_controller
-                if hasattr(camera_controller, 'current_frame') and camera_controller.current_frame is not None:
-                    # Use the stored clean frame
-                    pixmap = camera_controller.current_frame.copy()
-                elif hasattr(camera_controller, 'camera_thread') and camera_controller.camera_thread:
-                    # Try to get a new frame from the camera thread
-                    if hasattr(camera_controller.camera_thread, 'get_current_frame'):
-                        frame = camera_controller.camera_thread.get_current_frame()
-                        if frame is not None:
-                            # Convert OpenCV frame to QPixmap if needed
-                            try:
-                                # Import required libraries
-                                import cv2
-                                import numpy as np
-                                
-                                # Check if it's a numpy array (OpenCV image)
-                                if isinstance(frame, np.ndarray):
-                                    # Convert OpenCV BGR to RGB for Qt
-                                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                                    
-                                    # Convert to QImage
-                                    height, width, channels = frame_rgb.shape
-                                    bytes_per_line = channels * width
-                                    q_image = QImage(frame_rgb.data, width, height, bytes_per_line, QImage.Format.Format_RGB888)
-                                    
-                                    # Convert to QPixmap
-                                    pixmap = QPixmap.fromImage(q_image)
-                            except ImportError:
-                                # If numpy or cv2 aren't available, we'll just use the fallback method
-                                pass
+                # Use the active camera slot (selected in the camera tab)
+                active_idx = camera_controller.active_camera_index
                 
-                # If we couldn't get a raw frame, fall back to the displayed image
+                # Try to get the current frame directly from the camera_controller
+                if hasattr(camera_controller, 'get_current_frame'):
+                    # Use the stored clean frame for the active slot
+                    pixmap = camera_controller.get_current_frame(index=active_idx)
+                
+                # If we couldn't get a raw frame for the active slot, try the main view
+                if (pixmap is None or pixmap.isNull()) and active_idx != camera_controller.main_view_index:
+                    pixmap = camera_controller.get_current_frame(index=camera_controller.main_view_index)
+                
+                # If still nothing, fall back to the displayed image
                 if pixmap is None or pixmap.isNull():
                     # Get the camera display widget as fallback
                     camera_label = getattr(self.main_window, 'camera_label', None)

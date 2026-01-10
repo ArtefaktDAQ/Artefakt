@@ -454,6 +454,33 @@ class AudioSensorInterface(BaseInterface):
     - zero_crossing: Zero crossing rate
     """
     
+    DISPLAY_NAME = "Audio"
+    DESCRIPTION = "Use a microphone as a measurement sensor"
+    ICON = "🎤"
+    
+    HELP_TEXT = """
+    <h3>Audio Sensor Interface</h3>
+    <p>Uses a microphone as a measurement sensor for loudness, frequency, RPM, etc.</p>
+    <p><b>How to use:</b></p>
+    <ol>
+        <li>Select the audio input device (Device ID).</li>
+        <li>Select the measurement mode (RMS, Frequency, etc.).</li>
+        <li>Set the output rate (Hz).</li>
+        <li>Add sensors with interface type 'Audio' and select the desired measurement output.</li>
+    </ol>
+    """
+    
+    CONFIG_SCHEMA = {
+        "device_id": {"type": "number", "label": "Device ID (None=Default)", "default": 0},
+        "mode": {
+            "type": "list", 
+            "label": "Measurement Mode", 
+            "options": ["rms", "peak", "frequency", "rpm", "band_energy", "zero_crossing"],
+            "default": "rms"
+        },
+        "output_rate": {"type": "number", "label": "Output Rate (Hz)", "default": 10}
+    }
+
     # Class-level tracking of which devices are in use
     _devices_in_use = set()
     _devices_lock = Lock()

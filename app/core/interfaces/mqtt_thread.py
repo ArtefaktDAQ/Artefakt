@@ -30,6 +30,16 @@ class MQTTDataThread(QThread):
         # Create MQTT interface
         self.mqtt = None
         
+        # UI/Config attributes
+        self.broker = "localhost"
+        self.port = 1883
+        self.client_id = f"ArtefaktDAQ_{int(time.time())}"
+        self.username = ""
+        self.password = ""
+        self.auto_connect = False
+        self.enabled = True
+        self._last_error = ""
+        
         # Thread control
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
@@ -69,10 +79,25 @@ class MQTTDataThread(QThread):
         self.connection_lost_signal.emit(error_message)
         self.connection_status_signal.emit(False, f"Connection lost: {error_message}")
 
-    def connect(self, broker="localhost", port=1883, client_id="ArtefaktDAQ", 
+    def connect(self, broker=None, port=None, client_id=None, 
                 username=None, password=None, keepalive=60):
         """Connect to the MQTT broker"""
+        self._last_error = ""
         try:
+            # Use instance attributes if not provided as arguments (from harmonized dialog)
+            if broker is None: broker = self.broker
+            if port is None: port = int(self.port) if self.port else 1883
+            if client_id is None: client_id = self.client_id
+            if username is None: username = self.username
+            if password is None: password = self.password
+            
+            # Update instance attributes to keep in sync
+            self.broker = broker
+            self.port = port
+            self.client_id = client_id
+            self.username = username
+            self.password = password
+
             print(f"MQTTThread: Attempting to connect to MQTT broker at {broker}:{port}")
             
             # Save params for reconnect
@@ -103,15 +128,15 @@ class MQTTDataThread(QThread):
                 
                 return True
             else:
-                error_msg = self.mqtt.get_error()
-                print(f"MQTTThread: Failed to connect: {error_msg}")
-                self.connection_status_signal.emit(False, error_msg)
+                self._last_error = self.mqtt.get_error()
+                print(f"MQTTThread: Failed to connect: {self._last_error}")
+                self.connection_status_signal.emit(False, self._last_error)
                 return False
                 
         except Exception as e:
-            error_msg = f"Failed to connect to MQTT: {str(e)}"
-            print(f"MQTTThread: Exception during connect: {error_msg}")
-            self.connection_status_signal.emit(False, error_msg)
+            self._last_error = f"Failed to connect to MQTT: {str(e)}"
+            print(f"MQTTThread: Exception during connect: {self._last_error}")
+            self.connection_status_signal.emit(False, self._last_error)
             return False
 
     def disconnect(self):
@@ -135,6 +160,15 @@ class MQTTDataThread(QThread):
     def is_connected(self):
         return self.mqtt and self.mqtt.is_connected()
 
+    @property
+    def error_message(self):
+        """Get the last error message from the interface"""
+        if self._last_error:
+            return self._last_error
+        if self.mqtt:
+            return self.mqtt.get_error()
+        return ""
+        
     def subscribe(self, topic):
         """Subscribe to a topic"""
         if self.mqtt:

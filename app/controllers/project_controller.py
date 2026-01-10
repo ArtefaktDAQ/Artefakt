@@ -1295,6 +1295,26 @@ class ProjectController(QObject):
                     self.main_window.graph_controller.plot_historical_data(dc_controller.csv_historical_data, run_dir=run_dir)
                     
                     self.main_window.logger.log(f"Plotted historical graph data from {run_dir}")
+
+                    # Update dashboard metrics with the last available data point
+                    if hasattr(self.main_window, 'update_dashboard_metrics'):
+                        last_row = {'_source': 'replay'}
+                        for sensor_id, data in dc_controller.csv_historical_data.items():
+                            if data.get('value') and len(data['value']) > 0:
+                                last_row[sensor_id] = data['value'][-1]
+                                if data.get('time') and len(data['time']) > 0:
+                                    last_row['timestamp'] = data['time'][-1]
+                        
+                        # Only update if we found some sensor values
+                        if len(last_row) > 1:
+                            # Use QTimer to ensure UI is ready after load (slightly longer delay for startup)
+                            from PyQt6.QtCore import QTimer
+                            def delayed_update():
+                                self.main_window.logger.log("Triggering delayed dashboard metric update for all sensors", "DEBUG")
+                                self.main_window.update_dashboard_metrics(last_row)
+                            
+                            QTimer.singleShot(1000, delayed_update)
+                            self.main_window.logger.log("Preloaded dashboard metrics from last run", "DEBUG")
                 else:
                     self.main_window.logger.log(f"No historical graph data found in {run_dir}", "INFO")
             except Exception as e:

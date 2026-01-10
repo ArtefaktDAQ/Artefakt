@@ -42,8 +42,12 @@ class ArduinoMasterSlaveThread(QThread):
         
         self.monitoring_only = False  # Flag to indicate monitoring mode (no CSV writing)
         self.mutex = QMutex()
+        self._was_connected = False
+        self._last_error = ""
         
         # Data collection settings
+        self.port = "COM3"
+        self.baud_rate = 9600
         self.poll_interval = 1.0  # Default polling interval in seconds
         self.auto_reconnect = True  # Enable auto-reconnect by default
         self._last_reconnect_attempt = 0
@@ -101,10 +105,39 @@ class ArduinoMasterSlaveThread(QThread):
         self.connection_lost_signal.emit(error_message)
         self.connection_status_signal.emit(False, f"Connection lost: {error_message}")
             
-    def connect(self, port, baud_rate=9600):
+    def connect(self, port=None, baud_rate=None):
         """Connect to the Arduino master"""
+        self._last_error = ""
         try:
+            # If no port/baud provided, use existing attributes if they exist
+            if port is None:
+                port = getattr(self, "port", "COM3")
+            else:
+                self.port = port
+                
+            if baud_rate is None:
+                baud_rate = getattr(self, "baud_rate", 9600)
+            else:
+                self.baud_rate = baud_rate
+
             print(f"ArduinoMasterSlaveThread: Attempting to connect to Arduino on {port} with baud rate {baud_rate}")
+            
+            # If already connected, check if it's the same port/baud. If not, disconnect first.
+            if self.is_connected():
+                # Ensure baud_rate is compared as integer
+                try:
+                    current_baud = int(self.arduino.baud_rate)
+                    target_baud = int(baud_rate)
+                except (ValueError, TypeError):
+                    current_baud = self.arduino.baud_rate
+                    target_baud = baud_rate
+                    
+                if str(self.arduino.port) == str(port) and current_baud == target_baud:
+                    print("ArduinoMasterSlaveThread: Already connected to this device.")
+                    return True
+                else:
+                    print(f"ArduinoMasterSlaveThread: Already connected to different device ({self.arduino.port} @ {self.arduino.baud_rate}), disconnecting first...")
+                    self.disconnect()
             
             # Create new Arduino interface with settings
             self.arduino = ArduinoInterface(
@@ -121,10 +154,11 @@ class ArduinoMasterSlaveThread(QThread):
             if success:
                 print(f"ArduinoMasterSlaveThread: Successfully connected to Arduino on {port}")
                 self.connection_status_signal.emit(True, f"Connected to Arduino on {port}")
+                self._was_connected = True
                 
-                # Start a basic monitoring thread to receive sensor data
-                # (without CSV writing or full data collection)
+                # Start the thread if not already running
                 if not self.isRunning():
+                    print("ArduinoMasterSlaveThread: Starting thread for monitoring")
                     self._stop_event.clear()
                     self._pause_event.set()  # Not paused
                     self.monitoring_only = True  # Flag to indicate monitoring mode only
@@ -132,15 +166,15 @@ class ArduinoMasterSlaveThread(QThread):
                 
                 return True
             else:
-                error_msg = self.arduino.get_error()
-                print(f"ArduinoMasterSlaveThread: Failed to connect to Arduino: {error_msg}")
-                self.connection_status_signal.emit(False, error_msg)
+                self._last_error = self.arduino.get_error()
+                print(f"ArduinoMasterSlaveThread: Failed to connect to Arduino: {self._last_error}")
+                self.connection_status_signal.emit(False, self._last_error)
                 return False
                 
         except Exception as e:
-            error_msg = f"Failed to connect to Arduino: {str(e)}"
-            print(f"ArduinoMasterSlaveThread: Exception during connect: {error_msg}")
-            self.connection_status_signal.emit(False, error_msg)
+            self._last_error = f"Failed to connect to Arduino: {str(e)}"
+            print(f"ArduinoMasterSlaveThread: Exception during connect: {self._last_error}")
+            self.connection_status_signal.emit(False, self._last_error)
             return False
             
     def disconnect(self):
@@ -179,6 +213,15 @@ class ArduinoMasterSlaveThread(QThread):
     def is_connected(self):
         """Check if connected to Arduino"""
         return self.arduino and self.arduino.is_connected()
+        
+    @property
+    def error_message(self):
+        """Get the last error message from the interface"""
+        if self._last_error:
+            return self._last_error
+        if self.arduino:
+            return self.arduino.get_error()
+        return ""
         
     def start_data_collection(self, run_dir):
         """Start collecting data from Arduino (no CSV writing here)"""
@@ -252,6 +295,11 @@ class ArduinoMasterSlaveThread(QThread):
                 
                 # Check if still connected
                 if not self.is_connected():
+                    if self._was_connected:
+                        print("Arduino master-slave thread: Connection lost!")
+                        self.connection_status_signal.emit(False, "Connection lost")
+                        self._was_connected = False
+
                     if self.auto_reconnect:
                         current_time = time.time()
                         if current_time - self._last_reconnect_attempt >= self._reconnect_interval:

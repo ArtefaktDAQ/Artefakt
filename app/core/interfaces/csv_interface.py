@@ -8,6 +8,15 @@ from app.core.interfaces.base_interface import BaseInterface
 class CSVInterface(BaseInterface):
     """Interface for reading data from CSV files periodically."""
     
+    DISPLAY_NAME = "Read CSV"
+    DESCRIPTION = "Read sensor data from a CSV file"
+    ICON = "📄"
+    
+    CONFIG_SCHEMA = {
+        "file_path": {"type": "string", "label": "File Path", "default": ""},
+        "poll_interval": {"type": "number", "label": "Poll Interval (s)", "default": 1.0}
+    }
+
     def __init__(self, file_path, poll_interval=1.0, mappings=None):
         super().__init__(name="CSVInterface")
         self.file_path = file_path

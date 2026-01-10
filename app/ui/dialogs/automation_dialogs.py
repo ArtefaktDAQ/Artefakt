@@ -196,7 +196,11 @@ class TriggerDialog(QDialog):
         self.event_type.addItems([
             "recording_started",
             "recording_stopped",
-            "motion_detected" 
+            "motion_detected",
+            "motion_detected_cam1",
+            "motion_detected_cam2",
+            "motion_detected_cam3",
+            "motion_detected_cam4"
         ])
         
         layout.addRow("Event Type:", self.event_type)
@@ -1048,6 +1052,16 @@ class ActionDialog(QDialog):
             
             # Initialize sound options
             self.update_sound_options()
+            
+        elif action_type == "take_snapshot":
+            self.camera_selector = QComboBox()
+            self.camera_selector.addItem("Active/Selected Slot", None)
+            self.camera_selector.addItem("All Connected Cameras", -1)
+            self.camera_selector.addItem("Camera 1", 0)
+            self.camera_selector.addItem("Camera 2", 1)
+            self.camera_selector.addItem("Camera 3", 2)
+            self.camera_selector.addItem("Camera 4", 3)
+            self.system_options_layout.addRow("Camera Source:", self.camera_selector)
     
     def update_sound_options(self):
         """Update sound options based on selected sound type"""
@@ -1143,6 +1157,12 @@ class ActionDialog(QDialog):
                      self.update_sound_options()
                      if sound_type == "custom" and hasattr(self, 'sound_file_input'):
                          self.sound_file_input.setText(action.parameters.get("file_path", ""))
+                 elif action.specific_action_type == "take_snapshot" and hasattr(self, 'camera_selector'):
+                     cam_idx = action.parameters.get("camera_index")
+                     # Find index by data
+                     idx = self.camera_selector.findData(cam_idx)
+                     if idx >= 0:
+                         self.camera_selector.setCurrentIndex(idx)
             elif isinstance(action, SetVariableAction):
                  if hasattr(self, 'variable_name_input'):
                      self.variable_name_input.setText(action.variable_name)
@@ -1202,8 +1222,11 @@ class ActionDialog(QDialog):
                  params["sound"] = sound_type
                  if sound_type == "custom":
                      params["file_path"] = self.sound_file_input.text()
-            # No extra params needed for start/stop recording, snapshot
-
+            elif sys_action_type == "take_snapshot":
+                 if hasattr(self, 'camera_selector'):
+                     params["camera_index"] = self.camera_selector.currentData()
+            # No extra params needed for start/stop recording
+            
             # Ensure sys_action_type (e.g., "start_recording") is passed
             return SystemAction(name, sys_action_type, params)
 

@@ -840,6 +840,33 @@ COMMON USES:
 • Quality control and automated inspection"""
         },
         {
+            "title": "Brightness Mode",
+            "icon": "☀️",
+            "content": """BRIGHTNESS MODE measures the overall light intensity in a defined region of interest (ROI).
+
+HOW IT WORKS:
+1. Converts the selected ROI to grayscale
+2. Calculates statistical values for all pixels in that region
+3. Outputs these values as real-time sensor data
+
+OUTPUT VALUES:
+• brightness_mean: Average light level (0-255). Best for general light monitoring.
+• brightness_max: Brightest pixel in the ROI. Detects the presence of any light.
+• brightness_min: Darkest pixel in the ROI. Useful for detecting shadows or blockage.
+• brightness_std: Standard deviation (noise/contrast). High value means high contrast.
+
+APPLICATIONS:
+• Monitoring light levels in a growth chamber
+• Detecting when a lamp or LED is turned on
+• Measuring opacity or transparency of a sample
+• Detecting when an object enters a beam of light (shadow detection)
+
+TIPS:
+• For global measurement, set ROI to the full camera resolution (e.g., 640x480).
+• Use a smaller ROI to monitor a specific indicator LED or a localized light source.
+• Ensure the camera exposure is set to manual if you need consistent, absolute measurements across time."""
+        },
+        {
             "title": "Threshold Modes Explained",
             "icon": "📊",
             "content": """ABSOLUTE THRESHOLD (1-255):
@@ -1137,14 +1164,14 @@ Click "Add Sensor" or "Add Mapping" button and configure:
 • Unit: Measurement unit (°C, Pa, etc.)
 
 4️⃣ ENABLE GRAPH
-Check "Show in Graph" to display the sensor in visualizations."""
+Check "Use" to display the sensor in visualizations. (Data is always recorded for all enabled sensors)"""
         },
         {
             "title": "Sensor Table Columns",
             "icon": "📊",
-            "content": """GRAPH CHECKBOX:
-☑️ Check to show sensor in graph view
-(Data is always recorded regardless)
+            "content": """USE CHECKBOX:
+☑️ Check to 'use' (show) sensor in graph views.
+(Data is always recorded for all enabled sensors regardless)
 
 SENSOR NAME:
 The display name for your sensor
@@ -1294,6 +1321,23 @@ PERFORMANCE:
 • Limit active sensors if needed
 • Adjust poll intervals
 • Use appropriate data rates"""
+        },
+        {
+            "title": "Custom Interfaces",
+            "icon": "🐍",
+            "content": """DEVELOPER GUIDE:
+You can extend EvoLabs DAQ with your own hardware interfaces using Python scripts.
+
+HOW IT WORKS:
+1. Create a new Python file in the 'plugins' folder.
+2. Inherit from 'BaseInterface' class.
+3. Define CONFIG_SCHEMA for your settings.
+4. Implement connect(), disconnect(), and read_data() methods.
+
+Once your script is in the plugins folder, it will automatically appear as a clickable card in the Interfaces section.
+
+EXAMPLE:
+Look at 'plugins/example_plugin.py' for a template you can copy and modify."""
         }
     ]
 }

@@ -63,7 +63,7 @@ class AddEditSensorDialog(QDialog):
         # Show in graph
         self.show_in_graph_checkbox = QCheckBox()
         self.show_in_graph_checkbox.setChecked(self.sensor.get("show_in_graph", True))
-        layout.addRow("Show in Graph:", self.show_in_graph_checkbox)
+        layout.addRow("Use in Graphs:", self.show_in_graph_checkbox)
 
         # Sequence selection
         self.sequence_combo = QComboBox()
@@ -133,10 +133,17 @@ class AddEditSensorDialog(QDialog):
         if not seq:
             self.variable_combo.setEnabled(False)
             return
+
+        # Support both legacy UI schema (`actions`) and harmonized engine schema (`steps`)
+        steps_or_actions = seq.get("actions") or seq.get("steps") or []
+
         published_vars = []
-        for action in seq.get("actions", []):
-            if action.get("type") == "publish" and action.get("target"):
-                published_vars.append(action["target"])
+        for action in steps_or_actions:
+            action_type = (action.get("type") or "").strip()
+            if action_type.lower() == "publish":
+                target = action.get("target")
+                if target:
+                    published_vars.append(str(target))
         if published_vars:
             self.variable_combo.addItems(published_vars)
             self.variable_combo.setEnabled(True)
@@ -631,6 +638,8 @@ class OtherSensorsDialog(QDialog):
         
         # Update autoconnect setting in main window
         self.parent().other_sensors_autoconnect = self.autoconnect_checkbox.isChecked()
+        if hasattr(self.parent(), 'settings'):
+            self.parent().settings.setValue("other_sensors_autoconnect", "true" if self.parent().other_sensors_autoconnect else "false")
         
         # Check the actual connection status from the data_collection_controller
         actual_connected = False
@@ -849,6 +858,61 @@ class AddEditSequenceDialog(QDialog):
         self.resize(500, 440)
         self.setStyleSheet(DialogStyles.dark_dialog())
         self.sequence = sequence.copy() if sequence else {"name": "", "port": "", "baud": 9600, "actions": [], "poll_interval": 1.0}
+
+        # Backward/forward compatibility:
+        # - Legacy UI uses `actions` with types: send/wait/read/parse/publish
+        # - Harmonized engine may persist `steps` with types: SendCommand/Wait/ReadResponse/ParseValue/publish
+        if not self.sequence.get("actions") and self.sequence.get("steps"):
+            normalized_actions = []
+            for step in self.sequence.get("steps", []):
+                step_type = (step.get("type") or "").strip()
+                st_lower = step_type.lower()
+                if step_type == "SendCommand":
+                    normalized_actions.append({
+                        "type": "send",
+                        "command": step.get("command", ""),
+                        "line_ending": step.get("line_ending", "None"),
+                    })
+                elif step_type == "Wait":
+                    normalized_actions.append({
+                        "type": "wait",
+                        "ms": int(step.get("wait_time", 200) or 200),
+                    })
+                elif step_type == "ReadResponse":
+                    normalized_actions.append({
+                        "type": "read",
+                        "read_type": step.get("read_type", "Read Line"),
+                        "timeout": int(step.get("timeout", 1000) or 1000),
+                        "target": step.get("result_var", "response"),
+                    })
+                elif step_type == "ParseValue":
+                    # Convert ParseValue parameters to the UI's parse schema as best as possible
+                    parse_method = step.get("parse_method", "Entire Response")
+                    parse_mode = "entire"
+                    if parse_method == "After Marker":
+                        parse_mode = "after"
+                    elif parse_method == "Between Markers":
+                        parse_mode = "between"
+                    elif parse_method == "Before Marker":
+                        parse_mode = "before"
+                    normalized = {
+                        "type": "parse",
+                        "source": step.get("source_var", "response"),
+                        "target": step.get("result_var", "value"),
+                        "parse_mode": parse_mode,
+                    }
+                    if parse_mode in ("after", "between"):
+                        normalized["start"] = step.get("start_marker", "")
+                    if parse_mode in ("between", "before"):
+                        normalized["end"] = step.get("end_marker", "")
+                    normalized_actions.append(normalized)
+                elif st_lower == "publish":
+                    normalized_actions.append({
+                        "type": "publish",
+                        "source": step.get("source_var", "value"),
+                        "target": step.get("target", ""),
+                    })
+            self.sequence["actions"] = normalized_actions
         if isinstance(self.sequence.get("actions"), str):
             import json
             try:
@@ -879,6 +943,10 @@ class AddEditSequenceDialog(QDialog):
         self.poll_interval_edit = QLineEdit(str(self.sequence.get("poll_interval", 1.0)))
         self.poll_interval_edit.setToolTip("How often to poll the sensor (in seconds). Lower values update more frequently but use more resources.")
         layout.addRow("Poll Interval (seconds):", self.poll_interval_edit)
+
+        self.auto_connect_checkbox = QCheckBox("Auto-connect on startup")
+        self.auto_connect_checkbox.setChecked(self.sequence.get("auto_connect", True))
+        layout.addRow("", self.auto_connect_checkbox)
 
         self.actions_table = QTableWidget()
         self.actions_table.setColumnCount(2)
@@ -1041,6 +1109,7 @@ class AddEditSequenceDialog(QDialog):
             "port": self.port_combo.currentData(),
             "baud": int(self.baud_edit.text().strip() or 9600),
             "poll_interval": float(self.poll_interval_edit.text().strip() or 1.0),
+            "auto_connect": self.auto_connect_checkbox.isChecked(),
             "actions": self.sequence["actions"],
         }
 

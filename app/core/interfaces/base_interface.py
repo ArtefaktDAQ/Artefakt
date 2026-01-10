@@ -13,6 +13,21 @@ class BaseInterface(ABC):
     All hardware interfaces must inherit from this class.
     """
     
+    # Metadata for the UI and registration
+    DISPLAY_NAME = "Base Interface"
+    DESCRIPTION = "Base class for all hardware interfaces"
+    ICON = "🔌"  # Default icon for the UI card
+    
+    # Define what configuration fields this interface needs for the UI
+    # This schema allows the UI to automatically generate the "Add Sensor" dialog.
+    # Supported types: "string", "number", "list", "boolean"
+    # Example: 
+    # CONFIG_SCHEMA = {
+    #     "port": {"type": "list", "label": "Serial Port", "options_cmd": "list_ports"},
+    #     "baud_rate": {"type": "number", "label": "Baud Rate", "default": 9600}
+    # }
+    CONFIG_SCHEMA = {}
+
     def __init__(self, name=""):
         """
         Initialize the interface
@@ -22,9 +37,18 @@ class BaseInterface(ABC):
         """
         self.name = name
         self.connected = False
+        self.enabled = True
+        self.auto_connect = False
         self.error_message = ""
+    
+    @classmethod
+    def get_ui_options(cls, field_name):
+        """
+        Returns options for a 'list' type field in CONFIG_SCHEMA.
+        Override this to provide dynamic lists (like available COM ports).
+        """
+        return []
         
-    @abstractmethod
     def connect(self):
         """
         Connect to the hardware device
@@ -32,14 +56,13 @@ class BaseInterface(ABC):
         Returns:
             True if connected successfully, False otherwise
         """
-        pass
+        self.connected = True
+        return True
         
-    @abstractmethod
     def disconnect(self):
         """Disconnect from the hardware device"""
-        pass
+        self.connected = False
         
-    @abstractmethod
     def is_connected(self):
         """
         Check if the interface is connected
@@ -59,7 +82,6 @@ class BaseInterface(ABC):
         """
         pass
         
-    @abstractmethod
     def write_data(self, data):
         """
         Write data to the device
@@ -70,7 +92,15 @@ class BaseInterface(ABC):
         Returns:
             True if successful, False otherwise
         """
-        pass
+        return False
+
+    @classmethod
+    def get_output_keys(cls):
+        """
+        Returns a list of available data keys this interface provides.
+        Example: ["Temperature", "Humidity"] or ["Voltage", "Current"]
+        """
+        return []
         
     def get_error(self):
         """

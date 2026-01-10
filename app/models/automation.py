@@ -1059,8 +1059,10 @@ class SystemAction(BaseAction):
             elif self.specific_action_type == "stop_recording" and hasattr(main_window, 'camera_controller'):
                 main_window.camera_controller.stop_recording()
             elif self.specific_action_type == "take_snapshot" and hasattr(main_window, 'camera_controller'):
+                # Check for camera_index in parameters
+                camera_index = resolved_params.get("camera_index")
                 # Capture the snapshot path to include in automation event
-                self.last_image_path = main_window.camera_controller.take_snapshot()
+                self.last_image_path = main_window.camera_controller.take_snapshot(index=camera_index)
             elif self.specific_action_type == "display_message":
                 from PyQt6.QtWidgets import QMessageBox
                 QMessageBox.information(main_window, 
