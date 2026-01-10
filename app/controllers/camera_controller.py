@@ -192,7 +192,7 @@ class CameraController(QObject):
             self.camera_mode.blockSignals(True)
             self.camera_mode.setCurrentIndex(0)
             self.camera_mode.blockSignals(False)
-            self.refresh_camera_list()
+            self._handle_camera_mode_changed(0) # Sets visibility correctly for initial state
         
         # Initialize camera lazily after the event loop starts to keep the
         # main window paint fast.
@@ -488,7 +488,21 @@ class CameraController(QObject):
     
     def _handle_camera_mode_changed(self, index):
         """Handle change in camera mode (Local vs NDI)."""
+        # Update config for the active slot
+        self.camera_configs[self.active_camera_index]["mode"] = index
+        
         self.refresh_camera_list()
+        
+        # Show/Hide resolution fields based on mode (NDI handles resolution automatically)
+        is_ndi = (index == 1)
+        if hasattr(self.main_window, 'camera_resolution'):
+            self.main_window.camera_resolution.setVisible(not is_ndi)
+        if hasattr(self.main_window, 'camera_resolution_label'):
+            self.main_window.camera_resolution_label.setVisible(not is_ndi)
+            
+        if hasattr(self.main_window, 'camera_controls_group'):
+            self.main_window.camera_controls_group.setVisible(not is_ndi)
+            
         if index == 1 and NDI_AVAILABLE:
             if not self.ndi_discovery_timer.isActive():
                 self.ndi_discovery_timer.start(500) # Reverted to 500ms as requested
@@ -1415,6 +1429,14 @@ class CameraController(QObject):
 
     def refresh_settings_ui(self):
         idx = self.active_camera_index
+        
+        if hasattr(self.main_window, 'camera_mode'):
+            self.main_window.camera_mode.blockSignals(True)
+            self.main_window.camera_mode.setCurrentIndex(self.camera_configs[idx].get("mode", 0))
+            self.main_window.camera_mode.blockSignals(False)
+            # Ensure visibility of mode-specific fields is updated
+            self._handle_camera_mode_changed(self.camera_configs[idx].get("mode", 0))
+
         if self.camera_select:
             source_idx = self.camera_select.findData(self.camera_configs[idx]["source"])
             if source_idx >= 0: self.camera_select.setCurrentIndex(source_idx)

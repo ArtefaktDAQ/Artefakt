@@ -1341,7 +1341,8 @@ def setup_ui(self):
     camera_connection_layout.addLayout(connect_layout, 2, 1, 1, 2)
 
     # Resolution
-    camera_connection_layout.addWidget(QLabel("Res:"), 3, 0)
+    self.camera_resolution_label = QLabel("Res:")
+    camera_connection_layout.addWidget(self.camera_resolution_label, 3, 0)
     self.camera_resolution = QComboBox()
     self.camera_resolution.addItems(["640x480", "800x600", "1280x720", "1920x1080"])
     self.camera_resolution.setStyleSheet(InputStyles.default())
@@ -1424,9 +1425,9 @@ def setup_ui(self):
     adjust_layout.setSpacing(12)
 
     # Camera focus and exposure controls - modernized
-    camera_controls_group = QGroupBox("🎛️ Camera Controls")
-    camera_controls_group.setStyleSheet(GroupBoxStyles.tight())
-    camera_controls_layout = QGridLayout(camera_controls_group)
+    self.camera_controls_group = QGroupBox("🎛️ Camera Controls")
+    self.camera_controls_group.setStyleSheet(GroupBoxStyles.tight())
+    camera_controls_layout = QGridLayout(self.camera_controls_group)
     camera_controls_layout.setContentsMargins(10, 10, 10, 10)
     camera_controls_layout.setSpacing(10)
     
@@ -1508,7 +1509,7 @@ def setup_ui(self):
     camera_controls_layout.addLayout(exposure_slider_layout, 3, 0, 1, 3)
     
     # Add camera controls group to adjust layout
-    adjust_layout.addWidget(camera_controls_group)
+    adjust_layout.addWidget(self.camera_controls_group)
     
     # Motion Detection Settings for the active camera
     motion_settings_group = QGroupBox("🔍 Motion Detection")
