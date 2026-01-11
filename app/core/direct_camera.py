@@ -131,8 +131,8 @@ class DirectCameraThread(QThread):
         # Store reference to main window for accessing sensor controller
         self.main_window = main_window
         
-        # Set thread priority to highest
-        self.setPriority(QThread.Priority.HighestPriority)
+        # Set thread priority to high but not highest to allow UI thread to breathe
+        self.setPriority(QThread.Priority.HighPriority)
         
         # Camera state
         self.camera_id = 0
@@ -156,9 +156,14 @@ class DirectCameraThread(QThread):
         self.actual_fps = 0
         self.framerate_warning_shown = False  # Track if warning was shown for current recording
         
+        # Preview throttling
+        self.preview_fps = 15
+        self.last_preview_time = 0
+        self.is_visible = False # Whether this camera is currently visible in UI
+        self.preview_mode = "none" # "active", "dashboard", "thumbnail", or "none"
+        
         # Recording state
         self.recording = False
-        self.frames_buffer = []
         self.recording_start_time = 0
         self.recording_next_frame_time = 0
         self.output_file = ""
@@ -176,7 +181,7 @@ class DirectCameraThread(QThread):
         # Video settings
         self.video_quality = 85  # Default quality
         self.ffmpeg_path = FFMPEG_BINARY
-        self.direct_streaming = False
+        self.direct_streaming = True  # Always use direct streaming
         self.use_hw_accel = True  # Default to True as requested
         
         # Overlay settings
@@ -185,12 +190,6 @@ class DirectCameraThread(QThread):
         self._overlays_changed = False  # Flag to track if overlays need copying
         self._cached_overlays = []  # Cached copy of overlays for frame processing
         
-        # Memory management for buffered recording
-        # Limit buffer to ~2000 frames (approx 1 minute at 30fps)
-        # This is a fallback if direct streaming is disabled.
-        self.max_buffer_frames = 2000
-        self.buffer_warning_emitted = False
-
         # Motion detector
         self.motion_detector = MotionDetector()
         self._last_motion_state = False  # Store last motion detection state for overlay
@@ -245,11 +244,17 @@ class DirectCameraThread(QThread):
     def connect(self, camera_id, resolution, fps):
         """Setup connection parameters and start background thread for asynchronous connection."""
         try:
-            # Check if already connected
-            if self.connected:
-                print("Camera is already connected")
-                return True
-                
+            # If already running, stop it first to ensure a clean reconnect
+            if self.isRunning():
+                print("Camera thread already running, stopping for reconnect...")
+                self.running = False
+                self.wait(500)
+            
+            # Reset connection state
+            self.connected = False
+            self.cap = None
+            self.ndi_receiver = None
+            
             print(f"Queueing connection to camera {camera_id} with resolution {resolution} at {fps} FPS")
             
             # Parse and store settings for the background thread
@@ -766,7 +771,7 @@ class DirectCameraThread(QThread):
         try:
             print("Camera thread started")
             # Set thread priority again to ensure it's applied
-            self.setPriority(QThread.Priority.HighestPriority)
+            self.setPriority(QThread.Priority.HighPriority)
             
             # --- Perform Connection in Background ---
             # If not yet connected, attempt connection now in this thread
@@ -783,17 +788,42 @@ class DirectCameraThread(QThread):
             max_errors = 5  # Maximum number of consecutive errors before stopping
             
             # Main capture loop
-            while self.running and ( (self.cap and self.cap.isOpened()) or (self.ndi_receiver and self.ndi_receiver.is_connected()) ):
+            while self.running:
+                # Brief sleep to allow other threads to run and prevent tight loops
+                time.sleep(0.001)
+                
+                # Check connection status
+                is_connected = False
+                if self.is_ndi and self.ndi_receiver:
+                    is_connected = self.ndi_receiver.is_connected()
+                elif self.cap and self.cap.isOpened():
+                    is_connected = True
+                
+                if not is_connected:
+                    # Connection lost or not yet established
+                    error_count += 1
+                    if error_count > max_errors:
+                        break
+                    time.sleep(0.1)
+                    continue
+
                 try:
                     # Capture frame
                     if self.is_ndi and self.ndi_receiver:
-                        frame = self.ndi_receiver.capture_frame(timeout_ms=100)
-                        ret = frame is not None
+                        try:
+                            # Robust NDI frame capture
+                            frame = self.ndi_receiver.capture_frame(timeout_ms=100)
+                            ret = frame is not None
+                        except Exception as ndi_err:
+                            print(f"NDI Capture Error on Cam {self.index+1}: {ndi_err}")
+                            ret = False
+                            frame = None
+                            time.sleep(0.1) # Cool down on error
                         
                         # For NDI, a timeout isn't necessarily a fatal error
                         if not ret:
-                            # We don't increment error_count for NDI timeouts unless they persist for a long time
-                            # Let's just continue and try again
+                            # Give UI time to breathe even on timeout
+                            time.sleep(0.01)
                             continue
                     else:
                         ret, frame = self.cap.read()
@@ -809,9 +839,6 @@ class DirectCameraThread(QThread):
                                 print(f"Camera resolution changed/mismatch: {self.width}x{self.height} -> {f_w}x{f_h}. Updating...")
                                 self.width = f_w
                                 self.height = f_h
-                                # Note: If recording is active, changing resolution mid-stream will 
-                                # likely corrupt the video file as FFmpeg expects a constant resolution.
-                                # However, NDI sources typically stay constant once connected.
                         
                         # --- Motion Detection --- START
                         motion_detected = self.motion_detector.process_frame(frame)
@@ -822,139 +849,110 @@ class DirectCameraThread(QThread):
                         # Update FPS calculation
                         frame_count += 1
                         current_time = time.time()
+                        
                         if current_time - start_time >= 1.0:
                             self.actual_fps = frame_count / (current_time - start_time)
-                            print(f"Current FPS: {self.actual_fps:.1f}")
                             
                             # Check framerate during recording
-                            # Wait at least 3 seconds after recording starts before checking FPS
                             if self.recording and not self.framerate_warning_shown and self.actual_fps > 0:
-                                # Only check after 3 seconds of recording to get accurate measurement
                                 if hasattr(self, 'recording_start_time') and self.recording_start_time > 0:
                                     time_since_recording_start = current_time - self.recording_start_time
-                                    
                                     if time_since_recording_start >= 3.0:
-                                        # Check if actual FPS is significantly lower than expected (more than 20% lower)
                                         expected_fps = self.fps
-                                        fps_threshold = expected_fps * 0.8  # 80% of expected FPS
-                                        
+                                        fps_threshold = expected_fps * 0.8
                                         if self.actual_fps < fps_threshold:
-                                            # Emit warning signal (expected_fps, actual_fps)
                                             self.framerate_warning_signal.emit(self.index, expected_fps, self.actual_fps)
                                             self.framerate_warning_shown = True
-                                            print(f"Framerate warning: Expected {expected_fps} FPS, but camera is delivering {self.actual_fps:.1f} FPS")
                             
                             frame_count = 0
                             start_time = current_time
                         
-                        # Apply overlays if recording with overlays
-                        frame_with_overlays = self.apply_overlays(frame)
+                        # --- Lazy Overlay Application ---
+                        frame_with_overlays = None
+                        if self.recording or self.is_visible:
+                            frame_with_overlays = self.apply_overlays(frame)
                         
                         # Store frame if recording
-                        if self.recording:
-                            # --- Direct Streaming --- 
-                            if self.direct_streaming and hasattr(self, 'ffmpeg_process') and self.ffmpeg_process:
-                                # Periodically check if FFmpeg is still alive (every 10 frames for better responsiveness)
+                        if self.recording and frame_with_overlays is not None:
+                            # --- Direct Streaming Only --- 
+                            if hasattr(self, 'ffmpeg_process') and self.ffmpeg_process:
                                 if frame_count % 10 == 0:
                                     if self.ffmpeg_process.poll() is not None:
                                         print(f"CRITICAL: FFmpeg process cam{self.index+1} died during recording!")
-                                        # Attempt to read the last few lines of error log if possible
-                                        try:
-                                            if hasattr(self, 'ffmpeg_err_file'):
-                                                # This is tricky as we're writing to it, but let's try
-                                                print("Check logs for details on why FFmpeg died.")
-                                        except: pass
                                         self.recording = False
                                         self.recording_status_signal.emit(self.index, False)
                                         continue
 
                                 try:
                                     if self.ffmpeg_process.stdin:
-                                        # Calculate how many frames we should have sent by now to maintain target FPS
                                         frame_duration = 1.0 / self.fps
-                                        
-                                        # Determine how many frames to send to catch up to current time
-                                        # This handles cases where the camera is delivering frames slower than target FPS
-                                        # by duplicating the current frame to fill the time gaps.
                                         frames_to_send = 0
-                                        
-                                        # Use a small epsilon (10% of frame duration) to avoid jitter-induced skips
                                         epsilon = frame_duration * 0.1
                                         
                                         while current_time >= self.recording_next_frame_time - epsilon:
                                             frames_to_send += 1
                                             self.recording_next_frame_time += frame_duration
-                                            # Safety break to avoid huge bursts if system hangs or time jumps
                                             if frames_to_send > 10:
                                                 self.recording_next_frame_time = current_time + frame_duration
                                                 break
                                         
-                                        # If frames_to_send is 0, it means the camera is delivering frames faster 
-                                        # than the target FPS. In this case we skip this frame for the recording
-                                        # to maintain correct time synchronization with sensors.
                                         if frames_to_send > 0:
-                                            # Ensure frame is contiguous and in the expected BGR24 format for FFmpeg
                                             if not frame_with_overlays.flags['C_CONTIGUOUS']:
                                                 frame_with_overlays = np.ascontiguousarray(frame_with_overlays)
                                             
                                             frame_bytes = frame_with_overlays.tobytes()
                                             
-                                            # Verify byte size matches expectations to prevent video corruption/scrambling
-                                            # (width * height * 3 bytes for bgr24)
                                             expected_size = self.width * self.height * 3
                                             if len(frame_bytes) != expected_size:
-                                                print(f"CRITICAL: Frame byte size mismatch! Got {len(frame_bytes)}, expected {expected_size}. Skipping frame to avoid corruption.")
+                                                print(f"CRITICAL: Frame byte size mismatch! Got {len(frame_bytes)}, expected {expected_size}. Skipping frame.")
                                             else:
                                                 for _ in range(frames_to_send):
                                                     self.ffmpeg_process.stdin.write(frame_bytes)
                                                 
-                                                # Optional: flush occasionally to ensure data is moving, but not every frame
-                                                # for performance reasons. Since we're sending ~2.7MB, it will flush anyway.
                                                 if frame_count % 5 == 0:
                                                     self.ffmpeg_process.stdin.flush()
                                                 
                                 except Exception as write_error:
-                                    print(f"Error writing frame to FFmpeg (direct streaming): {str(write_error)}")
-                                    # If we get a broken pipe, FFmpeg has definitely died
+                                    print(f"Error writing frame to FFmpeg: {str(write_error)}")
                                     if "Broken pipe" in str(write_error) or "Invalid argument" in str(write_error) or (hasattr(write_error, 'errno') and write_error.errno == 32):
-                                        print("Broken pipe detected. Stopping recording.")
                                         self.recording = False
                                         self.recording_status_signal.emit(self.index, False)
-                            # --- Buffer Method --- 
-                            elif not self.direct_streaming: 
-                                # Only buffer if direct streaming is explicitly disabled
-                                # Check buffer limit to prevent memory exhaustion
-                                if len(self.frames_buffer) < self.max_buffer_frames:
-                                    self.frames_buffer.append((frame_with_overlays.copy(), current_time))
-                                elif not self.buffer_warning_emitted:
-                                    print(f"WARNING: Frame buffer limit ({self.max_buffer_frames}) reached! Consider using direct streaming for longer recordings.")
-                                    self.buffer_warning_emitted = True
-                            # else: (Direct streaming enabled but ffmpeg_process failed/missing) -> Do nothing, don't buffer.
 
-                        try:
-                            # Convert to RGB for Qt
-                            rgb_frame = cv2.cvtColor(frame_with_overlays, cv2.COLOR_BGR2RGB)
+                        # --- UI Preview Optimization ---
+                        if self.is_visible and frame_with_overlays is not None:
+                            effective_fps = self.preview_fps
+                            if self.preview_mode == "thumbnail":
+                                effective_fps = min(self.preview_fps, 5)
                             
-                            # Convert to QImage and QPixmap
-                            h, w, ch = rgb_frame.shape
-                            bytes_per_line = ch * w
+                            preview_interval = 1.0 / effective_fps
                             
-                            # IMPORTANT: QImage created from external data does NOT copy the data.
-                            # We must ensure the numpy array stays alive until QPixmap is created,
-                            # or make a copy of the QImage. Using copy() ensures data ownership.
-                            q_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
-                            
-                            # Emit signal with the QImage
-                            self.frame_captured.emit(self.index, q_image)
-                        except Exception as e:
-                            print(f"Error processing frame: {str(e)}")
-                            print("Frame processing traceback:")
-                            traceback.print_exc()
-                            error_count += 1
-                            continue
+                            if current_time - self.last_preview_time >= preview_interval:
+                                self.last_preview_time = current_time
+                                try:
+                                    ui_frame = frame_with_overlays
+                                    if self.preview_mode in ["dashboard", "thumbnail"] and self.width > 640:
+                                        new_w = 640
+                                        new_h = int(640 * self.height / self.width)
+                                        ui_frame = cv2.resize(frame_with_overlays, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                                    elif self.preview_mode == "active" and self.width > 1280:
+                                        new_w = 1280
+                                        new_h = int(1280 * self.height / self.width)
+                                        ui_frame = cv2.resize(frame_with_overlays, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+                                    rgb_frame = cv2.cvtColor(ui_frame, cv2.COLOR_BGR2RGB)
+                                    h, w, ch = rgb_frame.shape
+                                    bytes_per_line = ch * w
+                                    q_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
+                                    self.frame_captured.emit(self.index, q_image)
+                                except Exception as e:
+                                    print(f"Error processing frame for UI: {str(e)}")
+                                    error_count += 1
+                                    continue
                     else:
                         error_count += 1
                         print(f"Failed to read frame (error count: {error_count})")
+                        # Give UI time to breathe even on read error
+                        time.sleep(0.01)
                     
                     # Check if we've had too many consecutive errors
                     if error_count >= max_errors:
@@ -962,8 +960,8 @@ class DirectCameraThread(QThread):
                         self.running = False
                         break
                     
-                    # No sleep to allow maximum FPS
-                    # Removed sleep statement completely
+                    # Give UI time to breathe every loop
+                    time.sleep(0.001)
                     
                 except Exception as e:
                     print(f"Error capturing frame: {str(e)}")
@@ -1069,7 +1067,7 @@ class DirectCameraThread(QThread):
             # Determine actual video target path (temp file if muxing later)
             base, ext = os.path.splitext(self.output_file)
             self.video_output_path = self.output_file
-            if self.direct_streaming and self.audio_enabled:
+            if self.audio_enabled:
                 self.video_output_path = f"{base}_video{ext}"
                 print(f"Video will be written to temporary path for later mux: {self.video_output_path}")
             
@@ -1080,51 +1078,41 @@ class DirectCameraThread(QThread):
                     self.audio_enabled = False
                     print("Audio capture could not be started; continuing with video-only recording.")
             
-            # --- Select Recording Method --- 
+            # --- Start Direct FFmpeg Streaming --- 
             recording_started_successfully = False
-            if self.direct_streaming:
-                print("Attempting to start direct FFmpeg streaming...")
-                try:
-                    self._start_direct_ffmpeg_streaming() # This raises exception on failure
-                    # Check if the process actually started
-                    if hasattr(self, 'ffmpeg_process') and self.ffmpeg_process and self.ffmpeg_process.pid:
-                         print("Direct FFmpeg streaming process started successfully.")
-                         recording_started_successfully = True
-                    else:
-                         print("Direct FFmpeg streaming process did NOT start successfully.")
-                except Exception as ffmpeg_start_error:
-                    print(f"_start_direct_ffmpeg_streaming failed: {ffmpeg_start_error}")
-                    # Fallback is not desired, so we fail here
-                    recording_started_successfully = False 
-            else:
-                print("Using buffered frame recording method.")
-                # Clear frames buffer for traditional method
-                self.frames_buffer = []
-                recording_started_successfully = True # Buffer method setup is simple
+            print("Attempting to start direct FFmpeg streaming...")
+            try:
+                self._start_direct_ffmpeg_streaming()
+                if hasattr(self, 'ffmpeg_process') and self.ffmpeg_process and self.ffmpeg_process.pid:
+                    print("Direct FFmpeg streaming process started successfully.")
+                    recording_started_successfully = True
+                else:
+                    print("Direct FFmpeg streaming process did NOT start successfully.")
+            except Exception as ffmpeg_start_error:
+                print(f"_start_direct_ffmpeg_streaming failed: {ffmpeg_start_error}")
+                recording_started_successfully = False 
             
             # --- Finalize Recording Start --- 
             if recording_started_successfully:
                 self.recording = True
                 self.recording_start_time = time.time()
                 self.recording_next_frame_time = self.recording_start_time
-                self.framerate_warning_shown = False  # Reset warning flag for new recording
+                self.framerate_warning_shown = False
                 print(f"Recording successfully started at {self.recording_start_time}")
                 self.recording_status_signal.emit(self.index, True)
                 return True
             else:
                 print("Recording failed to start.")
                 self.recording = False
-                self.ffmpeg_process = None # Ensure process is None if start failed
-                self.frames_buffer = [] # Ensure buffer is empty
+                self.ffmpeg_process = None
                 self.recording_status_signal.emit(self.index, False)
                 return False
-            
+                
         except Exception as e:
             print(f"Critical error during start_recording setup: {str(e)}")
             traceback.print_exc()
             self.recording = False
             self.ffmpeg_process = None
-            self.frames_buffer = []
             self.recording_status_signal.emit(self.index, False)
             return False
     
@@ -1278,17 +1266,14 @@ class DirectCameraThread(QThread):
         """Stop recording and save the video file"""
         if not self.recording:
             print("Stop recording called, but not currently recording.")
-            # Ensure signal reflects state if somehow out of sync
             self.recording_status_signal.emit(self.index, False)
             return
         
-        print(f"Stopping recording. Direct streaming mode: {self.direct_streaming}")
+        print("Stopping recording.")
         
         # Stop the recording flag first
         self.recording = False
         
-        # Reset buffer warning flag for next recording
-        self.buffer_warning_emitted = False
         # Reset framerate warning flag for next recording
         self.framerate_warning_shown = False
         
@@ -1297,348 +1282,79 @@ class DirectCameraThread(QThread):
         if self.audio_enabled:
             audio_path = self._stop_audio_capture()
         
-        # --- Handle Direct Streaming Case ---            
-        if self.direct_streaming:
-            print("Processing stop for direct streaming mode.")
-            if hasattr(self, 'ffmpeg_process') and self.ffmpeg_process:
-                # Run FFmpeg finalization in a separate thread to avoid blocking
-                ffmpeg_proc = self.ffmpeg_process
-                video_path = self.video_output_path
-                output_file = self.output_file
-                audio_enabled = self.audio_enabled
-                
-                def finalize_ffmpeg():
-                    try:
-                        # Close stdin pipe to signal end of input to FFmpeg
-                        print("Closing FFmpeg stdin...")
-                        if ffmpeg_proc.stdin:
-                            ffmpeg_proc.stdin.close()
-                        
-                        # Wait for FFmpeg to finish (with timeout)
-                        print("Waiting for FFmpeg process to finish...")
-                        try:
-                            stdout, stderr = ffmpeg_proc.communicate(timeout=15)
-                            
-                            if ffmpeg_proc.returncode == 0:
-                                print(f"FFmpeg encoding completed successfully.")
-                                print(f"Recording saved to {video_path}")
-                            else:
-                                error_output = stderr.decode(errors='ignore') if stderr else 'None'
-                                print(f"FFmpeg error (returncode {ffmpeg_proc.returncode}):")
-                                print(f"FFmpeg stderr: {error_output}")
-                        except Exception as comm_error:
-                            print(f"FFmpeg communication timeout/error: {comm_error}")
-                            try:
-                                ffmpeg_proc.terminate()
-                                ffmpeg_proc.wait(timeout=5)
-                            except Exception:
-                                pass
-                        
-                        # Close the error log file if it was opened
-                        if hasattr(self, 'ffmpeg_err_file'):
-                            try:
-                                self.ffmpeg_err_file.close()
-                                delattr(self, 'ffmpeg_err_file')
-                            except: pass
-
-                        # Mux audio if recorded and paths are available
-                        if audio_path and audio_enabled:
-                            self._mux_audio_with_video(video_path, audio_path, output_file)
-                            
-                    except Exception as e:
-                        print(f"Error in FFmpeg finalization thread: {str(e)}")
-                        traceback.print_exc()
-                
-                # Start finalization in background thread
-                finalize_thread = Thread(target=finalize_ffmpeg, daemon=True)
-                finalize_thread.start()
-                
-                # Clean up process reference (thread will handle the actual process)
-                self.ffmpeg_process = None
-            else:
-                print("Direct streaming was enabled, but no ffmpeg_process found.")
+        # --- Handle Direct Streaming Finalization ---            
+        print("Processing stop for direct streaming mode.")
+        if hasattr(self, 'ffmpeg_process') and self.ffmpeg_process:
+            # Run FFmpeg finalization in a separate thread to avoid blocking
+            ffmpeg_proc = self.ffmpeg_process
+            video_path = self.video_output_path
+            output_file = self.output_file
+            audio_enabled = self.audio_enabled
             
-            # Always clear buffer in direct streaming mode after stopping
-            print("Clearing frame buffer in direct streaming mode.")
-            self.frames_buffer = []
-
-        # --- Handle Buffered Recording Case ---            
-        else:  # if not self.direct_streaming
-            print("Processing stop for buffered recording mode.")
-            if len(self.frames_buffer) > 0:
-                print(f"Found {len(self.frames_buffer)} frames in buffer. Processing...")
-                # Process in background thread to avoid blocking
-                buffer_copy = self.frames_buffer.copy()
-                self.frames_buffer = []  # Clear buffer immediately
-                
-                def process_buffer():
+            def finalize_ffmpeg():
+                try:
+                    # Close stdin pipe to signal end of input to FFmpeg
+                    print("Closing FFmpeg stdin...")
+                    if ffmpeg_proc.stdin:
+                        ffmpeg_proc.stdin.close()
+                    
+                    # Wait for FFmpeg to finish (with timeout)
+                    print("Waiting for FFmpeg process to finish...")
                     try:
-                        self._process_and_save_recording_from_buffer(buffer_copy, audio_path=audio_path)
-                    except Exception as e:
-                        print(f"Error processing buffered recording: {e}")
-                        traceback.print_exc()
-                
-                process_thread = Thread(target=process_buffer, daemon=True)
-                process_thread.start()
-            else:
-                print("Buffered recording mode, but frame buffer is empty.")
-                self.frames_buffer = []
-                print("Frame buffer cleared in buffered mode.")
+                        stdout, stderr = ffmpeg_proc.communicate(timeout=15)
+                        
+                        if ffmpeg_proc.returncode == 0:
+                            print(f"FFmpeg encoding completed successfully.")
+                            print(f"Recording saved to {video_path}")
+                        else:
+                            error_output = stderr.decode(errors='ignore') if stderr else 'None'
+                            print(f"FFmpeg error (returncode {ffmpeg_proc.returncode}):")
+                            print(f"FFmpeg stderr: {error_output}")
+                    except Exception as comm_error:
+                        print(f"FFmpeg communication timeout/error: {comm_error}")
+                        try:
+                            ffmpeg_proc.terminate()
+                            ffmpeg_proc.wait(timeout=5)
+                        except Exception:
+                            pass
+                    
+                    # Close the error log file if it was opened
+                    if hasattr(self, 'ffmpeg_err_file'):
+                        try:
+                            self.ffmpeg_err_file.close()
+                            delattr(self, 'ffmpeg_err_file')
+                        except: pass
+
+                    # Mux audio if recorded and paths are available
+                    if audio_path and audio_enabled:
+                        self._mux_audio_with_video(video_path, audio_path, output_file)
+                        
+                except Exception as e:
+                    print(f"Error in FFmpeg finalization thread: {str(e)}")
+                    traceback.print_exc()
+            
+            # Start finalization in background thread
+            finalize_thread = Thread(target=finalize_ffmpeg, daemon=True)
+            finalize_thread.start()
+            
+            # Clean up process reference
+            self.ffmpeg_process = None
+        else:
+            print("No ffmpeg_process found during stop.")
 
         # Emit signal that recording has stopped
-        print("Emitting recording stopped signal (False).")
         self.recording_status_signal.emit(self.index, False)
-        
-        # Reset audio flag after stopping
         self.audio_enabled = False
     
-    def _process_and_save_recording(self, audio_path=None):
-        """Process and save recorded frames to video file using FFmpeg"""
-        if not self.frames_buffer:
-            return
-        # Use the instance's frames_buffer
-        self._process_and_save_recording_from_buffer(self.frames_buffer, audio_path)
-    
-    def _process_and_save_recording_from_buffer(self, frames_buffer, audio_path=None):
-        """Process and save recorded frames from provided buffer to video file using FFmpeg"""
-        if not frames_buffer:
-            return
-            
-        try:
-            # Get first frame for dimensions
-            first_frame, _ = frames_buffer[0]
-            height, width = first_frame.shape[:2]
-            
-            # Sort frames by timestamp
-            frames_buffer.sort(key=lambda x: x[1])
-            
-            # Create a temporary directory for frame storage
-            import tempfile
-            temp_dir = tempfile.mkdtemp()
-            print(f"Created temporary directory: {temp_dir}")
-            
-            try:
-                # Get quality setting (0-100, where 100 is highest quality)
-                # Default to 70 if not set
-                quality = getattr(self, 'video_quality', 70)
-                print(f"Encoding video with quality setting: {quality}")
-                
-                # Set encoding parameters for JPEG quality if needed
-                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
-                
-                # Save each frame as an image in the temp directory
-                frame_files = []
-                file_extension = ".png" # Default to PNG for 100% quality
-                if quality < 100:
-                    file_extension = ".jpg"
-                    print(f"Using JPEG ({quality}%) for temporary frames.")
-                else:
-                    print("Using PNG for temporary frames (100% quality).")
+    def set_preview_fps(self, fps):
+        """Set the maximum FPS for the UI preview"""
+        self.preview_fps = max(1, min(60, int(fps)))
+        print(f"Camera {self.index+1} preview FPS set to {self.preview_fps}")
 
-                # Use timestamps to ensure constant framerate even if camera dropped frames
-                start_time = frames_buffer[0][1]
-                end_time = frames_buffer[-1][1]
-                duration = end_time - start_time
-                
-                # Calculate expected number of frames to maintain real-time duration at target FPS
-                expected_frame_count = int(round(duration * self.fps))
-                
-                # Safety: if duration is zero or negative (invalid timestamps), 
-                # or if it would result in 0 frames, fallback to the captured frame count.
-                if expected_frame_count <= 0:
-                    expected_frame_count = len(frames_buffer)
-                
-                print(f"Processing {len(frames_buffer)} frames for {duration:.2f}s recording. Target FPS: {self.fps}")
-                print(f"Will generate {expected_frame_count} frames to maintain constant framerate and sync.")
-                
-                frame_files = []
-                current_buffer_idx = 0
-                
-                for i in range(expected_frame_count):
-                    # Target time for this frame relative to start
-                    target_time = start_time + (i / self.fps)
-                    
-                    # Find the best frame in buffer for this time slot
-                    while (current_buffer_idx + 1 < len(frames_buffer) and 
-                           frames_buffer[current_buffer_idx + 1][1] <= target_time):
-                        current_buffer_idx += 1
-                    
-                    frame, _ = frames_buffer[current_buffer_idx]
-                    frame_path = os.path.join(temp_dir, f"frame_{i:06d}{file_extension}")
-                    
-                    # Apply quality compression if quality is less than 100
-                    if quality < 100:
-                        # Encode the frame to JPEG format with the specified quality and save directly
-                        result = cv2.imwrite(frame_path, frame, encode_param)
-                        if not result:
-                            print(f"Failed to save frame {i} as JPEG")
-                            continue
-                    else:
-                        # Save as PNG if quality is 100
-                        result = cv2.imwrite(frame_path, frame)
-                        if not result:
-                            print(f"Failed to save frame {i} as PNG")
-                            continue
-
-                    frame_files.append(frame_path)
-                
-                # Ensure output directory exists
-                os.makedirs(os.path.dirname(self.output_file), exist_ok=True)
-                
-                # Use ffmpeg to convert the frames to video (and optionally mux audio)
-                try:
-                    # CRF value mapping from quality 0-100 (higher quality = lower CRF)
-                    # Quality 100 -> CRF 17 (near lossless)
-                    # Quality 0 -> CRF 35 (lower quality)
-                    crf_value = int(35 - (quality / 100.0 * 18))
-                    
-                    # Verify FFmpeg path exists and is accessible
-                    global FFMPEG_BINARY
-                    print(f"Using FFmpeg binary: {FFMPEG_BINARY}")
-                    if not os.path.exists(FFMPEG_BINARY) and not os.path.isabs(FFMPEG_BINARY):
-                        # Try to find FFmpeg in PATH
-                        import shutil
-                        ffmpeg_in_path = shutil.which(FFMPEG_BINARY)
-                        if ffmpeg_in_path:
-                            print(f"Found FFmpeg in PATH: {ffmpeg_in_path}")
-                            # Update to use the full path
-                            FFMPEG_BINARY = ffmpeg_in_path
-                        else:
-                            print(f"WARNING: FFmpeg not found at {FFMPEG_BINARY} or in PATH")
-                    elif os.path.exists(FFMPEG_BINARY):
-                        print(f"FFmpeg binary exists at: {FFMPEG_BINARY}")
-                    else:
-                        print(f"WARNING: FFmpeg not found at {FFMPEG_BINARY}")
-                    
-                    print(f"Starting FFmpeg encoding to {self.output_file} with CRF {crf_value}")
-                    
-                    # Use numbered sequence format instead of glob pattern
-                    # Ensure the input pattern matches the saved file extension
-                    input_pattern = os.path.join(temp_dir, f'frame_%06d{file_extension}')
-                    
-                    # For diagnostic purposes, show the command that would be executed
-                    import subprocess
-                    ffmpeg_cmd = [
-                        FFMPEG_BINARY,
-                        '-framerate', str(self.fps),
-                        '-i', input_pattern,  # Use numbered sequence format
-                    ]
-                    
-                    has_audio = audio_path is not None and os.path.exists(audio_path)
-                    if has_audio:
-                        ffmpeg_cmd.extend(['-i', audio_path])
-                    
-                    ffmpeg_cmd.extend([
-                        '-c:v', 'libx264',
-                        '-preset', 'medium',
-                        '-crf', str(crf_value),
-                    ])
-                    
-                    if has_audio:
-                        ext = os.path.splitext(self.output_file)[1].lower()
-                        audio_codec = 'aac' if ext == '.mp4' else 'pcm_s16le'
-                        ffmpeg_cmd.extend(['-c:a', audio_codec, '-shortest'])
-                    
-                    ffmpeg_cmd.extend([
-                        '-pix_fmt', 'yuv420p',
-                        '-movflags', '+faststart',
-                        '-y',  # Overwrite output file
-                        self.output_file
-                    ])
-                    print(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
-                    
-                    # Try direct subprocess call first - more reliable than ffmpeg-python
-                    try:
-                        result = subprocess.run(
-                            ffmpeg_cmd,
-                            capture_output=True,
-                            text=True,
-                            check=True
-                        )
-                        print(f"FFmpeg subprocess encoding completed successfully")
-                        if result.stdout:
-                            print(f"FFmpeg stdout: {result.stdout}")
-                        if result.stderr:
-                            print(f"FFmpeg stderr: {result.stderr}")
-                    except subprocess.CalledProcessError as e:
-                        print(f"Subprocess FFmpeg error: {str(e)}")
-                        if e.stdout:
-                            print(f"FFmpeg stdout: {e.stdout}")
-                        if e.stderr:
-                            print(f"FFmpeg stderr: {e.stderr}")
-                        
-                        # Try with ffmpeg-python as fallback
-                        print("Trying ffmpeg-python as fallback...")
-                        try:
-                            # FFmpeg input from images - use numbered sequence format
-                            input_args = {
-                                'framerate': str(self.fps),
-                            }
-                            
-                            # FFmpeg output settings
-                            output_args = {
-                                'c:v': 'libx264',     # Use H.264 codec
-                                'preset': 'medium',    # Encoding speed/quality balance
-                                'crf': str(crf_value),  # Constant Rate Factor (quality - lower is better)
-                                'pix_fmt': 'yuv420p',  # Pixel format for maximum compatibility
-                                'movflags': '+faststart'  # Enables progressive download
-                            }
-                            if has_audio:
-                                audio_codec = 'aac' if os.path.splitext(self.output_file)[1].lower() == '.mp4' else 'pcm_s16le'
-                                output_args.update({'c:a': audio_codec, 'shortest': None})
-                            
-                            video_input = ffmpeg.input(input_pattern, **input_args)
-                            if has_audio:
-                                audio_input = ffmpeg.input(audio_path)
-                                stream = ffmpeg.output(video_input, audio_input, self.output_file, **output_args)
-                            else:
-                                stream = ffmpeg.output(video_input, self.output_file, **output_args)
-                            
-                            stream.overwrite_output().run(capture_stdout=True, capture_stderr=True, cmd=FFMPEG_BINARY)
-                            print(f"FFmpeg-python encoding completed successfully")
-                        except Exception as ffmpeg_py_error:
-                            print(f"FFmpeg-python error: {str(ffmpeg_py_error)}")
-                            raise e  # Re-raise the original error if ffmpeg-python also fails
-                    
-                    print(f"Recording saved to {self.output_file}")
-                    
-                except Exception as e:
-                    print(f"FFmpeg error: {str(e)}")
-                    traceback.print_exc()
-                    raise
-                
-            finally:
-                # Clean up the temporary files
-                import shutil
-                try:
-                    shutil.rmtree(temp_dir)
-                    print(f"Cleaned up temporary directory: {temp_dir}")
-                except Exception as cleanup_error:
-                    print(f"Error cleaning up temporary directory: {str(cleanup_error)}")
-                
-                if audio_path and os.path.exists(audio_path):
-                    try:
-                        os.remove(audio_path)
-                    except Exception:
-                        pass
-        
-        except Exception as e:
-            print(f"Error processing recording: {str(e)}")
-            traceback.print_exc()
-            
-            # Create a user-visible error message
-            from PyQt6.QtWidgets import QMessageBox
-            try:
-                QMessageBox.critical(
-                    None,
-                    "Video Encoding Error",
-                    f"Failed to encode video recording.\n\n"
-                    f"Error: {str(e)}\n\n"
-                    f"Please check that FFmpeg is installed at:\n{FFMPEG_BINARY}\n\n"
-                    f"You can specify the correct path in Settings → Camera Settings → FFmpeg binary"
-                )
-            except Exception as ui_error:
-                print(f"Could not display error message: {str(ui_error)}")
+    def set_visible(self, visible):
+        """Enable or disable processing for UI preview"""
+        self.is_visible = bool(visible)
+        # print(f"Camera {self.index+1} visibility: {self.is_visible}")
     
     def set_video_quality(self, quality):
         """Set the video quality (0-100)

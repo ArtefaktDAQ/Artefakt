@@ -169,10 +169,9 @@ class CameraController(QObject):
         self.selected_overlay = None # Currently selected overlay for the active camera index
         self.is_dragging = False     # Flag for overlay dragging state
 
-        # Timer for updating sensor overlay data (pushing data to thread)
-        self.sensor_push_timer = QTimer()
-        self.sensor_push_timer.timeout.connect(self.push_sensor_data_to_thread)
-        self.sensor_push_timer.start(200)  # Update 5 times per second (200ms)
+        # Visibility tracking
+        self.preview_fps = int(self.settings.get_value("camera_preview_fps", "15"))
+        self._current_tab = "None"
         
         # Timer for clearing automation events after they've been processed
         self.event_clear_timer = QTimer()
@@ -458,6 +457,10 @@ class CameraController(QObject):
             self.refresh_camera_list()
             self.refresh_audio_devices()
             self.load_overlays_from_run() # Load saved overlays
+            
+            # Set initial visibility (usually Projects tab)
+            self.update_visibility("Projects")
+            
             QTimer.singleShot(500, self.refresh_camera_list)
             print("CameraController: init_camera routine complete.")
             return True
@@ -626,6 +629,9 @@ class CameraController(QObject):
                 manual_exposure=self.camera_configs[index].get("manual_exposure", False),
                 exposure_value=self.camera_configs[index].get("exposure_value", 0)
             )
+            
+            # Ensure the new thread inherits current visibility/preview settings
+            self.update_visibility()
         except Exception as e:
             self.handle_connection_status(index, False, str(e))
 
@@ -651,6 +657,54 @@ class CameraController(QObject):
         else:
             self.logger.log("No cameras were connected.")
 
+    def set_preview_fps(self, fps):
+        """Update preview FPS for all camera threads"""
+        self.preview_fps = int(fps)
+        self.settings.set_value("camera_preview_fps", str(self.preview_fps))
+        for thread in self.camera_threads:
+            if thread:
+                thread.set_preview_fps(self.preview_fps)
+
+    def update_visibility(self, tab_name=None):
+        """Update which cameras should process frames for the UI based on current tab"""
+        if tab_name:
+            self._current_tab = tab_name
+        
+        # print(f"Updating visibility for tab: {self._current_tab}")
+        
+        for i in range(4):
+            if not self.camera_threads[i]:
+                continue
+            
+            is_visible = False
+            p_mode = "none"
+            
+            # Camera Tab: 
+            if self._current_tab == "Camera":
+                is_visible = True
+                if i == self.main_view_index:
+                    p_mode = "active" # Main large preview
+                else:
+                    p_mode = "thumbnail" # Thumbnail
+            
+            # Dashboard Tab: 
+            elif self._current_tab == "Dashboard":
+                if i in self.dashboard_slots and self.show_on_dashboard:
+                    is_visible = True
+                    p_mode = "dashboard" # Dashboard cams
+            
+            # Other tabs: nothing is visible
+            else:
+                is_visible = False
+                p_mode = "none"
+                
+            self.camera_threads[i].set_visible(is_visible)
+            if hasattr(self.camera_threads[i], 'preview_mode'):
+                self.camera_threads[i].preview_mode = p_mode
+            
+            if is_visible:
+                self.camera_threads[i].set_preview_fps(self.preview_fps)
+
     @pyqtSlot(int, bool, str)
     def handle_connection_status(self, index, connected, message):
         """Handle connection status updates from a camera thread"""
@@ -673,6 +727,8 @@ class CameraController(QObject):
                     
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     quality = int(self.settings.get_value("video_quality", "70"))
+                    use_direct = self.settings.get_bool("use_direct_streaming", True)
+                    use_hw = self.settings.get_bool("use_hw_accel", True)
                     fname = f"recording_cam{index+1}_{timestamp}.mp4"
                     
                     if self.camera_threads[index]:
@@ -680,6 +736,8 @@ class CameraController(QObject):
                         self.camera_threads[index].set_overlays(self.overlays[index])
                         success = self.camera_threads[index].start_recording(
                             output_dir=output_dir, filename=fname, codec="H264",
+                            use_direct_streaming=use_direct,
+                            use_hw_accel=use_hw,
                             record_audio=self.camera_configs[index].get("record_audio", False),
                             audio_device_index=self.camera_configs[index].get("audio_device", -1)
                         )
@@ -743,24 +801,22 @@ class CameraController(QObject):
         """Update the camera display with the captured frame"""
         if index >= 4: return
         
+        # Performance: Skip everything if no relevant tab is active
+        if self._current_tab not in ["Camera", "Dashboard"]:
+            return
+
         # Convert QImage to QPixmap in the GUI thread
+        # This is expensive, but we are now sending fewer/smaller images from the threads
         pixmap = QPixmap.fromImage(image)
         
-        # We always keep the last frame reference
+        # We always keep the last frame reference for snapshots
         self.current_frames[index] = pixmap
         self._frame_skips[index] += 1
         
-        # CPU Optimization: Only process UI updates if the relevant tab is active
-        # Index 2: Camera Tab, Index 5: Dashboard Tab
-        current_tab_widget = None
-        if hasattr(self.main_window, 'stacked_widget'):
-            current_tab_widget = self.main_window.stacked_widget.currentWidget()
-
         # 1. Main View (Large Preview) - ONLY if on Camera Tab
-        is_camera_tab = (hasattr(self.main_window, 'camera_tab') and current_tab_widget == self.main_window.camera_tab)
-        if is_camera_tab and index == self.main_view_index and self.camera_label:
-            now = time.time()
-            if now - self._last_main_view_update >= self._main_view_fps_limit:
+        if self._current_tab == "Camera":
+            if index == self.main_view_index and self.camera_label:
+                # Active large view
                 scaled = pixmap.scaled(self.camera_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
                 if self.is_recording[index]:
                     p = QPainter(scaled)
@@ -768,28 +824,27 @@ class CameraController(QObject):
                     p.drawEllipse(15, 15, 15, 15)
                     p.end()
                 self.camera_label.setPixmap(scaled)
-                self._last_main_view_update = now
-
-        # 2. Dashboard View - ONLY if on Dashboard Tab
-        is_dashboard_tab = (hasattr(self.main_window, 'dashboard_tab') and current_tab_widget == self.main_window.dashboard_tab)
-        if self.show_on_dashboard and is_dashboard_tab:
-            for i, slot in enumerate(self.dashboard_slots):
-                if slot == index:
-                    # Find the correct label
-                    lbl = None
-                    if hasattr(self.main_window, 'dashboard_camera_labels') and i < len(self.main_window.dashboard_camera_labels):
-                        lbl = self.main_window.dashboard_camera_labels[i]
-                    else:
-                        lbl = getattr(self.main_window, f'dashboard_camera_label_{i+1}', None)
-                    
-                    if lbl:
-                        lbl.setPixmap(pixmap)
-
-        # 3. Thumbnails - update only every 20th frame and ONLY if on Camera Tab
-        if is_camera_tab and self._frame_skips[index] % 20 == 0:
-            if hasattr(self.main_window, 'camera_preview_labels') and index < len(self.main_window.camera_preview_labels):
+            
+            # Thumbnails: Thread already throttles these to 5 FPS
+            elif hasattr(self.main_window, 'camera_preview_labels') and index < len(self.main_window.camera_preview_labels):
                 lbl = self.main_window.camera_preview_labels[index]
                 lbl.setPixmap(pixmap.scaled(lbl.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation))
+
+        # 2. Dashboard View - ONLY if on Dashboard Tab
+        elif self._current_tab == "Dashboard" and self.show_on_dashboard:
+            # Check if this index is actually one of the dashboard slots
+            if index in self.dashboard_slots:
+                # Find which slot it occupies
+                for i, slot in enumerate(self.dashboard_slots):
+                    if slot == index:
+                        lbl = None
+                        if hasattr(self.main_window, 'dashboard_camera_labels') and i < len(self.main_window.dashboard_camera_labels):
+                            lbl = self.main_window.dashboard_camera_labels[i]
+                        else:
+                            lbl = getattr(self.main_window, f'dashboard_camera_label_{i+1}', None)
+                        
+                        if lbl:
+                            lbl.setPixmap(pixmap)
 
     @pyqtSlot(int, bool)
     def handle_recording_status(self, index, is_recording):
@@ -1289,18 +1344,42 @@ class CameraController(QObject):
                 if hasattr(self.main_window, 'camera_tab_exposure_value'):
                     self.main_window.camera_tab_exposure_value.setText(str(exposure_value))
 
+            # Debounce hardware settings application to keep UI responsive
+            if not hasattr(self, '_cam_apply_timer'):
+                from PyQt6.QtCore import QTimer
+                self._cam_apply_timer = QTimer()
+                self._cam_apply_timer.setSingleShot(True)
+                self._cam_apply_timer.timeout.connect(self._do_apply_camera_settings)
+            
+            # Store current targets
+            self._pending_cam_idx = idx
+            self._pending_manual_focus = manual_focus
+            self._pending_focus_value = focus_value
+            self._pending_manual_exposure = manual_exposure
+            self._pending_exposure_value = exposure_value
+            
+            # Start/Restart debounce timer (100ms)
+            self._cam_apply_timer.start(100)
+
+        except Exception as e:
+            self.logger.log(f"Error preparing camera settings: {e}", "ERROR")
+
+    def _do_apply_camera_settings(self):
+        """Actually apply settings to hardware (called via debounce timer)"""
+        try:
+            idx = self._pending_cam_idx
             if self.is_connected[idx]: 
                 thread = self.camera_threads[idx]
                 if thread and thread.isRunning():
                     if hasattr(thread, 'set_camera_properties'):
                         thread.set_camera_properties(
-                            manual_focus=manual_focus,
-                            focus_value=focus_value,
-                            manual_exposure=manual_exposure,
-                            exposure_value=exposure_value
+                            manual_focus=self._pending_manual_focus,
+                            focus_value=self._pending_focus_value,
+                            manual_exposure=self._pending_manual_exposure,
+                            exposure_value=self._pending_exposure_value
                         )
         except Exception as e:
-            self.logger.log(f"Error applying camera settings: {e}", "ERROR")
+            print(f"Error in _do_apply_camera_settings: {e}")
 
     def _get_rel_image_pos(self, event_pos):
         """Calculate relative position (0.0-1.0) within the actual image area of the label"""
@@ -1449,6 +1528,10 @@ class CameraController(QObject):
             self.camera_connect_btn.setStyleSheet(ButtonStyles.danger("small") if connected else ButtonStyles.success("small"))
             if self.camera_select:
                 self.camera_select.setEnabled(not connected)
+            
+            # If connected, clear any "No camera connected" text from the labels
+            if connected:
+                self.update_camera_display()
 
         # Update recording checkboxes
         if hasattr(self.main_window, 'record_video_checkbox'):

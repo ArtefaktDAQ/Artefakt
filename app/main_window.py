@@ -426,7 +426,7 @@ class DAQApp(QMainWindow):
         # UI update timer
         self.ui_timer = QTimer()
         self.ui_timer.timeout.connect(self.update_ui)
-        self.ui_timer.start(100) # Update status less frequently maybe? 10 FPS
+        self.ui_timer.start(200) # Update status at 5 FPS - plenty for LEDs/Status
         
         # Blink timer for recording indicator
         self.blink_timer = QTimer()
@@ -588,6 +588,16 @@ class DAQApp(QMainWindow):
         # Get reference to the current widget
         current_widget = self.stacked_widget.widget(index)
         
+        # Determine the tab name for the camera controller optimization
+        tab_name = "None"
+        for btn in self.nav_buttons:
+            if btn.isChecked():
+                tab_name = btn.text()
+                break
+        
+        if hasattr(self, 'camera_controller'):
+            self.camera_controller.update_visibility(tab_name)
+        
         # Update specific tab content based on widget references instead of names/indices
         if hasattr(self, 'dashboard_tab') and current_widget == self.dashboard_tab:
             if hasattr(self, 'graph_controller'):
@@ -701,6 +711,15 @@ class DAQApp(QMainWindow):
         downsampling_check.setChecked(is_enabled)
         form.addRow("Performance:", downsampling_check)
         
+        # Camera Preview FPS
+        preview_fps_spin = QSpinBox()
+        preview_fps_spin.setRange(1, 60)
+        preview_fps_spin.setSuffix(" FPS")
+        current_fps = int(self.settings_model.get_value("camera_preview_fps", "15"))
+        preview_fps_spin.setValue(current_fps)
+        preview_fps_spin.setStyleSheet(InputStyles.default())
+        form.addRow("Camera Preview Rate:", preview_fps_spin)
+        
         layout.addLayout(form)
         
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -715,6 +734,13 @@ class DAQApp(QMainWindow):
             
             # Save downsampling setting
             self.settings_model.set_value("graph_downsampling", downsampling_check.isChecked())
+            
+            # Save camera preview FPS
+            new_preview_fps = preview_fps_spin.value()
+            if hasattr(self, 'camera_controller'):
+                self.camera_controller.set_preview_fps(new_preview_fps)
+            else:
+                self.settings_model.set_value("camera_preview_fps", str(new_preview_fps))
             
             # Update Graphs tab checkbox if it exists
             if hasattr(self, 'graph_downsampling_checkbox'):
@@ -786,6 +812,18 @@ class DAQApp(QMainWindow):
         if not data:
             return
             
+        # Throttling visual updates for performance
+        now = time.time()
+        if not hasattr(self, '_last_metrics_update_time'):
+            self._last_metrics_update_time = 0
+        
+        # Only update visuals at ~10 Hz (100ms) to avoid choking the UI thread
+        # Replay events override this throttle if forced
+        if now - self._last_metrics_update_time < 0.1 and not data.get("_force_update", False):
+            return
+        
+        self._last_metrics_update_time = now
+
         # Determine source of data
         source = data.get('_source')
         
@@ -1063,20 +1101,33 @@ class DAQApp(QMainWindow):
 
     def update_status_indicators(self):
         """Update the status indicators for each component"""
+        # Store last known statuses to avoid redundant setStyleSheet calls
+        if not hasattr(self, '_last_indicator_states'):
+            self._last_indicator_states = {}
+
         # Update dashboard LEDs
         if hasattr(self, 'led_daq'):
             daq_ok = (self.sensor_status == StatusState.READY)
-            self.led_daq.setStyleSheet(StatusIndicator.online(12) if daq_ok else StatusIndicator.offline(12))
+            state_key = f"led_daq_{daq_ok}"
+            if self._last_indicator_states.get('led_daq') != state_key:
+                self.led_daq.setStyleSheet(StatusIndicator.online(12) if daq_ok else StatusIndicator.offline(12))
+                self._last_indicator_states['led_daq'] = state_key
         
         if hasattr(self, 'led_recording'):
             is_rec = getattr(self, 'running', False)
-            self.led_recording.setStyleSheet(StatusIndicator.online(12) if is_rec else StatusIndicator.inactive(12))
+            state_key = f"led_rec_{is_rec}"
+            if self._last_indicator_states.get('led_recording') != state_key:
+                self.led_recording.setStyleSheet(StatusIndicator.online(12) if is_rec else StatusIndicator.inactive(12))
+                self._last_indicator_states['led_recording'] = state_key
             
         if hasattr(self, 'led_automation'):
             auto_active = False
             if hasattr(self, 'automation_controller'):
                 auto_active = self.automation_controller.is_running()
-            self.led_automation.setStyleSheet(StatusIndicator.online(12) if auto_active else StatusIndicator.inactive(12))
+            state_key = f"led_auto_{auto_active}"
+            if self._last_indicator_states.get('led_automation') != state_key:
+                self.led_automation.setStyleSheet(StatusIndicator.online(12) if auto_active else StatusIndicator.inactive(12))
+                self._last_indicator_states['led_automation'] = state_key
             
         # Update dashboard header info
         self.update_dashboard_header()
@@ -1240,6 +1291,16 @@ class DAQApp(QMainWindow):
             if index < len(self.nav_buttons): # Check index bounds
                 status, tooltip = statuses[component]
                 color = status_color_map.get(status, "red") # Default to red if status unknown
+
+                # Check if state changed before doing expensive IO and UI updates
+                state_key = f"nav_{component}_{color}"
+                if self._last_indicator_states.get(component) == state_key:
+                    # Update tooltip if it changed (less expensive than icon)
+                    if self.nav_buttons[index].toolTip() != tooltip:
+                        self.nav_buttons[index].setToolTip(tooltip)
+                    continue
+                
+                self._last_indicator_states[component] = state_key
 
                 # Handle yellow state - project is never yellow, others are optional
                 if status == StatusState.OPTIONAL:
@@ -3396,11 +3457,6 @@ class DAQApp(QMainWindow):
         perf_group.setStyleSheet(GroupBoxStyles.default())
         perf_layout = QVBoxLayout(perf_group)
         
-        use_direct_streaming = QCheckBox("Use Direct Streaming (Required for >1 min)")
-        use_direct_streaming.setToolTip("Saves video directly to disk. Disabling this uses RAM (Burst Mode), which will crash the app for recordings longer than a minute.")
-        use_direct_streaming.setChecked(self.settings_model.get_bool("use_direct_streaming", True))
-        perf_layout.addWidget(use_direct_streaming)
-        
         use_hw_accel = QCheckBox("Enable Hardware Acceleration (GPU)")
         use_hw_accel.setToolTip("Uses your Graphics Card (Nvidia, Intel, or AMD) to reduce CPU load during recording.")
         use_hw_accel.setChecked(self.settings_model.get_bool("use_hw_accel", True))
@@ -3432,7 +3488,6 @@ class DAQApp(QMainWindow):
             enable_ndi.isChecked(),
             ndi_source_name.text(),
             ndi_with_overlays.isChecked(),
-            use_direct_streaming.isChecked(),
             use_hw_accel.isChecked(),
             camera_auto_connect.isChecked(),
             dialog
@@ -3485,7 +3540,7 @@ class DAQApp(QMainWindow):
     def apply_camera_settings_from_popup(self, record_with_overlays, 
                                         recording_format, video_quality, media_volume,
                                         enable_ndi, ndi_source_name, ndi_with_overlays,
-                                        use_direct_streaming, use_hw_accel, 
+                                        use_hw_accel, 
                                         camera_auto_connect, dialog):
         """Apply camera settings from the popup dialog"""
         # Update settings
@@ -3498,7 +3553,6 @@ class DAQApp(QMainWindow):
         self.settings.setValue("enable_ndi", "true" if enable_ndi else "false")
         self.settings.setValue("ndi_source_name", ndi_source_name)
         self.settings.setValue("ndi_with_overlays", "true" if ndi_with_overlays else "false")
-        self.settings.setValue("use_direct_streaming", "true" if use_direct_streaming else "false")
         self.settings.setValue("use_hw_accel", "true" if use_hw_accel else "false")
         self.settings.setValue("camera_auto_connect", "true" if camera_auto_connect else "false")
 
@@ -3517,8 +3571,6 @@ class DAQApp(QMainWindow):
             self.ndi_source_name.setText(ndi_source_name)
         if hasattr(self, 'ndi_with_overlays'):
             self.ndi_with_overlays.setChecked(ndi_with_overlays)
-        if hasattr(self, 'use_direct_streaming'):
-            self.use_direct_streaming.setChecked(use_direct_streaming)
         if hasattr(self, 'use_hw_accel'):
             self.use_hw_accel.setChecked(use_hw_accel)
             
@@ -6557,9 +6609,18 @@ class DAQApp(QMainWindow):
                         except Exception:
                             pass
 
-            # Persist settings
-            self.settings.setValue("media_volume", str(int(vol)))
-            self.settings.setValue("media_muted", "true" if muted else "false")
+            # Persist settings - Throttled/Debounced to avoid slider lag
+            if not hasattr(self, '_audio_persist_timer'):
+                from PyQt6.QtCore import QTimer
+                self._audio_persist_timer = QTimer()
+                self._audio_persist_timer.setSingleShot(True)
+                self._audio_persist_timer.timeout.connect(self._persist_audio_settings)
+            
+            # Store values to be persisted
+            self._pending_vol = vol
+            self._pending_muted = muted
+            # Start/Restart timer (200ms debounce)
+            self._audio_persist_timer.start(200)
 
             # Keep all UI sliders/checkboxes in sync
             for widget_name in ["video_volume_slider", "camera_volume_slider", "dashboard_volume_slider"]:
@@ -6587,6 +6648,16 @@ class DAQApp(QMainWindow):
                     self.logger.log(f"Failed to apply media audio state: {e}", "WARN")
             except Exception:
                 pass
+
+    def _persist_audio_settings(self):
+        """Actually save audio settings to disk (debounced)"""
+        try:
+            if hasattr(self, '_pending_vol'):
+                self.settings.setValue("media_volume", str(int(self._pending_vol)))
+            if hasattr(self, '_pending_muted'):
+                self.settings.setValue("media_muted", "true" if self._pending_muted else "false")
+        except Exception as e:
+            print(f"Error persisting audio settings: {e}")
 
     def on_video_volume_changed(self, value: int):
         """Handle volume slider changes."""

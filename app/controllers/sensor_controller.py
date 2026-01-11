@@ -2158,6 +2158,14 @@ class SensorController(QObject):
         if not data:
             return
             
+        # Throttling to 20Hz (50ms) to save CPU
+        now = time.time()
+        if not hasattr(self, '_last_data_update_time'):
+            self._last_data_update_time = 0
+        if now - self._last_data_update_time < 0.05:
+            return
+        self._last_data_update_time = now
+
         timestamp = data.get('timestamp', time.time())
         updates_made = 0
         

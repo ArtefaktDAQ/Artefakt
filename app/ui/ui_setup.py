@@ -135,6 +135,7 @@ class DashMetricCard(QFrame):
         self.window_size = 5 # Default, will be updated from config
         self.min_val = float('inf')
         self.max_val = float('-inf')
+        self._last_trend = None # State tracking for performance
 
     def set_window_size(self, size):
         self.window_size = max(1, size)
@@ -142,14 +143,18 @@ class DashMetricCard(QFrame):
     def update_value(self, value):
         if value is None:
             self.value_label.setText("---")
-            self.trend_label.setText("")
+            if self._last_trend != "None":
+                self.trend_label.setText("")
+                self._last_trend = "None"
             return
             
         try:
             val_float = float(value)
             if np.isnan(val_float):
                 self.value_label.setText("---")
-                self.trend_label.setText("")
+                if self._last_trend != "None":
+                    self.trend_label.setText("")
+                    self._last_trend = "None"
                 return
 
             # Update history for smoothing
@@ -157,39 +162,48 @@ class DashMetricCard(QFrame):
             if len(self.history) > self.window_size * 2:
                 self.history.pop(0)
             
-            # Calculate trend based on windows if we have enough data
+            # Calculate trend
+            new_trend = "stable"
             if len(self.history) >= self.window_size * 2:
                 recent_avg = np.mean(self.history[-self.window_size:])
                 previous_avg = np.mean(self.history[-self.window_size*2:-self.window_size])
                 
                 if recent_avg > previous_avg + 0.0001:
-                    self.trend_label.setText("↑")
-                    self.trend_label.setStyleSheet(f"color: {COLORS.ERROR}; font-weight: bold; font-size: 16px;")
+                    new_trend = "up"
                 elif recent_avg < previous_avg - 0.0001:
-                    self.trend_label.setText("↓")
-                    self.trend_label.setStyleSheet(f"color: {COLORS.SUCCESS}; font-weight: bold; font-size: 16px;")
-                else:
-                    self.trend_label.setText("→")
-                    self.trend_label.setStyleSheet("color: #888; font-size: 16px;")
+                    new_trend = "down"
             elif len(self.history) > 1:
-                # Initial trend if history is still filling
                 if val_float > self.history[-2] + 0.0001:
+                    new_trend = "up"
+                elif val_float < self.history[-2] - 0.0001:
+                    new_trend = "down"
+
+            # Only update style and text if trend changed
+            if new_trend != self._last_trend:
+                if new_trend == "up":
                     self.trend_label.setText("↑")
                     self.trend_label.setStyleSheet(f"color: {COLORS.ERROR}; font-weight: bold; font-size: 16px;")
-                elif val_float < self.history[-2] - 0.0001:
+                elif new_trend == "down":
                     self.trend_label.setText("↓")
                     self.trend_label.setStyleSheet(f"color: {COLORS.SUCCESS}; font-weight: bold; font-size: 16px;")
                 else:
                     self.trend_label.setText("→")
                     self.trend_label.setStyleSheet("color: #888; font-size: 16px;")
+                self._last_trend = new_trend
             
             self.value_label.setText(f"{val_float:.3f}")
             
             # Update min/max
-            if val_float < self.min_val: self.min_val = val_float
-            if val_float > self.max_val: self.max_val = val_float
+            changed_stats = False
+            if val_float < self.min_val: 
+                self.min_val = val_float
+                changed_stats = True
+            if val_float > self.max_val: 
+                self.max_val = val_float
+                changed_stats = True
             
-            self.stats_label.setText(f"Min: {self.min_val:.2f} | Max: {self.max_val:.2f}")
+            if changed_stats:
+                self.stats_label.setText(f"Min: {self.min_val:.2f} | Max: {self.max_val:.2f}")
             
         except (ValueError, TypeError):
             self.value_label.setText(str(value))

@@ -1558,7 +1558,7 @@ REQUIREMENTS:
             "content": """RECORDING:
 • Use the "Start Recording" button to save video.
 • Recordings include all active overlays (sensor data, timestamps).
-• Select between direct streaming (FFmpeg) or buffered recording in settings.
+• All recordings use hardware-accelerated direct streaming for maximum reliability.
 
 OVERLAYS:
 • Right-click on the video feed to add text, sensor values, or motion boxes.
