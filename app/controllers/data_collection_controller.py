@@ -23,6 +23,7 @@ from app.core.interfaces.csv_interface import CSVThread
 from app.core.interfaces.labjack_data_thread import LabJackDataThread
 from app.core.interfaces.mqtt_thread import MQTTDataThread
 from app.core.interfaces.interface_registry import InterfaceRegistry
+from app.core.interfaces.outbound_interface import BaseOutboundInterface
 from app.core.interfaces.plugin_polling_thread import PluginPollingThread
 
 # Import LabJackInterface from the app.core.interfaces package
@@ -136,6 +137,10 @@ class DataCollectionController(QObject):
         self.pending_automation_events = []
         self.pending_events_mutex = QMutex()
         # ---------------------------
+
+        # Outbound plugins
+        self.outbound_plugins = []
+        self._setup_outbound_plugins()
         
         # Setup Arduino interface
         self.arduino_thread = ArduinoMasterSlaveThread()
@@ -1095,6 +1100,14 @@ class DataCollectionController(QObject):
                 os.makedirs(run_dir)
                 
             self.run_directory = run_dir
+            
+            # --- Update Outbound Plugins with new run directory ---
+            for plugin in self.outbound_plugins:
+                try:
+                    plugin.set_run_directory(run_dir)
+                except Exception as e:
+                    print(f"ERROR: Failed to set run directory for outbound plugin {getattr(plugin, 'name', 'Unknown')}: {e}")
+            # ------------------------------------------------------
 
             # Reset start time at the beginning of each run so graphs and
             # automation markers share the same zero point.
@@ -1330,6 +1343,15 @@ class DataCollectionController(QObject):
             # --- Close CSV File --- 
             self._close_csv_file()
             self.log("Data collection stopped.")
+            
+            # Clear run directory for outbound plugins
+            self.run_directory = ""
+            for plugin in self.outbound_plugins:
+                try:
+                    plugin.set_run_directory("")
+                except Exception as e:
+                    print(f"ERROR: Failed to clear run directory for outbound plugin {getattr(plugin, 'name', 'Unknown')}: {e}")
+            # ------------------------------------
 
             # Stop the combined data timer
             if hasattr(self, 'combined_data_timer') and self.combined_data_timer.isActive():
@@ -3477,6 +3499,60 @@ class DataCollectionController(QObject):
         # ----------------------------------
         # ----------------------------------
     
+    def _setup_outbound_plugins(self):
+        """Discover and initialize outbound plugins."""
+        try:
+            from app.core.interfaces.interface_registry import InterfaceRegistry
+            outbound_classes = InterfaceRegistry.get_outbound_interfaces()
+            
+            for name, cls in outbound_classes.items():
+                try:
+                    # Map display name to settings key (e.g. "Outbound Device" -> "outbound_device")
+                    settings_key = name.lower().replace(" ", "_")
+                    
+                    # Read all settings for this plugin
+                    config = {}
+                    if self.main_window and hasattr(self.main_window, 'settings'):
+                        s = self.main_window.settings
+                        # Always check for auto_connect and enabled
+                        auto_connect = s.value(f"{settings_key}_auto_connect", "false") == "true"
+                        enabled = s.value(f"{settings_key}_enabled", "true") == "true"
+                        config['auto_connect'] = auto_connect
+                        config['enabled'] = enabled
+                        
+                        # Load other schema fields from QSettings if they exist
+                        schema = getattr(cls, 'CONFIG_SCHEMA', {})
+                        for field, info in schema.items():
+                            if field in ['auto_connect', 'enabled']: continue
+                            val = s.value(f"{settings_key}_{field}")
+                            if val is not None:
+                                # Convert types based on schema
+                                if info.get('type') == 'number':
+                                    try:
+                                        if isinstance(val, str):
+                                            val = val.replace(',', '.')
+                                        config[field] = float(val)
+                                    except: pass
+                                elif info.get('type') == 'boolean':
+                                    config[field] = str(val).lower() == "true"
+                                else:
+                                    config[field] = val
+                    
+                    # Create instance with loaded config
+                    plugin = cls(name=name, **config)
+                    # Explicitly set enabled state as the constructor might not handle it
+                    plugin.enabled = config.get('enabled', True)
+                    self.outbound_plugins.append(plugin)
+                    
+                    # Auto-connect if enabled
+                    if config.get('auto_connect'):
+                        plugin.connect()
+                        
+                except Exception as e:
+                    print(f"ERROR: Failed to initialize outbound plugin {name}: {e}")
+        except Exception as e:
+            print(f"ERROR: Failed to setup outbound plugins: {e}")
+
     def emit_combined_data(self):
         """Emit the combined data from all interfaces at the specified sampling rate"""
         # print("DEBUG: emit_combined_data called") # <<< COMMENTED OUT
@@ -3702,12 +3778,76 @@ class DataCollectionController(QObject):
                         except (ValueError, TypeError):
                             pass
             
+            # --- Integrate Automation Events into the Data Stream ---
+            # This makes events available to both CSV logging AND outbound plugins in real-time
+            current_timestamp = combined_data_copy.get('timestamp', current_emit_time)
+            sampling_interval = 1.0 / self.sampling_rate if self.sampling_rate > 0 else 0.5
+            tolerance = sampling_interval * 1.2
+            
+            self.pending_events_mutex.lock()
+            try:
+                events_to_include = []
+                for event in self.pending_automation_events:
+                    event_time = event.get('timestamp', 0)
+                    time_diff = current_timestamp - event_time
+                    if 0 <= time_diff <= tolerance:
+                        events_to_include.append(event)
+                
+                # Remove written events
+                written_event_timestamps = {e.get('timestamp', 0) for e in events_to_include}
+                self.pending_automation_events = [
+                    e for e in self.pending_automation_events 
+                    if e.get('timestamp', 0) not in written_event_timestamps
+                ]
+                
+                # Format event strings
+                if events_to_include:
+                    trigger_descriptions = []
+                    action_descriptions = []
+                    sequence_names = []
+                    image_paths = []
+                    for event in events_to_include:
+                        if event.get('type') == 'trigger':
+                            trigger_descriptions.append(event.get('trigger_description', ''))
+                            action_descriptions.append(event.get('action_description', ''))
+                            sequence_names.append(event.get('sequence_name', ''))
+                            img_path = event.get('image_path')
+                            if img_path: image_paths.append(img_path)
+                        elif event.get('type') == 'action':
+                            action_descriptions.append(event.get('action_description', ''))
+                            sequence_names.append(event.get('sequence_name', ''))
+                            img_path = event.get('image_path')
+                            if img_path: image_paths.append(img_path)
+                    
+                    combined_data_copy['automation_trigger'] = '; '.join(trigger_descriptions) if trigger_descriptions else ''
+                    combined_data_copy['automation_action'] = '; '.join(action_descriptions) if action_descriptions else ''
+                    combined_data_copy['automation_sequence'] = '; '.join(set(sequence_names)) if sequence_names else ''
+                    combined_data_copy['automation_image'] = '; '.join(image_paths) if image_paths else ''
+                else:
+                    combined_data_copy['automation_trigger'] = ''
+                    combined_data_copy['automation_action'] = ''
+                    combined_data_copy['automation_sequence'] = ''
+                    combined_data_copy['automation_image'] = ''
+            finally:
+                self.pending_events_mutex.unlock()
+            # ------------------------------------------------------
+
             # Emit signal with all latest data (both real and averaged)
             # This is done even if NOT collecting_data to allow for monitoring/UI updates
             self.data_received_signal.emit(combined_data_copy)
             
             # Also emit combined data signal for graphs and metrics
             self.combined_data_signal.emit(combined_data_copy)
+
+            # --- Push data to Outbound Plugins ---
+            for plugin in self.outbound_plugins:
+                if getattr(plugin, 'enabled', False) and getattr(plugin, 'connected', False):
+                    try:
+                        # Call push_data in a non-blocking way if possible, or ensure it's fast
+                        plugin.push_data(combined_data_copy)
+                    except Exception as e:
+                        print(f"ERROR: Outbound plugin {getattr(plugin, 'name', 'Unknown')} failed to push data: {e}")
+            # --------------------------------------
 
             # Do not log to CSV if collection is not active
             if not self.collecting_data:
@@ -3722,85 +3862,17 @@ class DataCollectionController(QObject):
         if self.collecting_data and self.csv_writer and self.csv_file:
             try:
                 # Create a dictionary for the row containing only keys present in the header
+                # Note: row_data now automatically gets automation_* fields if they are in self.csv_header
                 row_data = {key: combined_data_copy.get(key, '') for key in self.csv_header}
                 
-                # Ensure the timestamp format is suitable for CSV (e.g., ISO 8601 or just the float)
-                # Using the raw float timestamp generated earlier
-                row_data['timestamp'] = combined_data_copy.get('timestamp', time.time())
-                
-                # Check for automation events that occurred near this timestamp
-                # Use a tolerance based on the sampling interval to ensure events are matched correctly
-                current_timestamp = row_data['timestamp']
-                
-                # Calculate tolerance: 1.2x the sampling interval to account for timing variations
-                # This ensures events are matched to the next CSV row after they occur
-                sampling_interval = 1.0 / self.sampling_rate if self.sampling_rate > 0 else 0.5
-                tolerance = sampling_interval * 1.2
-                
-                self.pending_events_mutex.lock()
-                try:
-                    events_to_include = []
-                    for event in self.pending_automation_events:
-                        event_time = event.get('timestamp', 0)
-                        time_diff = current_timestamp - event_time
-                        
-                        # Include events that occurred before or at this CSV row timestamp (within tolerance)
-                        # This ensures events are written to the next row after they occur, not previous rows
-                        # time_diff > 0 means event happened before current row
-                        # time_diff <= tolerance ensures we don't match events from too long ago
-                        if 0 <= time_diff <= tolerance:
-                            events_to_include.append(event)
-                    
-                    # Remove written events from the pending list to prevent duplicates
-                    written_event_timestamps = {e.get('timestamp', 0) for e in events_to_include}
-                    self.pending_automation_events = [
-                        e for e in self.pending_automation_events 
-                        if e.get('timestamp', 0) not in written_event_timestamps
-                    ]
-                    
-                    # Add event information to CSV row
-                    if events_to_include:
-                        print(f"DEBUG DATA COLLECTION: Including {len(events_to_include)} automation event(s) in CSV row at timestamp {current_timestamp}")
-                        # Combine multiple events if any occurred
-                        trigger_descriptions = []
-                        action_descriptions = []
-                        sequence_names = []
-                        image_paths = []
-                        for event in events_to_include:
-                            print(f"DEBUG DATA COLLECTION: Processing event: type={event.get('type')}, trigger={event.get('trigger_description', '')}, action={event.get('action_description', '')}, sequence={event.get('sequence_name', '')}")
-                            if event.get('type') == 'trigger':
-                                trigger_descriptions.append(event.get('trigger_description', ''))
-                                action_descriptions.append(event.get('action_description', ''))
-                                sequence_names.append(event.get('sequence_name', ''))
-                                img_path = event.get('image_path')
-                                if img_path:
-                                    image_paths.append(img_path)
-                            elif event.get('type') == 'action':
-                                action_descriptions.append(event.get('action_description', ''))
-                                sequence_names.append(event.get('sequence_name', ''))
-                                img_path = event.get('image_path')
-                                if img_path:
-                                    image_paths.append(img_path)
-                        
-                        row_data['automation_trigger'] = '; '.join(trigger_descriptions) if trigger_descriptions else ''
-                        row_data['automation_action'] = '; '.join(action_descriptions) if action_descriptions else ''
-                        row_data['automation_sequence'] = '; '.join(set(sequence_names)) if sequence_names else ''
-                        row_data['automation_image'] = '; '.join(image_paths) if image_paths else ''
-                        print(f"DEBUG DATA COLLECTION: CSV row automation data: trigger='{row_data['automation_trigger']}', action='{row_data['automation_action']}', sequence='{row_data['automation_sequence']}'")
-                    else:
-                        row_data['automation_trigger'] = ''
-                        row_data['automation_action'] = ''
-                        row_data['automation_sequence'] = ''
-                        row_data['automation_image'] = ''
-                finally:
-                    self.pending_events_mutex.unlock()
+                # Ensure the timestamp is correct
+                row_data['timestamp'] = combined_data_copy.get('timestamp', current_emit_time)
                 
                 self.csv_writer.writerow(row_data)
                 
                 # Track CSV write for data flow monitoring
                 if hasattr(self.main_window, 'data_flow_controller'):
-                    # Estimate row size (approximate CSV line length)
-                    row_size = len(','.join(str(v) for v in row_data.values())) + 1  # +1 for newline
+                    row_size = len(','.join(str(v) for v in row_data.values())) + 1
                     self.main_window.data_flow_controller.record_csv_write(row_size, row_count=1)
                     
             except Exception as e:

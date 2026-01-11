@@ -1223,6 +1223,20 @@ CAL. (CALIBRATE):
 Click to open calibration wizard"""
         },
         {
+            "title": "Outbound Devices",
+            "icon": "📤",
+            "content": """OUTBOUND INTERFACES:
+Unlike regular sensors that bring data IN, Outbound Devices push data OUT to external systems.
+
+FEATURES:
+• Real-time broadcast of synchronized sensor data
+• Integration with Automation Events (triggers, actions)
+• Run-aware: Automatically syncs data to the current project folder
+• Configurable modes (UDP, JSON Logging, Alarms)
+
+Look for the purple dashed cards in the Interface section. Click to configure and connect."""
+        },
+        {
             "title": "Interface Types",
             "icon": "🔌",
             "content": """ARDUINO:
@@ -1563,6 +1577,45 @@ OVERLAYS:
 }
 
 
+OUTBOUND_HELP = {
+    "title": "Outbound Interface Guide",
+    "sections": [
+        {
+            "title": "What is an Outbound Interface?",
+            "icon": "📡",
+            "content": """An Outbound Interface is a data 'pusher'. It takes the live, synchronized stream of all your sensors and sends it to another program, a file, or a network protocol.
+
+Common uses include:
+• Feeding data to 3D visualizations (Unity/Unreal)
+• Logging to specialized formats (.jsonl, InfluxDB)
+• Triggering external hardware alarms
+• Sending webhooks to IT systems"""
+        },
+        {
+            "title": "Capabilities",
+            "icon": "🚀",
+            "content": """Outbound plugins have access to:
+• SYNC DATA: Every sensor reading aligned to the exact same millisecond.
+• EVENTS: Real-time notification of triggers (e.g., 'Temp High') and actions taken.
+• RUN FOLDERS: The ability to save logs directly into your current experiment folder.
+• AUTO-START: Can be set to activate as soon as the program opens."""
+        },
+        {
+            "title": "Operating Modes",
+            "icon": "⚙️",
+            "content": """UDP BROADCAST:
+Sends packets over the network. Perfect for low-latency dashboards or digital twins.
+
+JSON LOGGER:
+Appends every data tick to a .jsonl file. Great for Python/R data analysis.
+
+SIMPLE ALARM:
+Monitors a specific sensor and alerts you (or an external system) when thresholds are met."""
+        }
+    ]
+}
+
+
 def get_help_content(tool_name: str) -> dict:
     """Get help content for a specific tool"""
     help_map = {
@@ -1576,6 +1629,7 @@ def get_help_content(tool_name: str) -> dict:
         "automation": AUTOMATION_HELP,
         "sensors": SENSORS_HELP,
         "camera": CAMERA_HELP,
+        "outbound": OUTBOUND_HELP,
     }
     return help_map.get(tool_name, {"title": "Help", "sections": []})
 

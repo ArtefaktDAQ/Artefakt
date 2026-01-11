@@ -1081,6 +1081,13 @@ class DAQApp(QMainWindow):
         # Update dashboard header info
         self.update_dashboard_header()
 
+        # Update outbound plugins status
+        if hasattr(self, 'data_collection_controller'):
+            for plugin in self.data_collection_controller.outbound_plugins:
+                name = getattr(plugin, 'name', '')
+                is_connected = plugin.is_connected()
+                self.update_generic_interface_status(name, is_connected)
+
         # Get status for each controller
         try:
             if hasattr(self, 'project_controller'):
@@ -3040,7 +3047,8 @@ class DAQApp(QMainWindow):
 
     def update_generic_interface_status(self, device_type, is_connected):
         """Generic handler to update connection status for any registered interface."""
-        print(f"DEBUG: update_generic_interface_status for '{device_type}' connected={is_connected}")
+        from app.ui.theme import COLORS, CardStyles
+        # print(f"DEBUG: update_generic_interface_status for '{device_type}' connected={is_connected}")
         
         # Track connection status
         self.interface_connections[device_type.lower()] = is_connected
@@ -3060,12 +3068,17 @@ class DAQApp(QMainWindow):
             if label:
                 status_text = "Connected" if is_connected else "Not connected"
                 
-                # Check if it's a plugin card to use light blue instead of grey
+                # Check if it's a plugin card or outbound card
                 container = label.parent()
                 is_plugin = container.property("is_plugin") if container else False
+                is_outbound = container.property("is_outbound") if container else False
                 
                 if is_connected:
                     status_color = COLORS.SUCCESS_TEXT
+                    if is_outbound: status_text = "Active"
+                elif is_outbound:
+                    status_color = "#A855F7" # Purple
+                    status_text = "Ready"
                 elif is_plugin:
                     status_color = COLORS.INFO
                 else:
@@ -3077,7 +3090,9 @@ class DAQApp(QMainWindow):
                 
                 # Update the surrounding device card background
                 if container and hasattr(container, 'setStyleSheet'):
-                    if is_plugin:
+                    if is_outbound:
+                        container.setStyleSheet(CardStyles.outbound_plugin_card(is_connected))
+                    elif is_plugin:
                         container.setStyleSheet(CardStyles.plugin_card(is_connected))
                     else:
                         container.setStyleSheet(CardStyles.device_card(is_connected))

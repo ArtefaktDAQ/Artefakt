@@ -1044,6 +1044,60 @@ class CardStyles:
             """
 
     @staticmethod
+    def outbound_plugin_card(connected: bool = False) -> str:
+        """
+        Custom card style for outbound plugins.
+        Uses a purple/violet theme to distinguish from hardware.
+        """
+        base_top = "rgba(60, 50, 90, 0.9)"
+        base_bottom = "rgba(35, 35, 55, 0.85)"
+        border_color = "#A855F7" # Purple
+        hover_color = "#C084FC"
+        
+        if connected:
+            return f"""
+                QFrame {{
+                    background: qlineargradient(x1:0, y1:0, x2:0.5, y2:1,
+                        stop:0 rgba(168, 85, 247, 0.2),
+                        stop:1 {base_bottom});
+                    border-radius: 8px;
+                    border: 2px solid {border_color};
+                }}
+                QFrame:hover {{
+                    background: qlineargradient(x1:0, y1:0, x2:0.5, y2:1,
+                        stop:0 rgba(168, 85, 247, 0.3),
+                        stop:1 rgba(45, 45, 75, 0.95));
+                    border: 2px solid {hover_color};
+                }}
+                QLabel {{
+                    background: transparent;
+                    border: none;
+                }}
+            """
+        else:
+            return f"""
+                QFrame {{
+                    background: qlineargradient(x1:0, y1:0, x2:0.5, y2:1,
+                        stop:0 {base_top},
+                        stop:1 {base_bottom});
+                    border-radius: 8px;
+                    border: 1px solid {border_color};
+                    border-style: dashed;
+                }}
+                QFrame:hover {{
+                    background: qlineargradient(x1:0, y1:0, x2:0.5, y2:1,
+                        stop:0 rgba(70, 60, 100, 0.95),
+                        stop:1 rgba(45, 45, 75, 0.9));
+                    border: 1px solid {hover_color};
+                    border-style: solid;
+                }}
+                QLabel {{
+                    background: transparent;
+                    border: none;
+                }}
+            """
+
+    @staticmethod
     def info_panel() -> str:
         """Großes Info-Panel für Details"""
         return f"""

@@ -2034,12 +2034,14 @@ def setup_ui(self):
     }
 
     # Helper to create an interface card
-    def create_card(name, icon_resource, popup_func, is_plugin=False):
+    def create_card(name, icon_resource, popup_func, is_plugin=False, is_outbound=False):
         container = QFrame()
         container.setFixedSize(card_width, card_height)
         
-        # Use plugin-specific style if requested
-        if is_plugin:
+        # Use specific style based on interface type
+        if is_outbound:
+            container.setStyleSheet(CardStyles.outbound_plugin_card(connected=False))
+        elif is_plugin:
             container.setStyleSheet(CardStyles.plugin_card(connected=False))
         else:
             container.setStyleSheet(device_card_style)
@@ -2193,6 +2195,91 @@ def setup_ui(self):
 
     # Note: Remote DAQ will be added by StreamController at the end
     
+    # --- ADDED: Outbound Interfaces Section ---
+    outbound_interfaces = InterfaceRegistry.get_outbound_interfaces()
+    if outbound_interfaces:
+        # Get next available grid position
+        start_idx = len(sorted_names)
+        
+        for i, (name, interface_class) in enumerate(outbound_interfaces.items()):
+            idx = start_idx + i
+            icon = getattr(interface_class, "ICON", "📤")
+            
+            # Outbound interfaces are always plugins
+            is_plugin = True
+            is_outbound = True
+            
+            # Handle icons for plugins (reusing logic)
+            if icon and (icon.endswith(".png") or icon.endswith(".svg")):
+                try:
+                    import inspect
+                    plugin_file = inspect.getfile(interface_class)
+                    plugin_dir = os.path.dirname(plugin_file)
+                    potential_path = os.path.join(plugin_dir, icon)
+                    if os.path.exists(potential_path):
+                        icon = potential_path
+                except Exception: pass
+
+            # Use create_card with is_outbound flag (we'll need to update create_card too)
+            card, status_label = create_card(name, icon, None, is_plugin=True, is_outbound=True)
+            card.setProperty("is_plugin", True)
+            card.setProperty("is_outbound", True)
+            card.setProperty("interface_name", name)
+            
+            # Connect outbound plugin toggle/configure
+            def handle_outbound_click(n=name):
+                if not hasattr(self, 'data_collection_controller'):
+                    return
+                
+                dcc = self.data_collection_controller
+                plugin = next((p for p in dcc.outbound_plugins if getattr(p, 'name', '') == n), None)
+                
+                if plugin:
+                    # Always show settings dialog on click
+                    from app.ui.dialogs.interface_config_dialog import InterfaceConfigDialog
+                    cls = InterfaceRegistry.get_interface_class(n)
+                    
+                    # Load current settings from QSettings
+                    settings_key = n.lower().replace(" ", "_")
+                    current_config = {}
+                    
+                    # Load standard fields
+                    current_config["auto_connect"] = self.settings.value(f"{settings_key}_auto_connect", "false") == "true"
+                    current_config["enabled"] = self.settings.value(f"{settings_key}_enabled", "true") == "true"
+                    
+                    schema = getattr(cls, 'CONFIG_SCHEMA', {})
+                    for field in schema:
+                        val = self.settings.value(f"{settings_key}_{field}")
+                        if val is not None:
+                            current_config[field] = val
+                    
+                    dialog = InterfaceConfigDialog(self, interface_class=cls, interface_instance=plugin, config=current_config)
+                    if dialog.exec():
+                        # Save new config to QSettings
+                        new_config = dialog.get_config()
+                        # Standard fields
+                        self.settings.setValue(f"{settings_key}_auto_connect", "true" if new_config.get("auto_connect") else "false")
+                        self.settings.setValue(f"{settings_key}_enabled", "true" if new_config.get("enabled") else "false")
+                        
+                        # Schema fields
+                        for field, val in new_config.items():
+                            if field not in ["auto_connect", "enabled"]:
+                                self.settings.setValue(f"{settings_key}_{field}", val)
+                        
+                        # If enabled and not connected, connect
+                        if new_config.get("enabled") and not plugin.is_connected():
+                            plugin.connect()
+                    
+                    self.update_status_indicators()
+
+            card.mousePressEvent = lambda event, n=name: handle_outbound_click(n)
+
+            row = idx // 2
+            col = idx % 2
+            devices_cards_layout.addWidget(card, row, col)
+            self.interface_status_labels[name] = status_label
+    # ------------------------------------------
+
     # Add stretch to grid to push cards to top
     devices_cards_layout.setRowStretch(devices_cards_layout.rowCount(), 1)
     

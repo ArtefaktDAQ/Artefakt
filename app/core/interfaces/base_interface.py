@@ -17,6 +17,7 @@ class BaseInterface(ABC):
     DISPLAY_NAME = "Base Interface"
     DESCRIPTION = "Base class for all hardware interfaces"
     ICON = "🔌"  # Default icon for the UI card
+    HELP_TEXT = None  # Optional HTML help text shown in the config dialog
     
     # Define what configuration fields this interface needs for the UI
     # This schema allows the UI to automatically generate the "Add Sensor" dialog.
