@@ -58,20 +58,36 @@
         ]
     },
     {
-        "name": "Motion -> Picture",
+        "name": "Quick Start/Stop Test",
         "loop": false,
         "checked": false,
         "steps": [
             {
                 "trigger": {
-                    "type": "EVENT",
-                    "name": "Unnamed Trigger",
-                    "event_type": "motion_detected"
+                    "type": "TIME_DURATION",
+                    "name": "Stabilize (1s)",
+                    "minutes": 0,
+                    "seconds": 1
                 },
                 "action": {
                     "type": "SYSTEM_ACTION",
-                    "name": "Unnamed Action",
-                    "specific_action_type": "take_snapshot",
+                    "name": "Start Run",
+                    "specific_action_type": "start_acquisition",
+                    "parameters": {}
+                },
+                "enabled": true
+            },
+            {
+                "trigger": {
+                    "type": "TIME_DURATION",
+                    "name": "Wait 10s",
+                    "minutes": 0,
+                    "seconds": 10
+                },
+                "action": {
+                    "type": "SYSTEM_ACTION",
+                    "name": "Stop Run",
+                    "specific_action_type": "stop_acquisition",
                     "parameters": {}
                 },
                 "enabled": true

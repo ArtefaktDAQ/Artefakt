@@ -128,6 +128,7 @@ class AutomationController(QObject):
         self.update_button_states() # Set initial button enabled/disabled state
         self.update_automation_status_display() # Set initial status display
         self.connect_signals() # Connect UI signals
+        self._setup_predefined_automations() # Initialize templates
         
         # Enable context menu for dashboard table
         if hasattr(self.main_window, 'dashboard_automation_table'):
@@ -696,10 +697,13 @@ class AutomationController(QObject):
             print("No automation sequences checked - continuing without automation")
             return
 
-        # Clear stale sensor data and events before starting sequences
+        # Clear stale sensor data and events before starting NEW sequences
         # This prevents immediate triggering from values left over from a previous run
-        self.manager.update_context({'sensors': {}, 'events': set()})
-        self.manager.variables = {} # Reset shared variables for a fresh start
+        # ONLY do this if no sequences are already running to avoid interrupting them
+        if not self.manager.active_sequences:
+            self.manager.update_context({'sensors': {}, 'events': set()})
+            self.manager.variables = {} # Reset shared variables for a fresh start
+            print("[Automation] Context and variables reset for new run")
 
         started_count = 0
         error_messages = []
@@ -860,13 +864,22 @@ class AutomationController(QObject):
                 # Decide how to handle this - maybe prevent path change?
                 # For now, proceed but loading/saving might fail.
 
-        # Update the manager's path and reload sequences
+        # Update the manager's path
         try:
             self.manager.set_sequences_file(new_sequences_file_path)
-            self.manager.load_sequences() # Reload sequences from the new path
-             # update_sequences_table will be called via the manager's sequences_changed signal
+            
+            # ONLY reload if no sequences are active.
+            # If sequences are active, we just want to change the save location
+            # without interrupting the current execution.
+            if not self.manager.active_sequences:
+                print("[Automation] No active sequences, reloading from new path.")
+                self.manager.load_sequences()
+            else:
+                print(f"[Automation] {len(self.manager.active_sequences)} sequences active. Skipping reload to prevent interruption.")
+                # We still want to emit a signal so the UI knows the path changed (e.g. for display)
+                self.manager.sequences_changed.emit()
         except Exception as e:
-            print(f"Error setting new sequence path or loading sequences: {e}")
+            print(f"Error updating sequence path: {e}")
             traceback.print_exc()
             QMessageBox.critical(self.main_window, "Error", f"Failed to load automation sequences from {new_sequences_file_path}: {e}") 
 
@@ -1074,3 +1087,292 @@ class AutomationController(QObject):
         finally:
             # Always clear the flag, even if an error occurred
             self._updating_dashboard_table = False 
+
+    def _setup_predefined_automations(self):
+        """Initialize the list of predefined automation templates."""
+        if not hasattr(self.main_window, 'predefined_list'):
+            return
+            
+        self.templates = {
+            "📸 Snapshot Every 1m": {
+                "name": "Periodic Snapshot (1m)",
+                "loop": True,
+                "steps": [
+                    {
+                        "trigger": {"type": "TIME_DURATION", "name": "Wait 1 min", "minutes": 1, "seconds": 0},
+                        "action": {"type": "SYSTEM_ACTION", "name": "Take Snapshot", "specific_action_type": "take_snapshot", "parameters": {}},
+                        "enabled": True
+                    }
+                ]
+            },
+            "🎥 Periodic Recording": {
+                "name": "Record 30s every 5m",
+                "loop": True,
+                "steps": [
+                    {
+                        "trigger": {"type": "TIME_DURATION", "name": "Wait 5 min", "minutes": 5, "seconds": 0},
+                        "action": {"type": "SYSTEM_ACTION", "name": "Start Recording", "specific_action_type": "start_recording", "parameters": {}},
+                        "enabled": True
+                    },
+                    {
+                        "trigger": {"type": "TIME_DURATION", "name": "Recording duration", "minutes": 0, "seconds": 30},
+                        "action": {"type": "SYSTEM_ACTION", "name": "Stop Recording", "specific_action_type": "stop_recording", "parameters": {}},
+                        "enabled": True
+                    }
+                ]
+            },
+            "🛡️ Snapshot + Alert": {
+                "name": "Snap (1m) & Record on High Temp",
+                "loop": True,
+                "steps": [
+                    {
+                        "trigger": {"type": "TIME_DURATION", "name": "1 min interval", "minutes": 1, "seconds": 0},
+                        "action": {"type": "SYSTEM_ACTION", "name": "Log Snapshot", "specific_action_type": "take_snapshot", "parameters": {}},
+                        "enabled": True
+                    },
+                    {
+                        "trigger": {"type": "TIME_DURATION", "name": "Instant Check", "minutes": 0, "seconds": 0},
+                        "action": {
+                            "type": "CONDITION", 
+                            "name": "Is Temperature High?", 
+                            "condition_expression": "{Temperature} > 50", 
+                            "if_true_step": 2,  
+                            "if_false_step": 0  
+                        },
+                        "enabled": True
+                    },
+                    {
+                        "trigger": {"type": "TIME_DURATION", "name": "Triggered", "minutes": 0, "seconds": 0},
+                        "action": {"type": "SYSTEM_ACTION", "name": "Start Video", "specific_action_type": "start_recording", "parameters": {}},
+                        "enabled": True
+                    }
+                ]
+            },
+            "⏰ Daily 8AM-9AM Run": {
+                "name": "Daily Scheduled Run",
+                "loop": True,
+                "steps": [
+                    {
+                        "trigger": {"type": "TIME_DURATION", "name": "Check Status", "minutes": 0, "seconds": 0},
+                        "action": {
+                            "type": "CONDITION", 
+                            "name": "Already running?", 
+                            "condition_expression": "{is_running} == True", 
+                            "if_true_step": 3, # Jump to Stop Timer
+                            "if_false_step": 1 # Continue to Start Timer
+                        },
+                        "enabled": True
+                    },
+                    {
+                        "trigger": {"type": "TIME_SPECIFIC", "name": "Wait for 8:00 AM", "hour": 8, "minute": 0},
+                        "action": {"type": "SYSTEM_ACTION", "name": "Start Acquisition", "specific_action_type": "start_acquisition", "parameters": {}},
+                        "enabled": True
+                    },
+                    {
+                        "trigger": {"type": "TIME_DURATION", "name": "Stabilization", "minutes": 0, "seconds": 1},
+                        "action": {"type": "INFO_MARKER", "name": "Log Start", "marker_text": "Scheduled run started"},
+                        "enabled": True
+                    },
+                    {
+                        "trigger": {"type": "TIME_SPECIFIC", "name": "Wait for 9:00 AM", "hour": 9, "minute": 0},
+                        "action": {"type": "SYSTEM_ACTION", "name": "Stop Acquisition", "specific_action_type": "stop_acquisition", "parameters": {}},
+                        "enabled": True
+                    }
+                ]
+            },
+                "🚀 Test (10s Run)": {
+                    "name": "Quick Start/Stop Test",
+                    "loop": False,
+                    "steps": [
+                        {
+                            "trigger": {"type": "TIME_DURATION", "name": "Stabilize (1s)", "minutes": 0, "seconds": 1},
+                            "action": {"type": "SYSTEM_ACTION", "name": "Start Run", "specific_action_type": "start_acquisition", "parameters": {}},
+                            "enabled": True
+                        },
+                        {
+                            "trigger": {"type": "TIME_DURATION", "name": "Wait 10s", "minutes": 0, "seconds": 10},
+                            "action": {"type": "SYSTEM_ACTION", "name": "Stop Run", "specific_action_type": "stop_acquisition", "parameters": {}},
+                            "enabled": True
+                        }
+                    ]
+                },
+            "🏃 Motion Snapshot": {
+                "name": "Capture Motion",
+                "loop": True,
+                "steps": [
+                    {
+                        "trigger": {"type": "EVENT", "name": "Motion detected", "event_type": "motion_detected"},
+                        "action": {"type": "SYSTEM_ACTION", "name": "Snapshot", "specific_action_type": "take_snapshot", "parameters": {}},
+                        "enabled": True
+                    }
+                ]
+            },
+            "🚨 Sensor Alert": {
+                "name": "High Value Alarm",
+                "loop": True,
+                "steps": [
+                    {
+                        "trigger": {
+                            "type": "SENSOR_VALUE", 
+                            "name": "Check A0 > 4.5V", 
+                            "sensor_name": "A0", 
+                            "operator": ">", 
+                            "threshold": 4.5,
+                            "hysteresis": 0.1
+                        },
+                        "action": {"type": "SYSTEM_ACTION", "name": "Play Alert", "specific_action_type": "play_sound", "parameters": {"sound": "beep"}},
+                        "enabled": True
+                    },
+                    {
+                        "trigger": {"type": "TIME_DURATION", "name": "Cooldown", "minutes": 0, "seconds": 5},
+                        "action": {"type": "INFO_MARKER", "name": "Log Marker", "marker_text": "High sensor value detected on A0!"},
+                        "enabled": True
+                    }
+                ]
+            },
+            "🔥 Emergency Stop": {
+                "name": "Stop on Overheat",
+                "loop": True,
+                "steps": [
+                    {
+                        "trigger": {
+                            "type": "SENSOR_VALUE", 
+                            "name": "Temp > 75°C", 
+                            "sensor_name": "Temperature", 
+                            "operator": ">", 
+                            "threshold": 75.0,
+                            "hysteresis": 2.0
+                        },
+                        "action": {"type": "SYSTEM_ACTION", "name": "Stop Everything", "specific_action_type": "stop_acquisition", "parameters": {}},
+                        "enabled": True
+                    },
+                    {
+                        "trigger": {"type": "TIME_DURATION", "name": "Instant", "minutes": 0, "seconds": 0},
+                        "action": {"type": "SYSTEM_ACTION", "name": "Alert User", "specific_action_type": "display_message", "parameters": {"title": "SAFETY ALERT", "message": "Acquisition stopped due to high temperature!"}},
+                        "enabled": True
+                    }
+                ]
+            },
+            "🎤 Acoustic Snap": {
+                "name": "Snapshot on Loud Noise",
+                "loop": True,
+                "steps": [
+                    {
+                        "trigger": {
+                            "type": "AUDIO_EVENT", 
+                            "name": "Loud Noise", 
+                            "sensor_name": "Microphone", 
+                            "event_type": "rms_above", 
+                            "threshold": 0.6
+                        },
+                        "action": {"type": "SYSTEM_ACTION", "name": "Snap", "specific_action_type": "take_snapshot", "parameters": {}},
+                        "enabled": True
+                    }
+                ]
+            },
+            "📡 MQTT Heartbeat": {
+                "name": "Periodic Status Update",
+                "loop": True,
+                "steps": [
+                    {
+                        "trigger": {"type": "TIME_DURATION", "name": "5 Min Interval", "minutes": 5, "seconds": 0},
+                        "action": {
+                            "type": "MQTT_PUBLISH", 
+                            "name": "Send Heartbeat", 
+                            "topic": "daq/heartbeat", 
+                            "payload": "State: {is_running} | Rec: {is_recording}"
+                        },
+                        "enabled": True
+                    }
+                ]
+            },
+            "☀ Auto-Daylight": {
+                "name": "Run when Bright",
+                "loop": True,
+                "steps": [
+                    {
+                        "trigger": {
+                            "type": "OPTICAL_EVENT", 
+                            "name": "Sunrise/Lights On", 
+                            "sensor_name": "Camera1", 
+                            "event_type": "brightness_above", 
+                            "threshold": 150
+                        },
+                        "action": {"type": "SYSTEM_ACTION", "name": "Start", "specific_action_type": "start_acquisition", "parameters": {}},
+                        "enabled": True
+                    },
+                    {
+                        "trigger": {
+                            "type": "OPTICAL_EVENT", 
+                            "name": "Sunset/Lights Off", 
+                            "sensor_name": "Camera1", 
+                            "event_type": "brightness_below", 
+                            "threshold": 50
+                        },
+                        "action": {"type": "SYSTEM_ACTION", "name": "Stop", "specific_action_type": "stop_acquisition", "parameters": {}},
+                        "enabled": True
+                    }
+                ]
+            },
+            "📊 Smart Burst": {
+                "name": "Record on Spike",
+                "loop": True,
+                "steps": [
+                    {
+                        "trigger": {
+                            "type": "SENSOR_VALUE", 
+                            "name": "Value Spike", 
+                            "sensor_name": "A0", 
+                            "operator": ">", 
+                            "threshold": 4.0
+                        },
+                        "action": {"type": "SYSTEM_ACTION", "name": "Start Recording", "specific_action_type": "start_recording", "parameters": {}},
+                        "enabled": True
+                    },
+                    {
+                        "trigger": {"type": "TIME_DURATION", "name": "10s Burst", "minutes": 0, "seconds": 10},
+                        "action": {"type": "SYSTEM_ACTION", "name": "Stop Recording", "specific_action_type": "stop_recording", "parameters": {}},
+                        "enabled": True
+                    }
+                ]
+            }
+        }
+        
+        self.main_window.predefined_list.clear()
+        for name in self.templates.keys():
+            self.main_window.predefined_list.addItem(name)
+            
+        # Connect double-click signal
+        self.main_window.predefined_list.itemDoubleClicked.connect(self._on_template_selected)
+
+    def _on_template_selected(self, item):
+        """Load the selected template into the automation manager and save it."""
+        template_data = self.templates.get(item.text())
+        if not template_data:
+            return
+            
+        try:
+            # Create a new sequence from the template data
+            new_sequence = AutomationSequence.from_dict(template_data)
+            
+            # Ensure the name is unique
+            base_name = new_sequence.name
+            counter = 1
+            while any(s.name == new_sequence.name for s in self.manager.sequences):
+                new_sequence.name = f"{base_name} ({counter})"
+                counter += 1
+            
+            # Add to manager (this will also trigger a save)
+            self.manager.add_sequence(new_sequence)
+            
+            # Provide feedback
+            if hasattr(self.main_window, 'statusBar') and self.main_window.statusBar():
+                self.main_window.statusBar().showMessage(f"Loaded template: {new_sequence.name}", 3000)
+            
+            # Select the newly added sequence in the table
+            self.update_sequences_table()
+            
+        except Exception as e:
+            print(f"Error loading template: {e}")
+            traceback.print_exc()
+            QMessageBox.critical(self.main_window, "Error", f"Failed to load template: {e}")

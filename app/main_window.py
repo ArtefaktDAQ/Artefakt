@@ -188,7 +188,12 @@ class DAQApp(QMainWindow):
         os.makedirs(log_dir, exist_ok=True)
         log_file = os.path.join(log_dir, f"daq_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
         # Set log level based on debug_mode setting
-        debug_mode = self.settings.value("debug_mode", "false").lower() == "true"
+        def get_bool_val(key, default="false"):
+            val = self.settings.value(key, default)
+            if isinstance(val, bool): return val
+            return str(val).lower() == "true"
+
+        debug_mode = get_bool_val("debug_mode", "false")
         log_level = "DEBUG" if debug_mode else "ERROR"
         self.logger = Logger("UI", log_file=log_file, log_level=log_level)
         self.logger.log("Application started", "INFO")
@@ -1456,17 +1461,12 @@ class DAQApp(QMainWindow):
         
         self.run_context_label.setText(text)
 
-    def on_toggle_clicked(self):
+    def on_toggle_clicked(self, force=False):
         """Handle toggle button click - simulate checkbox toggle"""
         print(f"\n[TOGGLE] ===== on_toggle_clicked called, current state: running={self.running} =====")
-        import traceback
-        print("[TOGGLE] Called from:")
-        for line in traceback.format_stack()[:-1]:
-            if 'EvoLabs DAQ PY' in line:
-                print(line.rstrip())
         
-        # Add a simple debounce to prevent rapid toggling
-        if hasattr(self, '_toggle_last_click'):
+        # Add a simple debounce to prevent rapid toggling, unless forced (e.g. by automation)
+        if not force and hasattr(self, '_toggle_last_click'):
             now = datetime.datetime.now()
             if (now - self._toggle_last_click).total_seconds() < 0.5:
                 print(f"[TOGGLE] Ignoring rapid toggle click, last click: {self._toggle_last_click}")
@@ -1539,12 +1539,6 @@ class DAQApp(QMainWindow):
                     self.camera_controller.stop_recording()
                     self.logger.log("Stopped video recording")
             
-            # --- ADDED: Stop all automation sequences ---
-            if hasattr(self, 'automation_controller'):
-                print("[TOGGLE] Stopping all automation sequences...")
-                self.automation_controller.stop_all_automation()
-                self.logger.log("Stopped all automation sequences")
-
             # Update status message
             self.statusBar().showMessage("Stopped recording")
             print("[TOGGLE] Data acquisition stopped successfully")
@@ -1751,9 +1745,14 @@ class DAQApp(QMainWindow):
 
     def load_settings(self, is_startup_load=False):
         """Load application settings"""
+        def get_bool_val(key, default="false"):
+            val = self.settings.value(key, default)
+            if isinstance(val, bool): return val
+            return str(val).lower() == "true"
+
         # Load from QSettings first for compatibility
-        debug_mode = self.settings.value("debug_mode", "false").lower() == "true"
-        show_log = self.settings.value("show_log", "true").lower() == "true"
+        debug_mode = get_bool_val("debug_mode", "false")
+        show_log = get_bool_val("show_log", "true")
         
         # Set the log visible or hidden
         if hasattr(self, 'log_panel'):
@@ -1781,7 +1780,12 @@ class DAQApp(QMainWindow):
                 self.save_config()
         
         # Load other settings as usual
-        self.other_sensors_autoconnect = self.settings.value("other_sensors_autoconnect", "true") == "true"
+        def get_bool_val(key, default="false"):
+            val = self.settings.value(key, default)
+            if isinstance(val, bool): return val
+            return str(val).lower() == "true"
+
+        self.other_sensors_autoconnect = get_bool_val("other_sensors_autoconnect", "true")
         
         # Load the global sampling rate setting if it exists
         if hasattr(self, 'sampling_rate_spinbox'):
@@ -1822,11 +1826,39 @@ class DAQApp(QMainWindow):
 
         # Handle camera auto-connect if enabled
         if hasattr(self, 'camera_controller') and is_startup_load:
-            camera_auto_connect = self.settings.value("camera_auto_connect", "false") == "true"
-            if camera_auto_connect:
-                self.logger.log("Auto-connecting camera...", "INFO")
-                # Use a small delay to ensure UI is fully ready and video outputs are set
-                QTimer.singleShot(1500, lambda: self.camera_controller.connect_camera(0))
+            # We check both the legacy global setting AND the new per-camera settings
+            # for the first slot for backward compatibility.
+            def get_bool_val(key, default="false"):
+                val = self.settings.value(key, default)
+                if isinstance(val, bool): return val
+                return str(val).lower() == "true"
+
+            legacy_auto_connect = get_bool_val("camera_auto_connect", "false")
+            
+            # Use a small delay to ensure UI is fully ready and video outputs are set
+            def perform_auto_connects():
+                connected_any = False
+                for idx in range(4):
+                    config = self.camera_controller.camera_configs[idx]
+                    should_connect = config.get("auto_connect", False)
+                    
+                    # For slot 0, also check the legacy global setting
+                    if idx == 0 and legacy_auto_connect:
+                        should_connect = True
+                        
+                    if should_connect:
+                        self.logger.log(f"Auto-connecting Camera {idx+1}...", "INFO")
+                        self.camera_controller.connect_camera(idx)
+                        connected_any = True
+                
+                # If we connected anything via legacy setting, update the new setting too
+                if legacy_auto_connect:
+                    self.camera_controller.camera_configs[0]["auto_connect"] = True
+                    self.camera_controller.save_camera_settings(0)
+                    # Clear legacy setting to prevent confusion in future
+                    self.settings.setValue("camera_auto_connect", "false")
+
+            QTimer.singleShot(1500, perform_auto_connects)
 
         # Load plot formatting settings
         if hasattr(self, 'plot_style_preset'):
@@ -2080,27 +2112,20 @@ class DAQApp(QMainWindow):
                     if hasattr(self, 'logger'):
                         self.logger.log("Replay video stopped because camera is being connected", "INFO")
             
-            # Get settings from the camera tab
-            camera_id = self.camera_id.currentIndex()
-            
-            # Get resolution and framerate from settings instead of UI elements (which were removed)
-            resolution = self.settings.value("camera/resolution", "1280x720")
-            fps = int(self.settings.value("camera/fps", "30"))
-            
-            # Update the settings values
-            self.settings.setValue("camera/default_camera", str(camera_id))
-            # Resolution and framerate are already set via the settings popup
-            
-            # Connect to the camera
+            # Connect to the camera using the controller
             self.camera_controller.toggle_camera()
             
             # Apply focus and exposure settings after connection
-            if self.camera_controller.is_connected:
+            if any(self.camera_controller.is_connected):
                 self.apply_camera_focus_exposure()
         else:
-            # Disconnect the camera using the force_disconnect method for reliability
-            print("Using force_disconnect for more reliable camera disconnection")
-            self.camera_controller.force_disconnect()
+            # Disconnect the camera using the controller
+            self.camera_controller.toggle_camera()
+            
+    def apply_camera_focus_exposure(self):
+        """Apply focus and exposure settings from the UI to the active camera"""
+        if hasattr(self, 'camera_controller'):
+            self.camera_controller.apply_camera_settings()
         
     def take_snapshot(self):
         """Take a camera snapshot"""
@@ -3170,13 +3195,18 @@ class DAQApp(QMainWindow):
             return
             
         # Get current config
+        def get_bool_val(key, default="false"):
+            val = self.settings.value(key, default)
+            if isinstance(val, bool): return val
+            return str(val).lower() == "true"
+
         config = {
             "port": self.settings.value("arduino_port", "COM3"),
             "baud_rate": str(self.settings.value("arduino_baud", "9600")),
             "mode": self.settings.value("arduino_mode", "polled"),
             "poll_interval": float(self.settings.value("arduino_poll_interval", "1.0")),
-            "auto_connect": self.settings.value("arduino_auto_connect", "false") == "true",
-            "enabled": self.settings.value("arduino_enabled", "true") == "true"
+            "auto_connect": get_bool_val("arduino_auto_connect", "false"),
+            "enabled": get_bool_val("arduino_enabled", "true")
         }
         
         instance = None
@@ -3299,14 +3329,19 @@ class DAQApp(QMainWindow):
         except (ValueError, TypeError):
             labjack_rate = 100.0
 
+        def get_bool_val(key, default="false"):
+            val = self.settings.value(key, default)
+            if isinstance(val, bool): return val
+            return str(val).lower() == "true"
+
         config = {
             "device_type": self.settings.value("labjack_type", "T7"),
             "connection_type": self.settings.value("labjack_connection", "ANY"),
             "port": self.settings.value("labjack_port", "ANY"),
-            "auto_reconnect": self.settings.value("labjack_auto_reconnect", "false") == "true",
+            "auto_reconnect": get_bool_val("labjack_auto_reconnect", "false"),
             "sampling_rate": labjack_rate,
-            "auto_connect": self.settings.value("labjack_auto_connect", "false") == "true",
-            "enabled": self.settings.value("labjack_enabled", "true") == "true"
+            "auto_connect": get_bool_val("labjack_auto_connect", "false"),
+            "enabled": get_bool_val("labjack_enabled", "true")
         }
         
         instance = None
@@ -3352,18 +3387,6 @@ class DAQApp(QMainWindow):
                 
             self.logger.log(f"LabJack settings updated: Type={new_config.get('device_type')}, Rate={new_config.get('sampling_rate')}", "INFO")
 
-    def apply_camera_focus_exposure(self):
-        """DEPRECATED: Now handled in camera_controller.py"""
-        pass
-
-    def update_focus_value_label(self):
-        """DEPRECATED: Now handled in camera_controller.py"""
-        pass
-
-    def update_exposure_value_label(self):
-        """DEPRECATED: Now handled in camera_controller.py"""
-        pass
-        
     def show_camera_settings_popup(self):
         """Show camera settings in a popup dialog"""
         dialog = QDialog(self)
@@ -3452,7 +3475,7 @@ class DAQApp(QMainWindow):
         
         right_column.addWidget(ndi_group)
 
-        # --- Group 4: Performance & Hardware ---
+        # Group 4: Performance & Hardware
         perf_group = QGroupBox("Performance & Hardware")
         perf_group.setStyleSheet(GroupBoxStyles.default())
         perf_layout = QVBoxLayout(perf_group)
@@ -3461,12 +3484,6 @@ class DAQApp(QMainWindow):
         use_hw_accel.setToolTip("Uses your Graphics Card (Nvidia, Intel, or AMD) to reduce CPU load during recording.")
         use_hw_accel.setChecked(self.settings_model.get_bool("use_hw_accel", True))
         perf_layout.addWidget(use_hw_accel)
-        
-        # Camera Auto-connect
-        camera_auto_connect = QCheckBox("Auto-connect Camera on Startup")
-        camera_auto_connect.setToolTip("Automatically connect to the selected camera source when the application starts.")
-        camera_auto_connect.setChecked(self.settings.value("camera_auto_connect", "false") == "true")
-        perf_layout.addWidget(camera_auto_connect)
         
         right_column.addWidget(perf_group)
         
@@ -3489,7 +3506,6 @@ class DAQApp(QMainWindow):
             ndi_source_name.text(),
             ndi_with_overlays.isChecked(),
             use_hw_accel.isChecked(),
-            camera_auto_connect.isChecked(),
             dialog
         ))
         button_box.rejected.connect(dialog.reject)
@@ -3540,8 +3556,7 @@ class DAQApp(QMainWindow):
     def apply_camera_settings_from_popup(self, record_with_overlays, 
                                         recording_format, video_quality, media_volume,
                                         enable_ndi, ndi_source_name, ndi_with_overlays,
-                                        use_hw_accel, 
-                                        camera_auto_connect, dialog):
+                                        use_hw_accel, dialog):
         """Apply camera settings from the popup dialog"""
         # Update settings
         self.settings.setValue("record_with_overlays", "true" if record_with_overlays else "false")
@@ -3554,7 +3569,6 @@ class DAQApp(QMainWindow):
         self.settings.setValue("ndi_source_name", ndi_source_name)
         self.settings.setValue("ndi_with_overlays", "true" if ndi_with_overlays else "false")
         self.settings.setValue("use_hw_accel", "true" if use_hw_accel else "false")
-        self.settings.setValue("camera_auto_connect", "true" if camera_auto_connect else "false")
 
         dialog.accept()
         if hasattr(self, 'record_with_overlays'):
@@ -3584,83 +3598,22 @@ class DAQApp(QMainWindow):
         dialog.accept()
         
     def start_acquisition(self):
-        """Start data acquisition"""
-        # Clear snapshots immediately
-        if hasattr(self, "load_snapshots_for_run"):
-            self.load_snapshots_for_run(None)
-            
-        # Set the acquisition flag
-        self.is_acquiring = True
-        self.paused = False
-        
+        """Start data acquisition using the standard toggle logic"""
         print("DEBUG MainWindow: start_acquisition called")
-        
-        # Get the run directory
-        run_dir = self.get_current_run_dir()
-        if run_dir:
-            # Create the run directory if it doesn't exist
-            os.makedirs(run_dir, exist_ok=True)
-            
-            # Move virtual_sensors.json to the run directory if it exists in current directory
-            virtual_sensors_fallback_path = VIRTUAL_SENSORS_PATH
-            virtual_sensors_run_path = os.path.join(run_dir, VIRTUAL_SENSORS_FILENAME)
-            if os.path.exists(virtual_sensors_fallback_path) and not os.path.exists(virtual_sensors_run_path):
-                try:
-                    shutil.copy2(virtual_sensors_fallback_path, virtual_sensors_run_path)
-                    self.logger.log(f"Copied virtual sensors config to run directory")
-                except Exception as e:
-                    self.logger.log(f"Failed to copy virtual sensors to run: {str(e)}", "ERROR")
-            
-            # Start data collection
-            self.data_collection_controller.start_data_collection(run_dir)
-            
-            # Start the sensor controller
-            if hasattr(self, 'sensor_controller'):
-                print("DEBUG MainWindow: Calling sensor_controller.start_acquisition()")
-                self.sensor_controller.start_acquisition()
-            
-            # Check if we have OtherSerial sensors and verify they're connected
-            has_virtual_sensors = len(getattr(self, 'other_sensors', [])) > 0
-            if has_virtual_sensors:
-                print(f"DEBUG MainWindow: Has {len(self.other_sensors)} virtual sensors")
-                # Check if other_serial interface is connected in the controller
-                if hasattr(self.data_collection_controller, 'interfaces'):
-                    other_serial_connected = 'other_serial' in self.data_collection_controller.interfaces and self.data_collection_controller.interfaces['other_serial'].get('connected', False)
-                    print(f"DEBUG MainWindow: OtherSerial interface connected = {other_serial_connected}")
-                    
-            # Update the UI states
-            self.start_btn.setEnabled(False)
-            self.pause_btn.setEnabled(True)
-            self.stop_btn.setEnabled(True)
-            
-            # Change the status LED
-            self.animation_status.setStyleSheet("background-color: green; border-radius: 10px;")
-            
-            # Log the acquisition start
-            self.logger.log(f"Started data acquisition to {run_dir}")
-            
-            # Update other UI elements to indicate acquisition has started
-            # ...
-            
+        if not self.running:
+            # The toggle logic handles all directory creation, graph setup, etc.
+            self.on_toggle_clicked(force=True)
         else:
-            # Show an error message
-            QMessageBox.warning(
-                self,
-                "Data Acquisition",
-                "Cannot start data acquisition - no run directory available",
-                QMessageBox.StandardButton.Ok
-            )
-        
+            print("DEBUG MainWindow: Already running, skipping start_acquisition")
+
     def stop_acquisition(self):
-        """Stop data acquisition"""
-        print(f"[STOP] stop_acquisition called (redirecting to toggle)")
-        self.logger.log("stop_acquisition called", "DEBUG")
-        
-        # Force button to Stop first
-        self.toggle_btn.setText("Stop")
-        
-        # Then trigger the toggle
-        self.on_toggle_clicked()
+        """Stop data acquisition using the standard toggle logic"""
+        print("DEBUG MainWindow: stop_acquisition called")
+        if self.running:
+            # The toggle logic handles all cleanup and stopping
+            self.on_toggle_clicked(force=True)
+        else:
+            print("DEBUG MainWindow: Not running, nothing to stop")
         
     def _apply_csv_configs(self):
         """Apply the current CSV configurations to the controller and UI."""

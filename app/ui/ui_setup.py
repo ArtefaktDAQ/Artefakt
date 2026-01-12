@@ -1354,36 +1354,41 @@ def setup_ui(self):
     
     camera_connection_layout.addLayout(connect_layout, 2, 1, 1, 2)
 
+    # Auto-connect checkbox for individual camera
+    self.camera_auto_connect_checkbox = QCheckBox("Auto-connect at Startup")
+    self.camera_auto_connect_checkbox.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 11px;")
+    camera_connection_layout.addWidget(self.camera_auto_connect_checkbox, 3, 1, 1, 2)
+
     # Resolution
     self.camera_resolution_label = QLabel("Res:")
-    camera_connection_layout.addWidget(self.camera_resolution_label, 3, 0)
+    camera_connection_layout.addWidget(self.camera_resolution_label, 4, 0)
     self.camera_resolution = QComboBox()
     self.camera_resolution.addItems(["640x480", "800x600", "1280x720", "1920x1080"])
     self.camera_resolution.setStyleSheet(InputStyles.default())
-    camera_connection_layout.addWidget(self.camera_resolution, 3, 1, 1, 2)
+    camera_connection_layout.addWidget(self.camera_resolution, 4, 1, 1, 2)
 
     # Framerate
-    camera_connection_layout.addWidget(QLabel("FPS:"), 4, 0)
+    camera_connection_layout.addWidget(QLabel("FPS:"), 5, 0)
     self.camera_framerate = QComboBox()
     self.camera_framerate.addItems(["15", "30", "60"])
     self.camera_framerate.setStyleSheet(InputStyles.default())
-    camera_connection_layout.addWidget(self.camera_framerate, 4, 1, 1, 2)
+    camera_connection_layout.addWidget(self.camera_framerate, 5, 1, 1, 2)
 
     # FPS Display
     fps_label = QLabel("Actual Rate:")
     fps_label.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY};")
-    camera_connection_layout.addWidget(fps_label, 5, 0)
+    camera_connection_layout.addWidget(fps_label, 6, 0)
     
     self.camera_fps_display = QLabel("0.0 / 0.0 FPS")
     self.camera_fps_display.setStyleSheet(f"color: {COLORS.PRIMARY_LIGHT}; font-weight: bold;")
     self.camera_fps_display.setToolTip("Actual FPS / Target FPS")
-    camera_connection_layout.addWidget(self.camera_fps_display, 5, 1, 1, 2)
+    camera_connection_layout.addWidget(self.camera_fps_display, 6, 1, 1, 2)
     
     # Sync Note
     sync_note = QLabel("Note: If actual FPS is lower than target, frames are duplicated.")
     sync_note.setWordWrap(True)
     sync_note.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 10px; font-style: italic;")
-    camera_connection_layout.addWidget(sync_note, 6, 0, 1, 3)
+    camera_connection_layout.addWidget(sync_note, 7, 0, 1, 3)
     
     # Recording settings for individual cameras
     recording_settings_group = QGroupBox("⏺️ Recording Settings")
@@ -2792,8 +2797,43 @@ def setup_ui(self):
     automation_layout.setContentsMargins(10, 0, 10, 0)
     automation_layout.setSpacing(10)
     
-    # Center spacer left
-    automation_layout.addStretch()
+    # Quick Templates Box
+    predefined_group = QGroupBox("Quick Templates")
+    predefined_group.setFixedWidth(220)
+    predefined_group.setStyleSheet(GroupBoxStyles.default())
+    predefined_layout = QVBoxLayout(predefined_group)
+    
+    predefined_label = QLabel("Double-click to load template:")
+    predefined_label.setStyleSheet(f"font-size: 11px; color: {COLORS.TEXT_SECONDARY}; margin-bottom: 5px;")
+    predefined_layout.addWidget(predefined_label)
+    
+    self.predefined_list = QListWidget()
+    self.predefined_list.setStyleSheet(f"""
+        QListWidget {{
+            background-color: transparent;
+            border: none;
+            outline: none;
+        }}
+        QListWidget::item {{
+            background-color: rgba(255, 255, 255, 0.05);
+            border: 1px solid {COLORS.BORDER_DEFAULT};
+            border-radius: 6px;
+            padding: 12px;
+            margin-bottom: 8px;
+            color: {COLORS.TEXT_PRIMARY};
+        }}
+        QListWidget::item:hover {{
+            background-color: rgba(255, 255, 255, 0.1);
+            border-color: {COLORS.PRIMARY};
+        }}
+        QListWidget::item:selected {{
+            background-color: {COLORS.PRIMARY}33;
+            border-color: {COLORS.PRIMARY};
+            color: white;
+        }}
+    """)
+    predefined_layout.addWidget(self.predefined_list)
+    automation_layout.addWidget(predefined_group)
     
     # Main content container (restored fixed width)
     automation_main_container = QFrame()
@@ -3735,68 +3775,20 @@ def setup_ui(self):
 
 def update_focus_value_label(self):
     """Update the focus value label when the slider changes"""
-    value = self.camera_tab_focus_slider.value()
-    self.camera_tab_focus_value.setText(str(value))
+    if hasattr(self, 'camera_tab_focus_slider') and hasattr(self, 'camera_tab_focus_value'):
+        value = self.camera_tab_focus_slider.value()
+        self.camera_tab_focus_value.setText(str(value))
     
 def update_exposure_value_label(self):
     """Update the exposure value label when the slider changes"""
-    value = self.camera_tab_exposure_slider.value()
-    self.camera_tab_exposure_value.setText(str(value))
+    if hasattr(self, 'camera_tab_exposure_slider') and hasattr(self, 'camera_tab_exposure_value'):
+        value = self.camera_tab_exposure_slider.value()
+        self.camera_tab_exposure_value.setText(str(value))
     
 def apply_camera_focus_exposure(self):
     """Apply camera focus and exposure settings"""
-    # Only process if camera is connected
-    if not hasattr(self, 'camera_controller') or not self.camera_controller.is_connected:
-        return
-        
-    try:
-        # Get focus and exposure settings from the camera tab controls
-        manual_focus = self.camera_tab_manual_focus.isChecked()
-        focus_value = self.camera_tab_focus_slider.value()
-        manual_exposure = self.camera_tab_manual_exposure.isChecked()
-        exposure_value = self.camera_tab_exposure_slider.value()
-        
-        # Update slider enabled states
-        self.camera_tab_focus_slider.setEnabled(manual_focus)
-        self.camera_tab_exposure_slider.setEnabled(manual_exposure)
-        
-        # Save to settings
-        self.settings.set_value("camera/manual_focus", "true" if manual_focus else "false")
-        self.settings.set_value("camera/focus_value", str(focus_value))
-        self.settings.set_value("camera/manual_exposure", "true" if manual_exposure else "false")
-        self.settings.set_value("camera/exposure_value", str(exposure_value))
-        
-        # Apply settings to camera directly
-        if self.camera_controller:
-            idx = self.camera_controller.active_camera_index
-            thread = self.camera_controller.camera_threads[idx]
-            if thread and thread.isRunning():
-                if hasattr(thread, 'set_camera_properties'):
-                    thread.set_camera_properties(
-                        manual_focus=manual_focus,
-                        focus_value=focus_value,
-                        manual_exposure=manual_exposure,
-                        exposure_value=exposure_value
-                    )
-                else:
-                    # Fallback for direct camera manipulation
-                    if hasattr(thread, 'cap') and thread.cap:
-                        if manual_focus:
-                            thread.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)  # Disable autofocus
-                            thread.cap.set(cv2.CAP_PROP_FOCUS, focus_value)
-                        else:
-                            thread.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)  # Enable autofocus
-                        
-                        if manual_exposure:
-                            thread.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Magic value for manual
-                            thread.cap.set(cv2.CAP_PROP_EXPOSURE, exposure_value)
-                        else:
-                            thread.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)  # Magic value for auto
-            
-    except Exception as e:
-        print(f"Error applying camera focus/exposure: {str(e)}")
-        import traceback
-        traceback.print_exc()
+    if hasattr(self, 'camera_controller'):
+        self.camera_controller.apply_camera_settings()
 
 def update_device_connection_status(self, device_type, is_connected):
     """Update the connection status display for a device
@@ -3879,24 +3871,21 @@ def connect_camera(self):
         
     # Forward to the controller
     if self.camera_connect_btn.text() == "Connect":
-        # Get settings from the camera tab
-        camera_id = self.camera_id.currentIndex()
+        # Check if replay is active with video - if so, stop replay video first
+        if hasattr(self, 'replay_mode_enabled') and self.replay_mode_enabled:
+            if hasattr(self, 'replay_active_video_path') and self.replay_active_video_path:
+                # Replay video is active - clear it before connecting camera
+                if hasattr(self, '_clear_replay_video'):
+                    self._clear_replay_video()
         
-        # Get resolution and framerate from settings instead of UI elements (which were removed)
-        resolution = self.settings.value("camera/resolution", "1280x720")
-        fps = int(self.settings.value("camera/fps", "30"))
-        
-        # Update the settings values
-        self.settings.set_value("camera/default_camera", str(camera_id))
-        
-        # Connect to the camera
+        # Connect to the camera using the controller
         self.camera_controller.toggle_camera()
         
         # Apply focus and exposure settings after connection
-        if self.camera_controller.is_connected:
+        if any(self.camera_controller.is_connected):
             self.apply_camera_focus_exposure()
     else:
-        # Disconnect the camera
+        # Disconnect the camera using the controller
         self.camera_controller.toggle_camera()
 
 

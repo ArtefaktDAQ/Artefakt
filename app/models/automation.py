@@ -93,18 +93,25 @@ class TimeDurationTrigger(BaseTrigger):
         
     def check(self, context=None): # Context not strictly needed here
         if self.start_time is None:
-            # Start time hasn't been set - this is abnormal, so set it now
-            print(f"WARNING: TimeDurationTrigger was checked without start_time being set. Setting it now.")
+            # Start time hasn't been set - this is normal when the step just became active
             self.start_time = time.monotonic()
+            print(f"[Automation] TimeDurationTrigger '{self.name}' started. Target: {self.duration}s")
             return False # Don't trigger immediately
             
         elapsed = time.monotonic() - self.start_time
         is_triggered = elapsed >= self.duration
         
-        # Add debug output every 5 seconds
-        if int(elapsed) % 5 == 0:
-            remaining = max(0, self.duration - elapsed)
-            print(f"TimeDurationTrigger check: elapsed={elapsed:.1f}s, remaining={remaining:.1f}s, triggered={is_triggered}")
+        # Add clean debug output every 5 seconds
+        if self.duration >= 5:
+            current_sec = int(elapsed)
+            if current_sec % 5 == 0 and current_sec > 0:
+                if not hasattr(self, '_last_log_sec') or self._last_log_sec != current_sec:
+                    self._last_log_sec = current_sec
+                    remaining = max(0, self.duration - elapsed)
+                    print(f"[Automation] TimeDurationTrigger '{self.name}': {elapsed:.1f}s / {self.duration}s ({remaining:.1f}s remaining)")
+        
+        if is_triggered:
+            print(f"[Automation] TimeDurationTrigger '{self.name}' triggered after {elapsed:.1f}s")
             
         return is_triggered
         
@@ -130,22 +137,43 @@ class TimeSpecificTrigger(BaseTrigger):
         
     def reset(self):
         self.triggered_today = False
+        self._armed_today = False
+        if hasattr(self, '_last_check_date'):
+            delattr(self, '_last_check_date')
 
     def check(self, context=None): # Context not needed
-        now = datetime.datetime.now().time()
+        now = datetime.datetime.now()
+        current_time = now.time()
         target_time = datetime.time(self.hour, self.minute)
         
+        # Reset flags if the day has changed
+        if hasattr(self, '_last_check_date') and self._last_check_date != now.date():
+            self.triggered_today = False
+            self._armed_today = False
+        self._last_check_date = now.date()
+
         # Check if current time is at or past the target time
-        if now >= target_time:
+        if current_time >= target_time:
             if not self.triggered_today:
-                self.triggered_today = True
-                return True
+                # We only trigger if we were "armed" (i.e., we have seen a time 
+                # BEFORE the target time today). This prevents immediate 
+                # triggering if the sequence is started after the target time.
+                if hasattr(self, '_armed_today') and self._armed_today:
+                    self.triggered_today = True
+                    return True
+                else:
+                    # Already past the target time for today, wait for tomorrow
+                    self.triggered_today = True 
+                    print(f"[Automation] TimeSpecificTrigger '{self.name}' ({self.hour:02d}:{self.minute:02d}) already passed for today. Waiting for tomorrow.")
+                    return False
         else:
-            # Reset flag if time has passed midnight
+            # We are currently before the target time today, so we are "armed" 
+            # to trigger when the time is reached.
+            self._armed_today = True
             self.triggered_today = False 
             
         return False
-        
+
     def to_dict(self):
         data = super().to_dict()
         data.update({
@@ -1052,8 +1080,6 @@ class SystemAction(BaseAction):
                     resolved_params[key] = value # Keep non-strings as is
 
             # Find the appropriate controller/method on main_window or its controllers
-            # This is a simplified example; a more robust system might use signals/slots
-            # or a dedicated system action handler.
             if self.specific_action_type == "start_recording" and hasattr(main_window, 'camera_controller'):
                 main_window.camera_controller.start_recording()
             elif self.specific_action_type == "stop_recording" and hasattr(main_window, 'camera_controller'):
@@ -1081,15 +1107,42 @@ class SystemAction(BaseAction):
                             raise ValueError(f"Custom sound file not found or specified: {file_path}")
                     elif sound == "beep":
                         sound_player.play_beep()
-                    # Add other standard sounds if needed
                 else:
                     print("Warning: Sound player not available in context.")
-                    # Optionally, play a system beep as fallback
                     try:
                         import winsound # Windows only
                         winsound.MessageBeep()
                     except ImportError:
                         print("\a", end='') # Generic terminal bell
+            elif self.specific_action_type == "start_acquisition":
+                print(f"[Automation] Action: START ACQUISITION")
+                # Ensure UI is ready
+                if hasattr(main_window, 'run_description'):
+                    desc = main_window.run_description.toPlainText().strip()
+                    if not desc:
+                        import datetime
+                        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        main_window.run_description.setPlainText(f"Auto-started by Automation at {timestamp}")
+                        print(f"[Automation] Set default run description")
+                
+                if hasattr(main_window, 'run_testers'):
+                    testers = main_window.run_testers.text().strip()
+                    if not testers:
+                        main_window.run_testers.setText("Automation")
+                        print(f"[Automation] Set default run testers")
+
+                # Trigger the start acquisition logic directly
+                if hasattr(main_window, 'start_acquisition'):
+                    main_window.start_acquisition()
+                else:
+                    print("Error: main_window.start_acquisition not found")
+
+            elif self.specific_action_type == "stop_acquisition":
+                print(f"[Automation] Action: STOP ACQUISITION")
+                if hasattr(main_window, 'stop_acquisition'):
+                    main_window.stop_acquisition()
+                else:
+                    print("Error: main_window.stop_acquisition not found")
             else:
                 raise NotImplementedError(f"System action '{self.specific_action_type}' not implemented")
                 
@@ -1339,10 +1392,6 @@ class AutomationStep(QObject):
         
         self.step_started.emit(self)
         
-        # If it's a time duration trigger, start its timer now
-        if isinstance(self.trigger, TimeDurationTrigger):
-            self.trigger.start()
-        
         # We now log action execution AFTER completion to capture any generated data (like snapshot paths)
         # unless it's an async action that might take a long time.
         # For simplicity, we'll log most actions on completion.
@@ -1547,11 +1596,15 @@ class AutomationSequence(QObject):
         # Only proceed if the step is not already running its action
         if not current_step.is_running:
              # Check the trigger for the current step
-             if current_step.check_trigger(self._context):
+             trigger_met = current_step.check_trigger(self._context)
+             
+             if trigger_met:
                  # Trigger condition met - log trigger event
+                 print(f"[Automation] Sequence '{self.name}' Step {self.current_step_index + 1}: Trigger met ({current_step.trigger.name})")
                  self._log_trigger_event(current_step, self._context)
                  # Execute the action
                  try:
+                     print(f"[Automation] Sequence '{self.name}' Step {self.current_step_index + 1}: Executing action ({current_step.action.name})")
                      current_step.execute_action(self._context)
                  except Exception as e:
                      error_msg = f"Exception during action execution: {e}"
@@ -1566,12 +1619,15 @@ class AutomationSequence(QObject):
                   # If it's a duration trigger, start its timer when the step becomes active
                   # (even if check returns false initially)
                   if isinstance(current_step.trigger, TimeDurationTrigger) and current_step.trigger.start_time is None:
+                       print(f"[Automation] Sequence '{self.name}' Step {self.current_step_index + 1}: Starting duration timer ({current_step.trigger.name})")
                        current_step.trigger.start()
 
     def _handle_step_completed(self, completed_step):
         if not self.is_running or completed_step != self.steps[self.current_step_index]:
             return # Ignore if sequence stopped or it's not the current step
             
+        print(f"[Automation] Sequence '{self.name}' Step {self.current_step_index + 1} completed.")
+        
         # Move to the next step
         self.current_step_index += 1
         
@@ -1597,6 +1653,7 @@ class AutomationSequence(QObject):
                 self.sequence_completed.emit(self)
         else:
             # Proceed to the next step
+            print(f"[Automation] Sequence '{self.name}' moving to Step {self.current_step_index + 1}.")
             self.sequence_step_changed.emit(self, self.current_step_index)
             # Use singleShot to break recursion
             QTimer.singleShot(0, self._run_loop)
@@ -1746,6 +1803,20 @@ class AutomationManager(QObject):
          context['resolve_variables'] = self.resolve_variables
          context['variables'] = self.variables # Direct access (read-only recommended)
          
+         # --- ADDED: Expose main app state to automation ---
+         main_window = self.app_context.get('main_window')
+         if main_window:
+             context['is_running'] = getattr(main_window, 'running', False)
+             # Handle camera recording state (could be bool or list)
+             is_rec = False
+             if hasattr(main_window, 'camera_controller'):
+                 if isinstance(main_window.camera_controller.is_recording, list):
+                     is_rec = any(main_window.camera_controller.is_recording)
+                 else:
+                     is_rec = main_window.camera_controller.is_recording
+             context['is_recording'] = is_rec
+         # --------------------------------------------------
+
          # Preserve events dictionary if it exists (don't overwrite with empty dict)
          if 'events' in self.app_context and 'events' not in context:
              # Keep existing events
@@ -2023,6 +2094,9 @@ class AutomationManager(QObject):
 
     def load_sequences(self):
         """Load sequences from the JSON file."""
+        if self.active_sequences:
+            print(f"[Automation] WARNING: load_sequences called while {len(self.active_sequences)} sequences are active. Stopping them now.")
+        
         # Stop any currently running sequences before loading new ones
         self.stop_all_sequences() 
         

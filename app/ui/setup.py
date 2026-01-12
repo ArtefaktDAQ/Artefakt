@@ -31,58 +31,9 @@ def setup_ui(main_window):
     
     def apply_camera_focus_exposure(self):
         """Apply camera focus and exposure settings immediately"""
-        # Only process if camera is connected
-        if not hasattr(self, 'camera_controller') or not self.camera_controller.is_connected:
-            return
-            
-        try:
-            # Get focus and exposure settings from the camera tab controls
-            manual_focus = self.camera_tab_manual_focus.isChecked()
-            focus_value = self.camera_tab_focus_slider.value()
-            manual_exposure = self.camera_tab_manual_exposure.isChecked()
-            exposure_value = self.camera_tab_exposure_slider.value()
-            
-            # Update slider enabled states
-            self.camera_tab_focus_slider.setEnabled(manual_focus)
-            self.camera_tab_exposure_slider.setEnabled(manual_exposure)
-            
-            # Save to settings - use setValue instead of set_value
-            self.settings.setValue("camera/manual_focus", "true" if manual_focus else "false")
-            self.settings.setValue("camera/focus_value", str(focus_value))
-            self.settings.setValue("camera/manual_exposure", "true" if manual_exposure else "false")
-            self.settings.setValue("camera/exposure_value", str(exposure_value))
-            
-            # Apply settings to camera directly
-            if self.camera_controller:
-                idx = self.camera_controller.active_camera_index
-                thread = self.camera_controller.camera_threads[idx]
-                if thread and thread.isRunning():
-                    if hasattr(thread, 'set_camera_properties'):
-                        thread.set_camera_properties(
-                        manual_focus=manual_focus,
-                        focus_value=focus_value,
-                        manual_exposure=manual_exposure,
-                        exposure_value=exposure_value
-                    )
-                else:
-                    # Fallback for direct camera manipulation
-                        if hasattr(thread, 'cap') and thread.cap:
-                        if manual_focus:
-                                thread.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)  # Disable autofocus
-                                thread.cap.set(cv2.CAP_PROP_FOCUS, focus_value)
-                        else:
-                                thread.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)  # Enable autofocus
-                        
-                        if manual_exposure:
-                                thread.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Magic value for manual
-                                thread.cap.set(cv2.CAP_PROP_EXPOSURE, exposure_value)
-                        else:
-                                thread.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)  # Magic value for auto
-                
-        except Exception as e:
-            print(f"Error applying camera focus/exposure: {str(e)}")
-            import traceback
-            traceback.print_exc()
+        # Forward to camera controller which now handles per-slot settings and saving
+        if hasattr(self, 'camera_controller'):
+            self.camera_controller.apply_camera_settings()
     
     def connect_camera(self):
         """Connect to a camera"""
@@ -91,23 +42,18 @@ def setup_ui(main_window):
             
         # Forward to the controller
         if self.camera_connect_btn.text() == "Connect":
-            # Get settings from the settings tab
-            camera_id = self.camera_id.currentIndex()
+            # Check if replay is active with video - if so, stop replay video first
+            if hasattr(self, 'replay_mode_enabled') and self.replay_mode_enabled:
+                if hasattr(self, 'replay_active_video_path') and self.replay_active_video_path:
+                    # Replay video is active - clear it before connecting camera
+                    if hasattr(self, '_clear_replay_video'):
+                        self._clear_replay_video()
             
-            # Get resolution and fps from the settings tab
-            resolution = self.camera_resolution.currentText()
-            fps = int(self.camera_framerate.currentText())
-            
-            # Update the settings values
-            self.settings.setValue("camera/default_camera", str(camera_id))
-            self.settings.setValue("camera/resolution", resolution)
-            self.settings.setValue("camera/fps", str(fps))
-            
-            # Connect to the camera
+            # Connect to the camera (controller handles slot-specific settings)
             self.camera_controller.toggle_camera()
             
             # Apply focus and exposure settings after connection
-            if self.camera_controller.is_connected:
+            if any(self.camera_controller.is_connected):
                 self.apply_camera_focus_exposure()
         else:
             # Disconnect the camera

@@ -144,7 +144,9 @@ class CameraController(QObject):
                 "exposure_value": 0,
                 "motion_enabled": False,
                 "motion_sensitivity": 20,
-                "motion_min_area": 500
+                "motion_min_area": 500,
+                "auto_connect": False,
+                "audio_device": -1
             } 
             for _ in range(4)
         ]
@@ -178,8 +180,16 @@ class CameraController(QObject):
         self.event_clear_timer.timeout.connect(self._clear_automation_events)
         self.event_clear_timer.setSingleShot(True)
         
+        # Timer for updating FPS display
+        self.fps_update_timer = QTimer()
+        self.fps_update_timer.timeout.connect(self._update_fps_display)
+        self.fps_update_timer.start(1000) # Update once per second
+        
         # Track previous motion detection state for edge detection
         self._last_motion_detected = False
+        
+        # Flag to prevent saving settings before they are loaded during initialization
+        self._initialized = False
         
         # Timer for NDI source discovery
         self.ndi_discovery_timer = QTimer()
@@ -221,6 +231,17 @@ class CameraController(QObject):
         
         self.logger.log("Camera controller initialized")
         
+    def _update_fps_display(self):
+        """Update the actual vs target FPS label in the UI"""
+        idx = self.active_camera_index
+        if hasattr(self.main_window, 'camera_fps_display'):
+            actual = 0.0
+            if self.camera_threads[idx] and self.is_connected[idx]:
+                actual = self.camera_threads[idx].get_actual_fps()
+            
+            target = float(self.camera_configs[idx].get("fps", 30.0))
+            self.main_window.camera_fps_display.setText(f"{actual:.1f} / {target:.1f} FPS")
+
     def _update_run_metadata(self, updates: dict):
         """Merge video-related metadata into the current run record."""
         if not updates:
@@ -418,41 +439,81 @@ class CameraController(QObject):
         try:
             print("CameraController: init_camera starting...")
             
-            # Load initial settings from QSettings into camera_configs[0]
+            # Load initial settings from QSettings into all camera slots
             if hasattr(self.main_window, 'settings'):
                 settings = self.main_window.settings
-                idx = 0 # Default slot
                 
-                # Try to get the saved camera ID/index
-                try:
-                    saved_source = settings.value("camera/default_camera")
-                    if saved_source is not None:
-                        # If it's a number (local camera index)
-                        if str(saved_source).isdigit():
-                            self.camera_configs[idx]["source"] = int(saved_source)
-                        else:
-                            # It might be an NDI source name
-                            self.camera_configs[idx]["source"] = str(saved_source)
-                except:
-                    pass
-                
-                self.camera_configs[idx]["resolution"] = settings.value("camera/resolution", "1280x720")
-                try:
-                    self.camera_configs[idx]["fps"] = int(settings.value("camera/fps", "30"))
-                except:
-                    pass
-                
-                self.camera_configs[idx]["manual_focus"] = settings.value("camera/manual_focus", "false").lower() == "true"
-                try:
-                    self.camera_configs[idx]["focus_value"] = int(settings.value("camera/focus_value", "0"))
-                except:
-                    pass
+                # Helper to get boolean values safely from QSettings
+                def get_bool_setting(key, default="false"):
+                    val = settings.value(key, default)
+                    if isinstance(val, bool):
+                        return val
+                    return str(val).lower() == "true"
+
+                for idx in range(4):
+                    # For slot 0, we can fall back to legacy keys for compatibility
+                    prefix = f"camera_{idx}/" if idx > 0 else "camera/"
                     
-                self.camera_configs[idx]["manual_exposure"] = settings.value("camera/manual_exposure", "false").lower() == "true"
-                try:
-                    self.camera_configs[idx]["exposure_value"] = int(settings.value("camera/exposure_value", "0"))
-                except:
-                    pass
+                    # Source
+                    saved_source = settings.value(f"{prefix}default_camera")
+                    if saved_source is not None:
+                        # Try to parse as int if it's a digit string
+                        if isinstance(saved_source, str) and saved_source.isdigit():
+                            self.camera_configs[idx]["source"] = int(saved_source)
+                        # Or if it's already an int (some versions of QSettings return the type)
+                        elif isinstance(saved_source, int):
+                            self.camera_configs[idx]["source"] = saved_source
+                        else:
+                            # It's likely an NDI source name (string)
+                            self.camera_configs[idx]["source"] = str(saved_source)
+                    
+                    # Mode (Local vs NDI)
+                    try:
+                        mode_val = settings.value(f"{prefix}mode", 0)
+                        self.camera_configs[idx]["mode"] = int(mode_val) if mode_val is not None else 0
+                    except: pass
+
+                    # Resolution & FPS
+                    self.camera_configs[idx]["resolution"] = str(settings.value(f"{prefix}resolution", "1280x720"))
+                    try:
+                        fps_val = settings.value(f"{prefix}fps", 30)
+                        self.camera_configs[idx]["fps"] = int(fps_val) if fps_val is not None else 30
+                    except: pass
+                    
+                    # Focus & Exposure
+                    self.camera_configs[idx]["manual_focus"] = get_bool_setting(f"{prefix}manual_focus", "false")
+                    try:
+                        focus_val = settings.value(f"{prefix}focus_value", 0)
+                        self.camera_configs[idx]["focus_value"] = int(focus_val) if focus_val is not None else 0
+                    except: pass
+                        
+                    self.camera_configs[idx]["manual_exposure"] = get_bool_setting(f"{prefix}manual_exposure", "false")
+                    try:
+                        exp_val = settings.value(f"{prefix}exposure_value", 0)
+                        self.camera_configs[idx]["exposure_value"] = int(exp_val) if exp_val is not None else 0
+                    except: pass
+
+                    # Recording settings
+                    self.camera_configs[idx]["record_video"] = get_bool_setting(f"{prefix}record_video", "true")
+                    self.camera_configs[idx]["record_audio"] = get_bool_setting(f"{prefix}record_audio", "false")
+                    try:
+                        audio_val = settings.value(f"{prefix}audio_device", -1)
+                        self.camera_configs[idx]["audio_device"] = int(audio_val) if audio_val is not None else -1
+                    except: pass
+                    
+                    # Auto-connect
+                    self.camera_configs[idx]["auto_connect"] = get_bool_setting(f"{prefix}auto_connect", "false")
+                    
+                    # Motion settings
+                    self.camera_configs[idx]["motion_enabled"] = get_bool_setting(f"{prefix}motion_enabled", "false")
+                    try:
+                        sens_val = settings.value(f"{prefix}motion_sensitivity", 20)
+                        self.camera_configs[idx]["motion_sensitivity"] = int(sens_val) if sens_val is not None else 20
+                    except: pass
+                    try:
+                        area_val = settings.value(f"{prefix}motion_min_area", 500)
+                        self.camera_configs[idx]["motion_min_area"] = int(area_val) if area_val is not None else 500
+                    except: pass
 
             self.refresh_camera_list()
             self.refresh_audio_devices()
@@ -461,13 +522,68 @@ class CameraController(QObject):
             # Set initial visibility (usually Projects tab)
             self.update_visibility("Projects")
             
+            # Sync the UI with the first slot initially
+            self.refresh_settings_ui()
+            
             QTimer.singleShot(500, self.refresh_camera_list)
             print("CameraController: init_camera routine complete.")
+            self._initialized = True
             return True
         except Exception as e:
             print(f"CameraController: Error in init_camera: {e}")
             traceback.print_exc()
             return False
+
+    def save_camera_settings(self, index):
+        """Save settings for a specific camera slot to persistent storage"""
+        if not hasattr(self.main_window, 'settings'):
+            return
+            
+        # Don't save if we're still initializing to avoid overwriting valid settings with defaults
+        if not getattr(self, '_initialized', False):
+            return
+            
+        settings = self.main_window.settings
+        config = self.camera_configs[index]
+        prefix = f"camera_{index}/" if index > 0 else "camera/"
+        
+        try:
+            # Source & Mode
+            source = config.get("source")
+            if source is not None:
+                settings.setValue(f"{prefix}default_camera", source)
+            
+            settings.setValue(f"{prefix}mode", config.get("mode", 0))
+            
+            # Resolution & FPS
+            settings.setValue(f"{prefix}resolution", config.get("resolution", "1280x720"))
+            settings.setValue(f"{prefix}fps", config.get("fps", 30))
+            
+            # Focus & Exposure
+            settings.setValue(f"{prefix}manual_focus", "true" if config.get("manual_focus") else "false")
+            settings.setValue(f"{prefix}focus_value", config.get("focus_value", 0))
+            settings.setValue(f"{prefix}manual_exposure", "true" if config.get("manual_exposure") else "false")
+            settings.setValue(f"{prefix}exposure_value", config.get("exposure_value", 0))
+            
+            # Recording settings
+            settings.setValue(f"{prefix}record_video", "true" if config.get("record_video") else "false")
+            settings.setValue(f"{prefix}record_audio", "true" if config.get("record_audio") else "false")
+            settings.setValue(f"{prefix}audio_device", config.get("audio_device", -1))
+            
+            # Auto-connect
+            settings.setValue(f"{prefix}auto_connect", "true" if config.get("auto_connect") else "false")
+            
+            # Motion settings
+            settings.setValue(f"{prefix}motion_enabled", "true" if config.get("motion_enabled") else "false")
+            settings.setValue(f"{prefix}motion_sensitivity", config.get("motion_sensitivity", 20))
+            settings.setValue(f"{prefix}motion_min_area", config.get("motion_min_area", 500))
+            
+            # Ensure settings are flushed to disk
+            if hasattr(settings, 'sync'):
+                settings.sync()
+                
+        except Exception as e:
+            self.logger.log(f"Error saving camera settings for slot {index}: {e}", "ERROR")
 
     def refresh_audio_devices(self):
         """Populate the audio device dropdown"""
@@ -489,12 +605,83 @@ class CameraController(QObject):
             self.disconnect_camera(idx)
             self.reconnect_camera_buttons()
     
-    def _handle_camera_mode_changed(self, index):
-        """Handle change in camera mode (Local vs NDI)."""
-        # Update config for the active slot
-        self.camera_configs[self.active_camera_index]["mode"] = index
+    def _handle_camera_source_changed(self):
+        idx = self.active_camera_index
+        if self.camera_select:
+            # IMPORTANT: Ignore changes during dropdown clearing or if no valid data
+            if self.camera_select.currentIndex() < 0:
+                return
+                
+            source = self.camera_select.currentData()
+            # Don't overwrite with None (can happen during list refreshes)
+            if source is None:
+                return
+                
+            # Only save if it's a real change to avoid wiping valid settings
+            if self.camera_configs[idx]["source"] != source:
+                self.camera_configs[idx]["source"] = source
+                self.save_camera_settings(idx)
+
+    def _handle_camera_res_fps_changed(self):
+        idx = self.active_camera_index
+        changed = False
         
-        self.refresh_camera_list()
+        # Only save if we are not in the middle of a list refresh
+        if hasattr(self.main_window, 'camera_resolution') and self.main_window.camera_resolution.currentIndex() >= 0:
+            new_res = self.main_window.camera_resolution.currentText()
+            if self.camera_configs[idx].get("resolution") != new_res:
+                self.camera_configs[idx]["resolution"] = new_res
+                changed = True
+                
+        if hasattr(self.main_window, 'camera_framerate') and self.main_window.camera_framerate.currentIndex() >= 0:
+            fps_text = self.main_window.camera_framerate.currentText()
+            if fps_text and fps_text.isdigit():
+                new_fps = int(fps_text)
+                if self.camera_configs[idx].get("fps") != new_fps:
+                    self.camera_configs[idx]["fps"] = new_fps
+                    changed = True
+                    
+        if changed:
+            self.save_camera_settings(idx)
+            self._update_fps_display() # Update UI immediately to show new target FPS
+
+    def _handle_record_audio_toggled(self, checked):
+        idx = self.active_camera_index
+        if self.camera_configs[idx].get("record_audio") != checked:
+            self.camera_configs[idx]["record_audio"] = checked
+            self.save_camera_settings(idx)
+
+    def _handle_auto_connect_toggled(self, checked):
+        idx = self.active_camera_index
+        # Only save if the value actually changed
+        if self.camera_configs[idx].get("auto_connect") == checked:
+            return
+            
+        self.camera_configs[idx]["auto_connect"] = checked
+        self.save_camera_settings(idx)
+
+    def _handle_audio_device_changed(self):
+        idx = self.active_camera_index
+        if hasattr(self.main_window, 'camera_audio_device'):
+            new_device = self.main_window.camera_audio_device.currentData()
+            if self.camera_configs[idx].get("audio_device") != new_device:
+                self.camera_configs[idx]["audio_device"] = new_device
+                self.save_camera_settings(idx)
+
+    def _handle_camera_mode_changed(self, index, refresh_list=True):
+        """Handle change in camera mode (Local vs NDI)."""
+        idx = self.active_camera_index
+        
+        # Only proceed if there's an actual change to avoid overwriting settings during init
+        old_mode = self.camera_configs[idx].get("mode")
+        self.camera_configs[idx]["mode"] = index
+        
+        # Only save if the mode actually changed
+        if old_mode != index:
+            self.save_camera_settings(idx)
+        
+        if refresh_list:
+            self.refresh_camera_list()
         
         # Show/Hide resolution fields based on mode (NDI handles resolution automatically)
         is_ndi = (index == 1)
@@ -515,6 +702,8 @@ class CameraController(QObject):
     def refresh_camera_list(self):
         """Populate the camera selection dropdown"""
         if self.camera_select is None: return
+        
+        self.camera_select.blockSignals(True)
         self.camera_select.clear()
         
         is_ndi = False
@@ -522,6 +711,7 @@ class CameraController(QObject):
             
         if is_ndi:
             self.camera_select.addItem("Searching for NDI sources...")
+            self.camera_select.blockSignals(False)
             if NDI_AVAILABLE: self.discover_ndi_sources()
         else:
             try:
@@ -532,6 +722,9 @@ class CameraController(QObject):
                     self.camera_select.addItem(f"Camera {i}", i)
             except Exception as e:
                 for i in range(10): self.camera_select.addItem(f"Camera {i}", i)
+            self.camera_select.blockSignals(False)
+            # Resync selection after list update
+            self.refresh_settings_ui()
 
     def discover_ndi_sources(self):
         """Discover NDI sources on the network and update UI."""
@@ -551,10 +744,14 @@ class CameraController(QObject):
             
             # If we were searching and found something, clear and update
             if "Searching" in current_text or current_count <= 1:
+                self.camera_select.blockSignals(True)
                 self.camera_select.clear()
                 for s in sources:
                     name = getattr(s, 'ndi_name', str(s))
                     self.camera_select.addItem(name, s)
+                self.camera_select.blockSignals(False)
+                # Sync selection after loading NDI sources
+                self.refresh_settings_ui()
             else:
                 # Update list while preserving selection if possible
                 selected_name = current_text
@@ -672,6 +869,11 @@ class CameraController(QObject):
         
         # print(f"Updating visibility for tab: {self._current_tab}")
         
+        # Get run state from main window if available
+        is_running = False
+        if hasattr(self, 'main_window'):
+            is_running = getattr(self.main_window, 'running', False)
+
         for i in range(4):
             if not self.camera_threads[i]:
                 continue
@@ -687,16 +889,21 @@ class CameraController(QObject):
                 else:
                     p_mode = "thumbnail" # Thumbnail
             
-            # Dashboard Tab: 
-            elif self._current_tab == "Dashboard":
+            # Dashboard Tab OR Automation Tab (if running): 
+            # We allow dashboard processing on Automation tab so it's ready when switching
+            elif self._current_tab in ["Dashboard", "Automation"]:
                 if i in self.dashboard_slots and self.show_on_dashboard:
                     is_visible = True
                     p_mode = "dashboard" # Dashboard cams
             
-            # Other tabs: nothing is visible
+            # Other tabs: nothing is visible unless we are running and it's a dashboard cam
             else:
-                is_visible = False
-                p_mode = "none"
+                if is_running and i in self.dashboard_slots and self.show_on_dashboard:
+                    is_visible = True
+                    p_mode = "dashboard"
+                else:
+                    is_visible = False
+                    p_mode = "none"
                 
             self.camera_threads[i].set_visible(is_visible)
             if hasattr(self.camera_threads[i], 'preview_mode'):
@@ -785,6 +992,42 @@ class CameraController(QObject):
             self.camera_connect_btn.setStyleSheet(ButtonStyles.danger("small") if connected else ButtonStyles.success("small"))
             self.camera_select.setEnabled(not connected)
         
+        # --- AUTO-ACTIVATE FIRST CAMERA ---
+        if connected:
+            # 1. If this is the only connected camera, make it the main view
+            if sum(1 for c in self.is_connected if c) == 1:
+                self.main_view_index = index
+                print(f"[Camera] Auto-activated Camera {index+1} as main view")
+            
+            # 2. Automatically assign this camera to the first empty dashboard slot
+            if hasattr(self.main_window, 'dashboard_camera_checkboxes'):
+                # Check if this camera is already assigned to any dashboard slot
+                is_assigned = index in self.dashboard_slots
+                if not is_assigned:
+                    # Find first free slot (-1)
+                    for slot_idx, cam_idx in enumerate(self.dashboard_slots):
+                        if cam_idx == -1:
+                            if slot_idx < len(self.main_window.dashboard_camera_checkboxes):
+                                cb = self.main_window.dashboard_camera_checkboxes[slot_idx]
+                                # Check if already checked (manual sync check)
+                                if not cb.isChecked():
+                                    cb.blockSignals(True)
+                                    cb.setChecked(True)
+                                    cb.blockSignals(False)
+                                
+                                # Update our internal tracking
+                                self.dashboard_slots[slot_idx] = index
+                                
+                                # Trigger UI update for the dashboard row visibility
+                                if hasattr(self.main_window, 'switch_dashboard_camera_source'):
+                                    self.main_window.switch_dashboard_camera_source(slot_idx)
+                                    print(f"[Camera] Auto-assigned Camera {index+1} to dashboard slot {slot_idx+1}")
+                            break
+            
+            # Force style refresh to show green border for active camera
+            self.update_camera_display()
+        # -----------------------------------
+
         any_connected = any(self.is_connected)
         if hasattr(self.main_window, 'record_btn'): 
             self.main_window.record_btn.setEnabled(any_connected)
@@ -802,7 +1045,8 @@ class CameraController(QObject):
         if index >= 4: return
         
         # Performance: Skip everything if no relevant tab is active
-        if self._current_tab not in ["Camera", "Dashboard"]:
+        # We now include "Automation" so previews are ready when switching to Dashboard
+        if self._current_tab not in ["Camera", "Dashboard", "Automation"]:
             return
 
         # Convert QImage to QPixmap in the GUI thread
@@ -813,10 +1057,10 @@ class CameraController(QObject):
         self.current_frames[index] = pixmap
         self._frame_skips[index] += 1
         
-        # 1. Main View (Large Preview) - ONLY if on Camera Tab
+        # 1. Camera Tab View
         if self._current_tab == "Camera":
+            # Active large view
             if index == self.main_view_index and self.camera_label:
-                # Active large view
                 scaled = pixmap.scaled(self.camera_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
                 if self.is_recording[index]:
                     p = QPainter(scaled)
@@ -825,13 +1069,17 @@ class CameraController(QObject):
                     p.end()
                 self.camera_label.setPixmap(scaled)
             
-            # Thumbnails: Thread already throttles these to 5 FPS
-            elif hasattr(self.main_window, 'camera_preview_labels') and index < len(self.main_window.camera_preview_labels):
+            # ALWAYS update thumbnails on Camera tab, even for the active camera
+            if hasattr(self.main_window, 'camera_preview_labels') and index < len(self.main_window.camera_preview_labels):
                 lbl = self.main_window.camera_preview_labels[index]
+                # PERFORMANCE FIX: Don't call setStyleSheet every frame. 
+                # Styles are now handled in update_camera_display/set_main_view.
                 lbl.setPixmap(pixmap.scaled(lbl.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation))
 
-        # 2. Dashboard View - ONLY if on Dashboard Tab
-        elif self._current_tab == "Dashboard" and self.show_on_dashboard:
+        # 2. Dashboard View - if on Dashboard/Automation Tab OR if a run is active
+        # We update dashboard cams in the background during a run so they are ready
+        is_running = hasattr(self.main_window, 'running') and self.main_window.running
+        if (self._current_tab in ["Dashboard", "Automation"] or is_running) and self.show_on_dashboard:
             # Check if this index is actually one of the dashboard slots
             if index in self.dashboard_slots:
                 # Find which slot it occupies
@@ -845,6 +1093,13 @@ class CameraController(QObject):
                         
                         if lbl:
                             lbl.setPixmap(pixmap)
+            
+            # --- AUTO-FALLBACK: Show active camera if dashboard is empty ---
+            elif all(s == -1 for s in self.dashboard_slots) and index == self.main_view_index:
+                if hasattr(self.main_window, 'dashboard_camera_labels') and len(self.main_window.dashboard_camera_labels) > 0:
+                    lbl = self.main_window.dashboard_camera_labels[0]
+                    if lbl: lbl.setPixmap(pixmap)
+            # -------------------------------------------------------------
 
     @pyqtSlot(int, bool)
     def handle_recording_status(self, index, is_recording):
@@ -944,7 +1199,7 @@ class CameraController(QObject):
             try: self.camera_select.currentIndexChanged.disconnect()
             except: pass
             self.camera_select.currentIndexChanged.connect(
-                lambda: self.camera_configs[self.active_camera_index].update({"source": self.camera_select.currentData()})
+                self._handle_camera_source_changed
             )
         
         # Connect adjust tab signals
@@ -969,13 +1224,17 @@ class CameraController(QObject):
             self.main_window.camera_tab_exposure_slider.valueChanged.connect(lambda: self.apply_camera_settings())
         
         if hasattr(self.main_window, 'camera_resolution'):
+            try: self.main_window.camera_resolution.currentIndexChanged.disconnect()
+            except: pass
             self.main_window.camera_resolution.currentIndexChanged.connect(
-                lambda: self.camera_configs[self.active_camera_index].update({"resolution": self.main_window.camera_resolution.currentText()})
+                self._handle_camera_res_fps_changed
             )
         
         if hasattr(self.main_window, 'camera_framerate'):
+            try: self.main_window.camera_framerate.currentIndexChanged.disconnect()
+            except: pass
             self.main_window.camera_framerate.currentIndexChanged.connect(
-                lambda: self.camera_configs[self.active_camera_index].update({"fps": int(self.main_window.camera_framerate.currentText())})
+                self._handle_camera_res_fps_changed
             )
 
         if hasattr(self.main_window, 'camera_mode'):
@@ -984,23 +1243,42 @@ class CameraController(QObject):
             self.main_window.camera_mode.currentIndexChanged.connect(self._handle_camera_mode_changed)
 
         if self.motion_enabled_widget:
+            try: self.motion_enabled_widget.stateChanged.disconnect()
+            except: pass
             self.motion_enabled_widget.stateChanged.connect(lambda state: self._handle_motion_enabled_changed(self.active_camera_index, state == 2))
         if self.motion_sensitivity_widget:
+            try: self.motion_sensitivity_widget.valueChanged.disconnect()
+            except: pass
             self.motion_sensitivity_widget.valueChanged.connect(self._handle_motion_settings_changed)
         if self.motion_min_area_widget:
+            try: self.motion_min_area_widget.valueChanged.disconnect()
+            except: pass
             self.motion_min_area_widget.valueChanged.connect(self._handle_motion_settings_changed)
         
         # Connect recording toggles
         if hasattr(self.main_window, 'record_video_checkbox'):
+            try: self.main_window.record_video_checkbox.toggled.disconnect()
+            except: pass
             self.main_window.record_video_checkbox.toggled.connect(self._handle_record_video_toggled)
         if hasattr(self.main_window, 'record_audio_checkbox'):
+            try: self.main_window.record_audio_checkbox.toggled.disconnect()
+            except: pass
             self.main_window.record_audio_checkbox.toggled.connect(
-                lambda checked: self.camera_configs[self.active_camera_index].update({"record_audio": checked})
+                self._handle_record_audio_toggled
             )
         
+        if hasattr(self.main_window, 'camera_auto_connect_checkbox'):
+            try: self.main_window.camera_auto_connect_checkbox.toggled.disconnect()
+            except: pass
+            self.main_window.camera_auto_connect_checkbox.toggled.connect(
+                self._handle_auto_connect_toggled
+            )
+
         if hasattr(self.main_window, 'camera_audio_device'):
+            try: self.main_window.camera_audio_device.currentIndexChanged.disconnect()
+            except: pass
             self.main_window.camera_audio_device.currentIndexChanged.connect(
-                lambda: self.camera_configs[self.active_camera_index].update({"audio_device": self.main_window.camera_audio_device.currentData()})
+                self._handle_audio_device_changed
             )
 
         if hasattr(self.main_window, 'overlay_selector'):
@@ -1344,6 +1622,9 @@ class CameraController(QObject):
                 if hasattr(self.main_window, 'camera_tab_exposure_value'):
                     self.main_window.camera_tab_exposure_value.setText(str(exposure_value))
 
+            # Save the updated settings for this slot
+            self.save_camera_settings(idx)
+
             # Debounce hardware settings application to keep UI responsive
             if not hasattr(self, '_cam_apply_timer'):
                 from PyQt6.QtCore import QTimer
@@ -1496,7 +1777,10 @@ class CameraController(QObject):
         return self.current_frames[index]
 
     def set_main_view(self, index):
-        if 0 <= index < 4: self.main_view_index = index; self.update_camera_display()
+        if 0 <= index < 4: 
+            self.main_view_index = index
+            self._refresh_camera_styles()
+            self.update_camera_display()
 
     def set_active_config_slot(self, index):
         if 0 <= index < 4: 
@@ -1505,6 +1789,7 @@ class CameraController(QObject):
             self.selected_overlay = self.overlays[index][0] if self.overlays[index] else None
             
             self.refresh_settings_ui()
+            self._update_fps_display() # Update FPS display immediately for the new slot
 
     def refresh_settings_ui(self):
         idx = self.active_camera_index
@@ -1513,12 +1798,24 @@ class CameraController(QObject):
             self.main_window.camera_mode.blockSignals(True)
             self.main_window.camera_mode.setCurrentIndex(self.camera_configs[idx].get("mode", 0))
             self.main_window.camera_mode.blockSignals(False)
-            # Ensure visibility of mode-specific fields is updated
-            self._handle_camera_mode_changed(self.camera_configs[idx].get("mode", 0))
+            # Ensure visibility of mode-specific fields is updated (without triggering recursion)
+            self._handle_camera_mode_changed(self.camera_configs[idx].get("mode", 0), refresh_list=False)
 
         if self.camera_select:
-            source_idx = self.camera_select.findData(self.camera_configs[idx]["source"])
-            if source_idx >= 0: self.camera_select.setCurrentIndex(source_idx)
+            source = self.camera_configs[idx]["source"]
+            source_idx = self.camera_select.findData(source)
+            
+            # Type-robust matching: try both int and string if it's a digit
+            if source_idx < 0 and source is not None:
+                if isinstance(source, str) and source.isdigit():
+                    source_idx = self.camera_select.findData(int(source))
+                elif isinstance(source, int):
+                    source_idx = self.camera_select.findData(str(source))
+            
+            if source_idx >= 0: 
+                self.camera_select.blockSignals(True)
+                self.camera_select.setCurrentIndex(source_idx)
+                self.camera_select.blockSignals(False)
         
         # Update connection button for this slot
         if self.camera_connect_btn:
@@ -1549,6 +1846,11 @@ class CameraController(QObject):
             if audio_idx >= 0: self.main_window.camera_audio_device.setCurrentIndex(audio_idx)
             self.main_window.camera_audio_device.blockSignals(False)
             
+        if hasattr(self.main_window, 'camera_auto_connect_checkbox'):
+            self.main_window.camera_auto_connect_checkbox.blockSignals(True)
+            self.main_window.camera_auto_connect_checkbox.setChecked(self.camera_configs[idx].get("auto_connect", False))
+            self.main_window.camera_auto_connect_checkbox.blockSignals(False)
+
         if hasattr(self.main_window, 'camera_resolution'):
             self.main_window.camera_resolution.blockSignals(True)
             self.main_window.camera_resolution.setCurrentText(self.camera_configs[idx].get("resolution", "1280x720"))
@@ -1592,19 +1894,38 @@ class CameraController(QObject):
 
     def update_camera_display(self):
         if not self.camera_label: return
+        self._refresh_camera_styles()
         for i in range(4):
             pix = self.current_frames[i]
+            # 1. Main View
             if i == self.main_view_index:
                 if pix: self.camera_label.setPixmap(pix.scaled(self.camera_label.size(), Qt.AspectRatioMode.KeepAspectRatio))
                 else: self.camera_label.setText(f"Cam {i+1} disconnected")
+            
+            # 2. Thumbnails
             if hasattr(self.main_window, 'camera_preview_labels') and i < len(self.main_window.camera_preview_labels):
                 lbl = self.main_window.camera_preview_labels[i]
                 if pix: lbl.setPixmap(pix.scaled(lbl.size(), Qt.AspectRatioMode.KeepAspectRatio))
                 else: lbl.setText(f"C{i+1}")
-                # Maintain the cursor and other styles while updating the border
-                border_color = "#4CAF50" if i == self.main_view_index else "#333"
-                lbl.setStyleSheet(f"background: black; color: white; border: 2px solid {border_color};")
-                lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+            
+            # 3. Dashboard Labels - Always update these if we have frames
+            if pix and hasattr(self.main_window, 'dashboard_camera_labels'):
+                # Find if this camera is in a dashboard slot
+                for slot_idx, cam_idx in enumerate(self.dashboard_slots):
+                    if cam_idx == i and slot_idx < len(self.main_window.dashboard_camera_labels):
+                        lbl = self.main_window.dashboard_camera_labels[slot_idx]
+                        if lbl:
+                            lbl.setPixmap(pix)
+
+    def _refresh_camera_styles(self):
+        """Update borders and selection styles for camera thumbnails"""
+        if not hasattr(self.main_window, 'camera_preview_labels'):
+            return
+            
+        for i, lbl in enumerate(self.main_window.camera_preview_labels):
+            border_color = "#4CAF50" if i == self.main_view_index else "#333"
+            lbl.setStyleSheet(f"background: black; color: white; border: 2px solid {border_color};")
+            lbl.setCursor(Qt.CursorShape.PointingHandCursor)
     
     def handle_motion_detection_state(self, state):
         idx = self.active_camera_index
@@ -1615,6 +1936,7 @@ class CameraController(QObject):
         """Handle manual toggle of the record video checkbox"""
         index = self.active_camera_index
         self.camera_configs[index]["record_video"] = checked
+        self.save_camera_settings(index)
         
         # If a run is active, we should start or stop recording for this camera
         is_run_active = getattr(self.main_window, 'running', False)
@@ -1657,6 +1979,7 @@ class CameraController(QObject):
     @pyqtSlot(int, bool)
     def _handle_motion_enabled_changed(self, index, state):
         self.camera_configs[index]["motion_enabled"] = state
+        self.save_camera_settings(index)
         if self.camera_threads[index]: self.camera_threads[index].set_motion_detection_enabled(state)
 
     @pyqtSlot()
@@ -1666,6 +1989,7 @@ class CameraController(QObject):
         min_area = self.motion_min_area_widget.value()
         self.camera_configs[idx]["motion_sensitivity"] = sensitivity
         self.camera_configs[idx]["motion_min_area"] = min_area
+        self.save_camera_settings(idx)
         if self.camera_threads[idx]:
             self.camera_threads[idx].update_motion_detection_settings(sensitivity, min_area)
 
