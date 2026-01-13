@@ -2268,7 +2268,11 @@ def setup_ui(self):
                     
                     schema = getattr(cls, 'CONFIG_SCHEMA', {})
                     for field in schema:
-                        val = self.settings.value(f"{settings_key}_{field}")
+                        try:
+                            val = self.settings.value(f"{settings_key}_{field}", None)
+                        except (TypeError, Exception):
+                            val = None
+                            
                         if val is not None:
                             current_config[field] = val
                     

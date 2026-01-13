@@ -455,7 +455,11 @@ class CameraController(QObject):
                     prefix = f"camera_{idx}/" if idx > 0 else "camera/"
                     
                     # Source
-                    saved_source = settings.value(f"{prefix}default_camera")
+                    try:
+                        saved_source = settings.value(f"{prefix}default_camera", None)
+                    except (TypeError, Exception):
+                        saved_source = None
+                        
                     if saved_source is not None:
                         # Try to parse as int if it's a digit string
                         if isinstance(saved_source, str) and saved_source.isdigit():

@@ -2307,7 +2307,11 @@ class DataCollectionController(QObject):
                 settings_key = device_type.lower().replace(" ", "_")
                 schema = getattr(interface_class, "CONFIG_SCHEMA", {})
                 for key, field_cfg in schema.items():
-                    val = self.main_window.settings.value(f"{settings_key}_{key}")
+                    try:
+                        val = self.main_window.settings.value(f"{settings_key}_{key}", None)
+                    except (TypeError, Exception):
+                        val = None
+                        
                     if val is not None:
                         # Convert type if needed
                         if field_cfg.get("type") == "number":

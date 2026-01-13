@@ -1249,7 +1249,11 @@ class SensorController(QObject):
                 field_widget = self._create_ui_field(key, config, interface_class)
                 
                 # Try to set current value from QSettings (the source of truth for interfaces)
-                saved_val = self.main_window.settings.value(f"{settings_key}_{key}")
+                try:
+                    saved_val = self.main_window.settings.value(f"{settings_key}_{key}", None)
+                except (TypeError, Exception):
+                    saved_val = None
+                    
                 if saved_val is not None:
                     if isinstance(field_widget, QLineEdit):
                         field_widget.setText(str(saved_val))
