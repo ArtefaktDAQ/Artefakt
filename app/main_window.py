@@ -3516,7 +3516,7 @@ class DAQApp(QMainWindow):
     def show_camera_config_dialog(self, slot_idx):
         """Show a modeless dialog for camera-specific configuration"""
         if hasattr(self, 'camera_config_dialog') and self.camera_config_dialog.isVisible():
-            self.camera_config_dialog.setWindowTitle(f"Configure Camera {slot_idx + 1}")
+            self.camera_config_dialog.setWindowTitle(f"Configure Cam {slot_idx + 1}")
             self.camera_config_dialog.raise_()
             self.camera_config_dialog.activateWindow()
             return
@@ -3524,7 +3524,7 @@ class DAQApp(QMainWindow):
         dialog = QDialog(self)
         self.camera_config_dialog = dialog
         dialog.setObjectName("camera_config_dialog")
-        dialog.setWindowTitle(f"Configure Camera {slot_idx + 1}")
+        dialog.setWindowTitle(f"Configure Cam {slot_idx + 1}")
         dialog.setMinimumWidth(450)
         dialog.setMinimumHeight(600)
         dialog.setStyleSheet(DialogStyles.dark_dialog())

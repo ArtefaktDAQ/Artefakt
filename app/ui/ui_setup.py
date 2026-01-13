@@ -1766,13 +1766,13 @@ def setup_ui(self):
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl.setStyleSheet("background: black; color: white;")
         lbl.setCursor(Qt.CursorShape.PointingHandCursor)
-        lbl.setToolTip(f"Click to view Camera {i+1}")
+        lbl.setToolTip(f"Click to view Cam {i+1}")
         # Make the preview clickable
         lbl.mousePressEvent = lambda e, idx=i: self.camera_controller.set_main_view(idx)
         slot_layout.addWidget(lbl)
         self.camera_preview_labels.append(lbl)
         
-        cfg_btn = QPushButton(f"Configure Camera {i+1}")
+        cfg_btn = QPushButton(f"Configure Cam {i+1}")
         cfg_btn.setFixedHeight(28)
         cfg_btn.setStyleSheet(camera_button_style)
         def handle_cfg_click(checked, idx=i):

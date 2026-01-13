@@ -268,7 +268,7 @@ class OpticalSensorTool(QWidget):
             return
 
         for cam_id in available:
-            self.camera_combo.addItem(f"Camera {cam_id}", cam_id)
+            self.camera_combo.addItem(f"Camera index {cam_id}", cam_id)
 
         if current is not None:
             idx = self.camera_combo.findData(current)

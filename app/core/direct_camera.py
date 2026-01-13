@@ -241,7 +241,7 @@ class DirectCameraThread(QThread):
             traceback.print_exc()
             return False
     
-    def connect(self, camera_id, resolution, fps):
+    def connect(self, camera_id, resolution, fps, is_ndi=False):
         """Setup connection parameters and start background thread for asynchronous connection."""
         try:
             # If already running, stop it first to ensure a clean reconnect
@@ -255,25 +255,35 @@ class DirectCameraThread(QThread):
             self.cap = None
             self.ndi_receiver = None
             
-            print(f"Queueing connection to camera {camera_id} with resolution {resolution} at {fps} FPS")
+            print(f"Queueing connection to camera {camera_id} (is_ndi={is_ndi}) with resolution {resolution} at {fps} FPS")
             
             # Parse and store settings for the background thread
             # Handle NDI source which might be a special string or object
-            self.is_ndi = False
+            self.is_ndi = is_ndi
             self.ndi_source_obj = None
             
-            if isinstance(camera_id, str) and camera_id.startswith("NDI:"):
-                self.is_ndi = True
-                self.camera_id = camera_id
-            elif hasattr(camera_id, 'ndi_name'): # It's likely an NDI Source object
-                self.is_ndi = True
-                self.camera_id = getattr(camera_id, 'ndi_name', str(camera_id))
-                self.ndi_source_obj = camera_id
+            if is_ndi:
+                if hasattr(camera_id, 'ndi_name'): # It's an NDI Source object
+                    self.camera_id = getattr(camera_id, 'ndi_name', str(camera_id))
+                    self.ndi_source_obj = camera_id
+                elif isinstance(camera_id, str):
+                    if camera_id.startswith("NDI:"):
+                        self.camera_id = camera_id[4:]
+                    else:
+                        self.camera_id = camera_id
+                else:
+                    self.camera_id = str(camera_id)
+                print(f"Connecting to NDI: {self.camera_id}")
             else:
+                # Local camera
                 try:
-                    self.camera_id = int(camera_id)
+                    # Strip any prefix if it accidentally leaked in
+                    cid_str = str(camera_id)
+                    if cid_str.startswith("NDI:"): cid_str = cid_str[4:]
+                    self.camera_id = int(cid_str)
                 except (ValueError, TypeError):
                     self.camera_id = 0
+                print(f"Connecting to Local Camera: {self.camera_id}")
             
             self.fps = int(fps)
             if isinstance(resolution, str) and 'x' in resolution:

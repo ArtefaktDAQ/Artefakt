@@ -1477,7 +1477,7 @@ class OpticalSensorAddDialog(QDialog):
         self.camera_combo = QComboBox()
         if self.available_cameras:
             for cam_id in self.available_cameras:
-                self.camera_combo.addItem(f"Camera {cam_id}", cam_id)
+                self.camera_combo.addItem(f"Camera index {cam_id}", cam_id)
         else:
             self.camera_combo.addItem("No cameras available", -1)
         form_layout.addRow("Camera:", self.camera_combo)

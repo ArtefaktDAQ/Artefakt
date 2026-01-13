@@ -461,15 +461,19 @@ class CameraController(QObject):
                         saved_source = None
                         
                     if saved_source is not None:
+                        saved_str = str(saved_source)
+                        # Check if it's an NDI source string (starts with NDI:)
+                        if saved_str.startswith("NDI:"):
+                            self.camera_configs[idx]["source"] = saved_str[4:]
                         # Try to parse as int if it's a digit string
-                        if isinstance(saved_source, str) and saved_source.isdigit():
+                        elif saved_str.isdigit():
                             self.camera_configs[idx]["source"] = int(saved_source)
                         # Or if it's already an int (some versions of QSettings return the type)
                         elif isinstance(saved_source, int):
                             self.camera_configs[idx]["source"] = saved_source
                         else:
                             # It's likely an NDI source name (string)
-                            self.camera_configs[idx]["source"] = str(saved_source)
+                            self.camera_configs[idx]["source"] = saved_str
                     
                     # Mode (Local vs NDI)
                     try:
@@ -554,10 +558,30 @@ class CameraController(QObject):
         try:
             # Source & Mode
             source = config.get("source")
-            if source is not None:
-                settings.setValue(f"{prefix}default_camera", source)
+            mode = config.get("mode", 0)
             
-            settings.setValue(f"{prefix}mode", config.get("mode", 0))
+            if source is not None:
+                # Save NDI sources with a prefix to ensure they are loaded correctly as strings
+                if mode == 1:
+                    # It's an NDI source
+                    if hasattr(source, 'ndi_name'):
+                        settings.setValue(f"{prefix}default_camera", f"NDI:{source.ndi_name}")
+                    elif isinstance(source, str) and not source.startswith("NDI:"):
+                        settings.setValue(f"{prefix}default_camera", f"NDI:{source}")
+                    else:
+                        settings.setValue(f"{prefix}default_camera", str(source))
+                else:
+                    # For local cameras, ensure it's a basic type (int or str)
+                    # This prevents pickling errors if an NDI source object is still in config
+                    if hasattr(source, 'ndi_name'):
+                        # Should not happen in mode 0, but safety first
+                        settings.setValue(f"{prefix}default_camera", f"NDI:{source.ndi_name}")
+                    elif isinstance(source, (int, str, float, bool)):
+                        settings.setValue(f"{prefix}default_camera", source)
+                    else:
+                        settings.setValue(f"{prefix}default_camera", str(source))
+            
+            settings.setValue(f"{prefix}mode", mode)
             
             # Resolution & FPS
             settings.setValue(f"{prefix}resolution", config.get("resolution", "1280x720"))
@@ -622,7 +646,18 @@ class CameraController(QObject):
                 return
                 
             # Only save if it's a real change to avoid wiping valid settings
-            if self.camera_configs[idx]["source"] != source:
+            # Safe comparison to avoid TypeError with complex objects (like NDI sources)
+            current_source = self.camera_configs[idx].get("source")
+            is_different = False
+            
+            try:
+                # Basic equality check
+                is_different = (current_source != source)
+            except:
+                # If comparison fails (e.g. comparing NDI object to int), they are different
+                is_different = True
+                
+            if is_different:
                 self.camera_configs[idx]["source"] = source
                 self.save_camera_settings(idx)
 
@@ -722,10 +757,10 @@ class CameraController(QObject):
                 from PyQt6.QtMultimedia import QMediaDevices
                 devices = QMediaDevices.videoInputs()
                 for i in range(max(len(devices), 1)):
-                    name = devices[i].description() if i < len(devices) else f"Camera {i}"
-                    self.camera_select.addItem(f"Camera {i}", i)
+                    name = devices[i].description() if i < len(devices) else f"Camera index {i}"
+                    self.camera_select.addItem(f"Camera index {i}", i)
             except Exception as e:
-                for i in range(10): self.camera_select.addItem(f"Camera {i}", i)
+                for i in range(10): self.camera_select.addItem(f"Camera index {i}", i)
             self.camera_select.blockSignals(False)
             # Resync selection after list update
             self.refresh_settings_ui()
@@ -792,7 +827,15 @@ class CameraController(QObject):
                 return
 
             if self.camera_threads[index] and self.camera_threads[index].isRunning():
-                return
+                # If it's already running and connected, we're done
+                if self.is_connected[index]:
+                    return
+                else:
+                    # Thread is lingering but not connected, wait a bit for it to stop
+                    print(f"CameraController: Camera thread {index} is still lingering, waiting...")
+                    if not self.camera_threads[index].wait(1000):
+                        print(f"CameraController: Camera thread {index} failed to stop, forcing reconnect anyway.")
+                        # Proceeding anyway as connect() will handle it by stopping the thread again if needed
 
             if not self.camera_threads[index]:
                 from app.core.direct_camera import DirectCameraThread
@@ -814,7 +857,8 @@ class CameraController(QObject):
                 self.update_overlay_selector()
 
             self.camera_threads[index].set_overlays(self.overlays[index])
-            self.camera_threads[index].connect(camera_id, res, fps)
+            mode = self.camera_configs[index].get("mode", 0)
+            self.camera_threads[index].connect(camera_id, res, fps, is_ndi=(mode == 1))
             
             # Apply initial settings once connected
             if self.camera_configs[index].get("motion_enabled"):
@@ -1820,6 +1864,18 @@ class CameraController(QObject):
                 self.camera_select.blockSignals(True)
                 self.camera_select.setCurrentIndex(source_idx)
                 self.camera_select.blockSignals(False)
+            else:
+                # The saved source is not in the current list (e.g. mode changed)
+                # Update config to match the currently selected item in the dropdown
+                # but only if the dropdown actually has items and signals are not blocked
+                if self.camera_select.count() > 0:
+                    current_source = self.camera_select.currentData()
+                    if current_source is not None:
+                        # Don't save if it's just "Searching..." or empty
+                        if not (isinstance(current_source, str) and "Searching" in current_source):
+                            self.camera_configs[idx]["source"] = current_source
+                            # Note: We don't save to settings here to avoid accidental overrides
+                            # during rapid UI switching, but the internal state is now correct.
         
         # Update connection button for this slot
         if self.camera_connect_btn:
