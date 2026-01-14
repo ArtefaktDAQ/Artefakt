@@ -1448,6 +1448,12 @@ class SequenceDialog(QDialog):
         # Loop checkbox
         self.loop_checkbox = QCheckBox("Loop Sequence (Restart from beginning when complete)")
         name_layout.addRow("", self.loop_checkbox)
+
+        # Run-linked checkbox
+        self.run_linked_checkbox = QCheckBox("Link to Run (Stop automatically when run stops)")
+        self.run_linked_checkbox.setToolTip("If checked, this sequence will stop when the data acquisition is stopped. "
+                                          "If unchecked, it will continue running until manually stopped or the app is closed.")
+        name_layout.addRow("", self.run_linked_checkbox)
         
         layout.addLayout(name_layout)
         
@@ -1661,6 +1667,7 @@ class SequenceDialog(QDialog):
         """Load values from an existing sequence"""
         self.sequence_name.setText(sequence.name)
         self.loop_checkbox.setChecked(sequence.loop)
+        self.run_linked_checkbox.setChecked(getattr(sequence, 'run_linked', False))
         # Steps are already loaded in __init__
         # self.steps = sequence.steps.copy() 
         self.update_steps_table()
@@ -1676,14 +1683,17 @@ class SequenceDialog(QDialog):
              QMessageBox.warning(self, "No Steps", "Please add at least one step to the sequence.")
              return None
 
+        is_loop = self.loop_checkbox.isChecked()
+        is_run_linked = self.run_linked_checkbox.isChecked()
+
         # If we were editing an existing sequence, return the modified original
         if self.original_sequence:
              self.original_sequence.name = name
              self.original_sequence.steps = self.steps.copy()
-             self.original_sequence.loop = self.loop_checkbox.isChecked()
+             self.original_sequence.loop = is_loop
+             self.original_sequence.run_linked = is_run_linked
              return self.original_sequence
         else:
              # Otherwise, create a new sequence object
-             new_sequence = AutomationSequence(name, self.steps.copy())
-             new_sequence.loop = self.loop_checkbox.isChecked()
+             new_sequence = AutomationSequence(name, self.steps.copy(), loop=is_loop, run_linked=is_run_linked)
              return new_sequence 

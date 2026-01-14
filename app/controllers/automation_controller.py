@@ -640,23 +640,35 @@ class AutomationController(QObject):
             
         return (state, tooltip) 
         
-    def stop_all_automation(self):
+    def stop_all_automation(self, is_exiting=False):
          """Called when the application is closing or needs to stop everything."""
-         if self.dashboard_update_timer.isActive():
-             print("Temporarily stopping dashboard updates")
-             self.dashboard_update_timer.stop() # Stop dashboard updates on exit
+         if hasattr(self, 'dashboard_update_timer') and self.dashboard_update_timer.isActive():
+             if is_exiting:
+                 print("Stopping dashboard update timer for exit")
+                 self.dashboard_update_timer.stop()
+             else:
+                 print("Temporarily stopping dashboard updates")
+                 self.dashboard_update_timer.stop() 
          
          self.manager.stop_all_sequences()
          
          # Restart the timer if we're not fully closing the application
          # This is needed because stop_all_automation might be called
          # in situations other than application exit
-         if hasattr(self, 'dashboard_update_timer'):
+         if not is_exiting and hasattr(self, 'dashboard_update_timer'):
              if not self.dashboard_update_timer.isActive():
                  print("Restarting dashboard update timer")
                  self.dashboard_update_timer.start()
              else:
                  print("Dashboard timer already active")
+
+    def stop_run_linked_automations(self):
+        """Stop all automations that are linked to the data collection run."""
+        print("Stopping run-linked automation sequences...")
+        for seq in list(self.manager.active_sequences):
+            if getattr(seq, 'run_linked', False):
+                print(f"Stopping run-linked sequence: {seq.name}")
+                self.manager.stop_sequence(seq)
 
     def get_checked_sequences(self):
         """Get a list of AutomationSequence objects whose checkboxes are checked."""

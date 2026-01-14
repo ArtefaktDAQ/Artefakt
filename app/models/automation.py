@@ -1504,12 +1504,13 @@ class AutomationSequence(QObject):
     sequence_stopped = pyqtSignal(object)
     sequence_error = pyqtSignal(object, str) # sequence, error_message
 
-    def __init__(self, name, steps=None, loop=False, checked=False):
+    def __init__(self, name, steps=None, loop=False, checked=False, run_linked=False):
         super().__init__()
         self.name = name
         self.steps = steps if steps else []
         self.loop = loop
         self.checked = checked
+        self.run_linked = run_linked
         self.current_step_index = -1
         self.is_running = False
         self._timer = None
@@ -1718,6 +1719,7 @@ class AutomationSequence(QObject):
             'name': self.name,
             'loop': self.loop,
             'checked': self.checked,
+            'run_linked': self.run_linked,
             'steps': steps_data
         }
         
@@ -1728,7 +1730,8 @@ class AutomationSequence(QObject):
         steps_data = data.get('steps', [])
         steps = [AutomationStep.from_dict(step_data) for step_data in steps_data]
         checked_state = data.get('checked', False)
-        return AutomationSequence(name, steps, loop, checked_state)
+        run_linked = data.get('run_linked', False)
+        return AutomationSequence(name, steps, loop, checked_state, run_linked)
 
 # --- Automation Manager (Handles loading/saving/running sequences) ---
 class AutomationManager(QObject):

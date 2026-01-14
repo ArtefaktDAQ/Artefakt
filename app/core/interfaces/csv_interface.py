@@ -17,12 +17,14 @@ class CSVInterface(BaseInterface):
         "poll_interval": {"type": "number", "label": "Poll Interval (s)", "default": 1.0}
     }
 
-    def __init__(self, file_path, poll_interval=1.0, mappings=None):
+    def __init__(self, file_path, poll_interval=1.0, mappings=None, delimiter=',', decimal_separator='.'):
         super().__init__(name="CSVInterface")
         self.file_path = file_path
         self.poll_interval = float(poll_interval)
         # mappings: list of {column: name_or_idx, sensor_name: str, extract_rule: str}
         self.mappings = mappings or []
+        self.delimiter = delimiter
+        self.decimal_separator = decimal_separator
         self.connected = False
         self.last_poll_time = 0
         self.last_file_size = -1
@@ -38,7 +40,7 @@ class CSVInterface(BaseInterface):
             return False
         try:
             with open(self.file_path, 'r', newline='', encoding='utf-8') as f:
-                reader = csv.reader(f)
+                reader = csv.reader(f, delimiter=self.delimiter)
                 self.headers = next(reader, None)
             self.connected = True
             self.error_message = ""
@@ -118,7 +120,7 @@ class CSVInterface(BaseInterface):
                     if not last_line: return None
                     
                     # Use csv reader to handle quotes correctly
-                    reader = csv.reader([last_line])
+                    reader = csv.reader([last_line], delimiter=self.delimiter)
                     row = next(reader, None)
                     if not row: return None
                     
@@ -180,6 +182,10 @@ class CSVInterface(BaseInterface):
             except Exception:
                 pass
                 
+        # Handle custom decimal separator
+        if hasattr(self, 'decimal_separator') and self.decimal_separator != '.' and self.decimal_separator in text:
+            text = text.replace(self.decimal_separator, '.')
+
         try:
             # Remove units/text and convert to float
             # Only keep digits, dot, and leading minus sign
@@ -211,7 +217,9 @@ class CSVThread(QThread):
                 iface = CSVInterface(
                     file_path=cfg['file'],
                     poll_interval=cfg.get('poll', 1.0),
-                    mappings=cfg.get('mappings', [])
+                    mappings=cfg.get('mappings', []),
+                    delimiter=cfg.get('delimiter', ','),
+                    decimal_separator=cfg.get('decimal_separator', '.')
                 )
                 if iface.connect():
                     self.interfaces.append(iface)

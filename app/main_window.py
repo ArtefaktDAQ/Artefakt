@@ -1521,6 +1521,10 @@ class DAQApp(QMainWindow):
                 print("[TOGGLE] Stopping data collection...")
                 self.data_collection_controller.stop_data_collection()
                 
+            if hasattr(self, 'automation_controller'):
+                print("[TOGGLE] Stopping run-linked automations...")
+                self.automation_controller.stop_run_linked_automations()
+                
             if hasattr(self, 'sensor_controller'):
                 print("[TOGGLE] Stopping sensor acquisition...")
                 self.sensor_controller.stop_acquisition()
@@ -2065,6 +2069,10 @@ class DAQApp(QMainWindow):
                             self.logger.log(f"Error disconnecting optical sensor {sensor.name}: {e}", "WARN")
         
         # Shutdown controllers
+        if hasattr(self, 'automation_controller'):
+            self.automation_controller.stop_all_automation(is_exiting=True)
+            self.logger.log("Automation controller shut down")
+
         if hasattr(self, 'data_collection_controller'):
             self.data_collection_controller.shutdown()
         

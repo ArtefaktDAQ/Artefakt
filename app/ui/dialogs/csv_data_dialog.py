@@ -95,7 +95,9 @@ class AddEditCSVConfigDialog(QDialog):
             "file": "", 
             "poll": 1.0 / global_rate, 
             "enabled": True, 
-            "mappings": []
+            "mappings": [],
+            "delimiter": "Auto",
+            "decimal_separator": "."
         }
         self.headers = []
         self.setup_ui()
@@ -144,6 +146,21 @@ class AddEditCSVConfigDialog(QDialog):
         rate_info.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 10px;")
         form_layout.addRow("", rate_info)
         
+        # CSV Format Settings
+        self.delimiter_combo = QComboBox()
+        self.delimiter_combo.addItems(["Auto", ",", ";", "\\t (Tab)", "|", "Space"])
+        self.delimiter_combo.setEditable(True)
+        delim = self.config.get("delimiter", "Auto")
+        if delim == "\t": self.delimiter_combo.setCurrentText("\\t (Tab)")
+        elif delim == " ": self.delimiter_combo.setCurrentText("Space")
+        else: self.delimiter_combo.setCurrentText(str(delim))
+        form_layout.addRow("Delimiter:", self.delimiter_combo)
+
+        self.decimal_combo = QComboBox()
+        self.decimal_combo.addItems([". (Dot)", ", (Comma)"])
+        self.decimal_combo.setCurrentIndex(1 if self.config.get("decimal_separator") == "," else 0)
+        form_layout.addRow("Decimal Point:", self.decimal_combo)
+
         self.enabled_check = QCheckBox("Enabled")
         self.enabled_check.setChecked(self.config.get("enabled", True))
         form_layout.addRow(self.enabled_check)
@@ -235,13 +252,27 @@ class AddEditCSVConfigDialog(QDialog):
                     self.preview_label.setText("Could not find data line.")
                     return
                 
-                reader = csv.reader([buffer])
+                # Get current format settings
+                delim = self.delimiter_combo.currentText()
+                if delim == "Auto":
+                    try:
+                        # Try to sniff from the buffer or start of file
+                        dialect = csv.Sniffer().sniff(buffer, delimiters=',;\t| ')
+                        delim = dialect.delimiter
+                    except Exception:
+                        delim = ',' # Fallback
+                elif delim == "\\t (Tab)": delim = "\t"
+                elif delim == "Space": delim = " "
+                
+                dec_sep = "," if self.decimal_combo.currentIndex() == 1 else "."
+
+                reader = csv.reader([buffer], delimiter=delim)
                 row = next(reader, None)
                 if not row:
                     self.preview_label.setText("Row is empty.")
                     return
                 
-                preview_text = f"Last line: {', '.join(row)}\n\n"
+                preview_text = f"Last line (delim='{delim}'): {delim.join(row)}\n\n"
                 preview_text += "Parsing Results:\n"
                 
                 for m in self.config["mappings"]:
@@ -271,9 +302,11 @@ class AddEditCSVConfigDialog(QDialog):
                         
                         # Clean numerical
                         try:
-                            # Use a more robust regex for numbers, including scientific notation
-                            # and ensuring we only pick up the numeric part
                             clean_text = str(extracted).strip()
+                            # Handle decimal separator
+                            if dec_sep != '.' and dec_sep in clean_text:
+                                clean_text = clean_text.replace(dec_sep, '.')
+                            
                             num_match = re.search(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', clean_text)
                             if num_match:
                                 final_val = float(num_match.group(0))
@@ -303,9 +336,22 @@ class AddEditCSVConfigDialog(QDialog):
     def _load_headers(self):
         if not os.path.exists(self.config["file"]):
             return
+        
+        delim = self.delimiter_combo.currentText()
+        if delim == "Auto":
+            try:
+                with open(self.config["file"], 'r', encoding='utf-8') as f:
+                    sample = f.read(2048)
+                    dialect = csv.Sniffer().sniff(sample, delimiters=',;\t| ')
+                    delim = dialect.delimiter
+            except Exception:
+                delim = ',' # Fallback
+        elif delim == "\\t (Tab)": delim = "\t"
+        elif delim == "Space": delim = " "
+
         try:
             with open(self.config["file"], 'r', newline='', encoding='utf-8') as f:
-                reader = csv.reader(f)
+                reader = csv.reader(f, delimiter=delim)
                 self.headers = next(reader, [])
         except Exception:
             self.headers = []
@@ -342,11 +388,20 @@ class AddEditCSVConfigDialog(QDialog):
         # Convert Hz to interval (seconds) for internal storage
         hz = self.poll_spin.value()
         interval = 1.0 / hz if hz > 0 else 1.0
+        
+        delim = self.delimiter_combo.currentText()
+        if delim == "\\t (Tab)": delim = "\t"
+        elif delim == "Space": delim = " "
+        
+        dec_sep = "," if self.decimal_combo.currentIndex() == 1 else "."
+
         return {
             "file": self.file_edit.text(),
             "poll": interval,
             "enabled": self.enabled_check.isChecked(),
-            "mappings": self.config["mappings"]
+            "mappings": self.config["mappings"],
+            "delimiter": delim,
+            "decimal_separator": dec_sep
         }
 
 class CSVDataDialog(QDialog):

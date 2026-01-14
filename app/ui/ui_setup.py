@@ -1390,6 +1390,12 @@ def setup_ui(self):
     sync_note.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 10px; font-style: italic;")
     camera_connection_layout.addWidget(sync_note, 7, 0, 1, 3)
     
+    # Access Hint for Multi-app access (Windows 11 24H2+)
+    self.camera_access_hint = QLabel("💡 Hint: If your camera is used by OBS, ensure 'Multi-app camera access' is enabled in Windows Settings.")
+    self.camera_access_hint.setWordWrap(True)
+    self.camera_access_hint.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 10px; font-style: italic;")
+    camera_connection_layout.addWidget(self.camera_access_hint, 8, 0, 1, 3)
+    
     # Recording settings for individual cameras
     recording_settings_group = QGroupBox("⏺️ Recording Settings")
     recording_settings_group.setStyleSheet(GroupBoxStyles.tight())

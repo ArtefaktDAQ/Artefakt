@@ -3,6 +3,7 @@
         "name": "AIN2 >= 30 and 31 and 32",
         "loop": false,
         "checked": true,
+        "run_linked": false,
         "steps": [
             {
                 "trigger": {
@@ -61,13 +62,14 @@
         "name": "Quick Start/Stop Test",
         "loop": false,
         "checked": false,
+        "run_linked": false,
         "steps": [
             {
                 "trigger": {
                     "type": "TIME_DURATION",
-                    "name": "Stabilize (1s)",
+                    "name": "Start when activated",
                     "minutes": 0,
-                    "seconds": 1
+                    "seconds": 0
                 },
                 "action": {
                     "type": "SYSTEM_ACTION",
