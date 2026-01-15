@@ -6,12 +6,13 @@ from PyQt6.QtWidgets import (
     QWidget, QFileDialog, QMessageBox
 )
 from PyQt6.QtCore import Qt, QTime
-from app.ui.theme import GroupBoxStyles, DialogStyles
+from app.ui.theme import GroupBoxStyles, DialogStyles, TableStyles
 from app.models.automation import (  # Adjusted import
     TimeDurationTrigger, TimeSpecificTrigger, SensorValueTrigger, EventTrigger,
     OpticalEventTrigger, AudioEventTrigger, CompoundTrigger,
     ArduinoCommandAction, LabJackCommandAction, SerialCommandAction, SystemAction,
     SetVariableAction, JumpToStepAction, ConditionAction, InfoMarkerAction,
+    MQTTPublishAction,
     AutomationStep, AutomationSequence
 )
 
@@ -701,9 +702,12 @@ class ActionDialog(QDialog):
             "Send Arduino Command": ArduinoCommandAction,
             "Send LabJack Command": LabJackCommandAction,
             "Send Serial Command": SerialCommandAction,
+            "MQTT Publish": MQTTPublishAction,
             "System Action": SystemAction,
             "Set Variable": SetVariableAction,
-            "Info Marker": InfoMarkerAction
+            "Info Marker": InfoMarkerAction,
+            "Jump to Step": JumpToStepAction,
+            "Condition (If/Else Jump)": ConditionAction
         }
         
         self.setup_ui()
@@ -728,6 +732,7 @@ class ActionDialog(QDialog):
             "Send Arduino Command",
             "Send LabJack Command",
             "Send Serial Command",
+            "MQTT Publish",
             "System Action",
             "Set Variable",
             "Info Marker",
@@ -766,6 +771,10 @@ class ActionDialog(QDialog):
         # Info Marker options
         self.info_marker_widget = self.create_info_marker_options()
         self.action_options.addTab(self.info_marker_widget, "Marker")
+
+        # MQTT options
+        self.mqtt_widget = self.create_mqtt_options()
+        self.action_options.addTab(self.mqtt_widget, "MQTT")
         
         # Jump options
         self.jump_widget = self.create_jump_options()
@@ -881,6 +890,27 @@ class ActionDialog(QDialog):
         
         layout.addRow("Port:", self.serial_port)
         layout.addRow("Command:", self.serial_command)
+        
+        return widget
+
+    def create_mqtt_options(self):
+        """Create options for MQTT Publish action"""
+        widget = QGroupBox("MQTT Publish")
+        widget.setStyleSheet(GroupBoxStyles.compact())
+        layout = QFormLayout(widget)
+        
+        self.mqtt_topic = QLineEdit()
+        self.mqtt_topic.setPlaceholderText("Enter topic (e.g., daq/heartbeat)")
+        
+        self.mqtt_payload = QLineEdit()
+        self.mqtt_payload.setPlaceholderText("Enter payload (e.g., State: {is_running})")
+        
+        layout.addRow("Topic:", self.mqtt_topic)
+        layout.addRow("Payload:", self.mqtt_payload)
+        
+        help_label = QLabel("Use {variable_name} or {sensor_name} for substitutions.")
+        help_label.setStyleSheet("font-size: 9pt; color: gray;")
+        layout.addRow(help_label)
         
         return widget
         
@@ -1087,8 +1117,9 @@ class ActionDialog(QDialog):
             "System Action": 3,
             "Set Variable": 4,
             "Info Marker": 5,
-            "Jump to Step": 6,
-            "Condition (If/Else Jump)": 7
+            "MQTT Publish": 6,
+            "Jump to Step": 7,
+            "Condition (If/Else Jump)": 8
         }
         action_text = self.action_type.currentText()
         index = type_map.get(action_text, 0) # Default to first tab if not found
@@ -1102,6 +1133,7 @@ class ActionDialog(QDialog):
             ArduinoCommandAction: ("Send Arduino Command", self.arduino_command, "command"),
             LabJackCommandAction: ("Send LabJack Command", None, None), # Special handling
             SerialCommandAction: ("Send Serial Command", self.serial_command, "command"), # Port handling needed
+            MQTTPublishAction: ("MQTT Publish", None, None),
             SystemAction: ("System Action", None, None), # Special handling
             SetVariableAction: ("Set Variable", None, None), # <<< Added, special handling
             InfoMarkerAction: ("Info Marker", None, None),
@@ -1144,6 +1176,9 @@ class ActionDialog(QDialog):
             elif isinstance(action, SerialCommandAction):
                  self.serial_port.setCurrentText(action.port) # Set port separately
                  self.serial_command.setText(action.command)
+            elif isinstance(action, MQTTPublishAction):
+                 self.mqtt_topic.setText(action.topic)
+                 self.mqtt_payload.setText(action.payload)
             elif isinstance(action, SystemAction):
                  self.system_action_type.setCurrentText(action.specific_action_type)
                  self.update_system_action_options() # Show correct sub-options
@@ -1210,6 +1245,11 @@ class ActionDialog(QDialog):
             port = self.serial_port.currentText().strip() # Use currentText for editable combo box
             command = self.serial_command.text().strip()
             return SerialCommandAction(name, port, command)
+
+        elif action_type == "MQTT Publish":
+            topic = self.mqtt_topic.text().strip()
+            payload = self.mqtt_payload.text().strip()
+            return MQTTPublishAction(name, topic, payload)
             
         elif action_type == "System Action":
             sys_action_type = self.system_action_type.currentText()
@@ -1463,6 +1503,7 @@ class SequenceDialog(QDialog):
         steps_layout = QVBoxLayout(steps_group)
 
         self.steps_table = QTableWidget()
+        self.steps_table.setStyleSheet(TableStyles.default())
         self.steps_table.setColumnCount(4)
         self.steps_table.setHorizontalHeaderLabels(["#", "Trigger", "Action", "Enabled"])
         self.steps_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)

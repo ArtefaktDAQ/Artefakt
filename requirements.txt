@@ -3,7 +3,6 @@ PyQt6>=6.7.0
 pyserial>=3.5
 numpy>=1.23.0
 opencv-python-headless>=4.7.0  # Headless version - smaller, no GUI (we use PyQt6 for display)
-pyqtdarktheme>=2.1.0
 pyqtgraph>=0.13.1
 pandas>=1.5.0,<2.0.0
 scipy>=1.9.0

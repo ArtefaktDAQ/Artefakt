@@ -716,6 +716,21 @@ class DAQApp(QMainWindow):
         downsampling_check.setChecked(is_enabled)
         form.addRow("Performance:", downsampling_check)
         
+        # Graph Update Interval
+        update_interval_spin = QDoubleSpinBox()
+        update_interval_spin.setRange(0.01, 5.0)
+        update_interval_spin.setSingleStep(0.05)
+        update_interval_spin.setSuffix(" s")
+        update_interval_spin.setToolTip("How often to redraw the graphs. Lower = smoother but higher CPU usage.")
+        update_interval_spin.setStyleSheet(InputStyles.default())
+        current_interval = self.settings_model.get_float("graph_update_interval", 0.3)
+        update_interval_spin.setValue(current_interval)
+        form.addRow("Graph Refresh Rate:", update_interval_spin)
+        
+        hint_label = QLabel("Note: This affects both the Dashboard and Graphs tabs.")
+        hint_label.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY}; font-size: 10px;")
+        form.addRow("", hint_label)
+        
         # Camera Preview FPS
         preview_fps_spin = QSpinBox()
         preview_fps_spin.setRange(1, 60)
@@ -739,6 +754,14 @@ class DAQApp(QMainWindow):
             
             # Save downsampling setting
             self.settings_model.set_value("graph_downsampling", downsampling_check.isChecked())
+            
+            # Save graph update interval
+            new_interval = update_interval_spin.value()
+            self.settings_model.set_value("graph_update_interval", new_interval)
+            if hasattr(self, 'graph_controller'):
+                self.graph_controller.plot_update_interval = new_interval
+                # Update any active timers with the new interval
+                self.graph_controller.ensure_main_graph_live_update()
             
             # Save camera preview FPS
             new_preview_fps = preview_fps_spin.value()
@@ -4571,7 +4594,7 @@ class DAQApp(QMainWindow):
                 
                 # Set table properties
                 self.data_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-                self.data_table.setAlternatingRowColors(True)
+                self.data_table.setAlternatingRowColors(False)
                 self.data_table.setSortingEnabled(False)
                 
                 print("Sensor table set up")

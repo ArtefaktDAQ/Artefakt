@@ -987,6 +987,7 @@ def setup_ui(self):
 
     # --- ADDED --- New table for detailed status
     self.dashboard_automation_table = QTableWidget()
+    self.dashboard_automation_table.setStyleSheet(TableStyles.default())
     self.dashboard_automation_table.setMinimumHeight(80) # Reduced from default
     self.dashboard_automation_table.setColumnCount(5)
     self.dashboard_automation_table.setHorizontalHeaderLabels(["Sequence", "Status", "Current Step", "Next Step", "Time/Trigger"])
@@ -998,7 +999,7 @@ def setup_ui(self):
     self.dashboard_automation_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     self.dashboard_automation_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
     self.dashboard_automation_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers) # Make read-only
-    self.dashboard_automation_table.setAlternatingRowColors(True)
+    self.dashboard_automation_table.setAlternatingRowColors(False)
     dashboard_automation_layout.addWidget(self.dashboard_automation_table)
 
     self.dashboard_automation_group.setMinimumWidth(200) # Reduced from 350 to allow better window shrinking
@@ -2868,6 +2869,7 @@ def setup_ui(self):
     
     # Table to display defined automation sequences
     self.sequences_table = QTableWidget()
+    self.sequences_table.setStyleSheet(TableStyles.default())
     self.sequences_table.setColumnCount(3)
     self.sequences_table.setHorizontalHeaderLabels(["Name", "Status", "Actions"])
     self.sequences_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -3369,8 +3371,8 @@ def setup_ui(self):
     # Sampling rate setting
     sampling_rate_layout = QHBoxLayout()
     sampling_rate_layout.setSpacing(8)
-    sampling_rate_label = QLabel("Sampling Rate:")
-    sampling_rate_label.setMinimumWidth(100)
+    sampling_rate_label = QLabel("<b>Global Sampling Rate:</b>")
+    sampling_rate_label.setMinimumWidth(150)
     sampling_rate_layout.addWidget(sampling_rate_label)
     
     self.sampling_rate_spinbox = QDoubleSpinBox()

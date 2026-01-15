@@ -1672,7 +1672,6 @@ class TableStyles:
             QTableWidget::item {{
                 padding: 5px;
                 color: {COLORS.TEXT_PRIMARY};
-                background-color: {COLORS.BG_CARD};
             }}
             QTableWidget::item:selected {{
                 background-color: rgba(108, 92, 231, 0.45);
@@ -1684,6 +1683,30 @@ class TableStyles:
                 border: none;
                 border-bottom: 1px solid {COLORS.BORDER_DEFAULT};
                 font-weight: bold;
+            }}
+            /* Improvement for checkbox visibility in tables */
+            QTableWidget::indicator {{
+                width: 16px;
+                height: 16px;
+                border-radius: 3px;
+                border: 1px solid rgba(255, 255, 255, 0.3);
+                background-color: {COLORS.BG_INPUT};
+            }}
+            QTableWidget::indicator:checked {{
+                background-color: {COLORS.PRIMARY};
+                border-color: {COLORS.PRIMARY};
+            }}
+            /* Also style QCheckBoxes inside the table */
+            QCheckBox::indicator {{
+                width: 16px;
+                height: 16px;
+                border-radius: 3px;
+                border: 1px solid rgba(255, 255, 255, 0.3);
+                background-color: {COLORS.BG_INPUT};
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: {COLORS.PRIMARY};
+                border-color: {COLORS.PRIMARY};
             }}
         """
 
@@ -2169,7 +2192,7 @@ class DialogStyles:
                 width: 16px;
                 height: 16px;
                 border-radius: 3px;
-                border: 1px solid {COLORS.BORDER_DEFAULT};
+                border: 1px solid rgba(255, 255, 255, 0.3);
                 background-color: {COLORS.BG_INPUT};
             }}
             QCheckBox::indicator:checked {{

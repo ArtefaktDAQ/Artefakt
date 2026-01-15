@@ -52,6 +52,7 @@ class SettingsModel:
             "plot_font_size": "10",
             "plot_line_width": "2",
             "graph_downsampling": "true",  # Enable/disable pyqtgraph automatic downsampling
+            "graph_update_interval": "0.3", # Visual refresh interval in seconds
             
             # Motion detection settings
             "motion_detection_enabled": "false",

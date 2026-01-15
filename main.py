@@ -2,7 +2,6 @@ import sys
 import traceback
 import signal
 from PyQt6.QtWidgets import QApplication
-import qdarktheme
 
 # Import the main application class from our app package
 from app.main_window import DAQApp
@@ -43,7 +42,6 @@ def main():
         
         # Set application style
         app.setStyle("Fusion")
-        qdarktheme.setup_theme("dark")
         
         # Initialize sound player for automations
         sound_player = SoundPlayer()

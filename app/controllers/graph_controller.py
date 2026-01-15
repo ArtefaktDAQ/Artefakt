@@ -41,7 +41,7 @@ class GraphController:
         self.dashboard_plot_data = {} 
         self.dashboard_graph_widget = None # Will be set in start_live_dashboard_update
         self.last_plot_update_time = 0 # Time of the last visual plot update
-        self.plot_update_interval = 0.3 # Update plot visuals every 300ms (reduced frequency for performance)
+        self.plot_update_interval = self.settings_model.get_float("graph_update_interval", 0.3)
         
         # Store automation event markers for graph visualization
         self.event_markers = []  # List of event dictionaries with timestamps
@@ -889,13 +889,20 @@ class GraphController:
                  text.setPos(0, 0) 
             self.dashboard_graph_widget.addItem(text)
             
-        # --- Set up dashboard update timer to match sampling rate, but not faster than 1s ---
-        update_interval_ms = 1000  # Default 1s
+        # --- Set up dashboard update timer to match user preference ---
+        update_interval_ms = int(self.plot_update_interval * 1000)
+        
+        # If sampling rate is very slow, sync to that instead
         if hasattr(self.main_window, 'sampling_rate_spinbox'):
             rate_hz = self.main_window.sampling_rate_spinbox.value()
             if rate_hz > 0:
-                # Convert Hz to ms interval: 1000 / Hz
-                update_interval_ms = max(int(1000 / rate_hz), 1000)
+                sampling_interval_ms = int(1000 / rate_hz)
+                if sampling_interval_ms > update_interval_ms:
+                    update_interval_ms = sampling_interval_ms
+        
+        # Guard against zero or negative (though spinbox handles this)
+        update_interval_ms = max(update_interval_ms, 10)
+
         if not hasattr(self, 'dashboard_update_timer'):
             from PyQt6.QtCore import QTimer
             self.dashboard_update_timer = QTimer()
@@ -2796,13 +2803,21 @@ class GraphController:
             print("Main graph live update not started: checkbox is not checked")
             return
             
-        # Set timer interval to match sampling rate, but not faster than 1s
-        update_interval_ms = 1500
+        # Set timer interval from settings (default 1.5s or based on sampling rate if interval is very fast)
+        update_interval_ms = int(self.plot_update_interval * 1000)
+        
+        # If sampling rate is provided and much slower than visual refresh, sync to sampling rate instead
         if hasattr(self.main_window, 'sampling_rate_spinbox'):
             rate_hz = self.main_window.sampling_rate_spinbox.value()
             if rate_hz > 0:
-                # Convert Hz to ms interval: 1000 / Hz
-                update_interval_ms = max(int(1000 / rate_hz), 1000)
+                sampling_interval_ms = int(1000 / rate_hz)
+                # If sampling is slower than visual refresh, no need to refresh faster than data arrives
+                if sampling_interval_ms > update_interval_ms:
+                    update_interval_ms = sampling_interval_ms
+        
+        # Ensure we don't refresh faster than 10ms (100Hz) even if user set interval lower
+        update_interval_ms = max(update_interval_ms, 10)
+        
         self.main_graph_update_timer.setInterval(update_interval_ms)
         # Only start the timer if data collection is active
         if hasattr(self.main_window, 'data_collection_controller') and self.main_window.data_collection_controller.collecting_data:
@@ -2836,12 +2851,15 @@ class GraphController:
                         print("DEBUG: Started main graph live update timer from ensure_main_graph_live_update")
                     else:
                         # Timer is already active, just update the interval if needed
-                        update_interval_ms = 1500
+                        update_interval_ms = int(self.plot_update_interval * 1000)
                         if hasattr(self.main_window, 'sampling_rate_spinbox'):
                             rate_hz = self.main_window.sampling_rate_spinbox.value()
                             if rate_hz > 0:
-                                # Convert Hz to ms interval: 1000 / Hz
-                                update_interval_ms = max(int(1000 / rate_hz), 1000)
+                                sampling_interval_ms = int(1000 / rate_hz)
+                                if sampling_interval_ms > update_interval_ms:
+                                    update_interval_ms = sampling_interval_ms
+                        
+                        update_interval_ms = max(update_interval_ms, 10)
                         self.main_graph_update_timer.setInterval(update_interval_ms)
                         print("DEBUG: Main graph live update timer already active, updated interval")
                 else:

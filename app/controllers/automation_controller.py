@@ -216,7 +216,7 @@ class AutomationController(QObject):
         for i, seq in enumerate(self.manager.sequences):
             # --- Column 0: Checkbox ---
             checkbox_item = QTableWidgetItem()
-            checkbox_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            checkbox_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             # Restore check state from sequence object
             checkbox_item.setCheckState(Qt.CheckState.Checked if seq.checked else Qt.CheckState.Unchecked)
             # Store sequence object in the checkbox item's data for easy retrieval
