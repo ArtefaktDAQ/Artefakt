@@ -11,6 +11,7 @@ release.py
 github_release.py
 quick_build.bat
 create_release.bat
+start_daq.bat
 VERSION_MANAGEMENT.md
 DEVELOPMENT_WORKFLOW.md
 RELEASE_NOTES_TEMPLATE.md
