@@ -259,11 +259,16 @@ class ArduinoMasterSlaveThread(QThread):
         
     def get_available_sensor_names(self):
         """
-        Get a list of available sensor names from the current data
+        Get a list of all sensor names discovered since connection.
         
         Returns:
             List of sensor names
         """
+        # First try to get from the underlying interface's discovery set
+        if self.arduino and hasattr(self.arduino, 'get_instance_output_keys'):
+            return self.arduino.get_instance_output_keys()
+            
+        # Fallback to latest data keys
         with QMutexLocker(self.data_mutex):
             return list(self.latest_data.keys()) if self.latest_data else []
             

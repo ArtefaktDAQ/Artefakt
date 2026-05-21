@@ -77,6 +77,18 @@ class ArduinoInterface(BaseInterface):
         self.last_poll_time = 0
         self._consecutive_errors = 0
         self._max_consecutive_errors = 3  # Disconnect after this many consecutive errors
+        self._discovered_sensors = set()
+
+    @classmethod
+    def get_output_keys(cls):
+        """Return a list of available sensor names for this interface type.
+        Note: For Arduino, this is dynamic and requires a connection.
+        """
+        return []
+
+    def get_instance_output_keys(self):
+        """Return a list of sensor names discovered during the current connection."""
+        return sorted(list(self._discovered_sensors))
     
     @classmethod
     def get_ui_options(cls, field_name):
@@ -282,6 +294,9 @@ class ArduinoInterface(BaseInterface):
                     name, value = pair.split(':', 1)
                     name = name.strip()
                     value = value.strip()
+                    # Track discovered sensor name
+                    if name:
+                        self._discovered_sensors.add(name)
                     # Try to convert to float if possible
                     try:
                         value = float(value)

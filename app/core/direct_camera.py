@@ -361,6 +361,8 @@ class DirectCameraThread(QThread):
                 else:
                     # Fallback: try to find by name if only string was provided
                     finder = NDISourceFinder()
+                    # Give it a moment to discover sources
+                    time.sleep(0.5)
                     sources = finder.get_sources()
                     target_source = None
                     clean_name = self.camera_id.replace("NDI:", "").strip()
@@ -419,8 +421,8 @@ class DirectCameraThread(QThread):
             backends = []
             if platform.system() == 'Windows':
                 print("Windows system detected, trying different camera backends...")
-                # Try Media Foundation first as it's modern and less likely to conflict with NDI's DSHOW hooks
-                backends = [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_ANY]
+                # Try DirectShow first as it's typically faster for webcams on Windows
+                backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
             else:
                 backends = [cv2.CAP_ANY]
 

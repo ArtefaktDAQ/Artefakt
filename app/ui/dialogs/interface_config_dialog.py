@@ -2,9 +2,9 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, 
     QLabel, QLineEdit, QPushButton, QGroupBox, 
     QMessageBox, QComboBox, QCheckBox, QWidget,
-    QDialogButtonBox, QDoubleSpinBox, QTabWidget, QTextEdit
+    QDialogButtonBox, QDoubleSpinBox, QTabWidget, QTextEdit, QInputDialog, QScrollArea
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QUrl
+from PyQt6.QtCore import Qt, pyqtSignal, QUrl, QSize
 from PyQt6.QtGui import QDesktopServices
 import os
 from app.ui.theme import DialogStyles, ButtonStyles, ConnectionStyles, COLORS, GroupBoxStyles
@@ -33,6 +33,7 @@ class InterfaceConfigDialog(QDialog):
             
         self.setWindowTitle(f"Configure {self.display_name}")
         self.setMinimumWidth(500)
+        self._apply_screen_friendly_size()
         self.setStyleSheet(DialogStyles.dark_dialog())
         
         self.field_widgets = {}
@@ -46,10 +47,26 @@ class InterfaceConfigDialog(QDialog):
         
     def setup_ui(self):
         layout = QVBoxLayout(self)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
         
+        # Description header (More prominent, outside tabs)
+        desc = getattr(self.interface_class, "DESCRIPTION", "")
+        if desc:
+            desc_header = QLabel(desc)
+            desc_header.setWordWrap(True)
+            desc_header.setStyleSheet(f"color: {COLORS.TEXT_PRIMARY}; font-size: 13px; font-weight: bold; padding: 10px; background-color: {COLORS.BG_CARD}; border-radius: 5px; margin-bottom: 5px;")
+            content_layout.addWidget(desc_header)
+            
         # Tab Widget for organization
         self.tabs = QTabWidget()
-        layout.addWidget(self.tabs)
+        content_layout.addWidget(self.tabs)
         
         # --- General Settings Tab ---
         general_tab = QWidget()
@@ -60,14 +77,6 @@ class InterfaceConfigDialog(QDialog):
         status_group.setStyleSheet(GroupBoxStyles.default())
         status_form = QFormLayout(status_group)
         
-        # Description header (More prominent)
-        desc = getattr(self.interface_class, "DESCRIPTION", "")
-        if desc:
-            desc_header = QLabel(desc)
-            desc_header.setWordWrap(True)
-            desc_header.setStyleSheet(f"color: {COLORS.TEXT_PRIMARY}; font-size: 14px; font-weight: bold; margin-bottom: 10px;")
-            general_layout.addWidget(desc_header)
-
         # Enabled Checkbox
         self.enabled_checkbox = QCheckBox("Interface Enabled")
         self.enabled_checkbox.setToolTip("Enable or disable this entire interface and all its sensors.")
@@ -95,6 +104,35 @@ class InterfaceConfigDialog(QDialog):
         
         status_form.addRow("Connection:", conn_layout)
         general_layout.addWidget(status_group)
+
+        test_actions = []
+        if self.interface_class and hasattr(self.interface_class, "get_test_actions"):
+            try:
+                test_actions = self.interface_class.get_test_actions() or []
+            except Exception:
+                test_actions = []
+
+        if test_actions:
+            diagnostics_group = QGroupBox("Diagnostics")
+            diagnostics_group.setStyleSheet(GroupBoxStyles.default())
+            diagnostics_layout = QVBoxLayout(diagnostics_group)
+
+            btn_row = QHBoxLayout()
+            for action in test_actions:
+                btn = QPushButton(action.get("label", action.get("id", "Run Test")))
+                btn.clicked.connect(lambda _, a=action: self._run_test_action(a))
+                btn_row.addWidget(btn)
+            btn_row.addStretch()
+            diagnostics_layout.addLayout(btn_row)
+
+            self.diagnostics_output = QTextEdit()
+            self.diagnostics_output.setReadOnly(True)
+            self.diagnostics_output.setPlaceholderText("Test results will appear here.")
+            self.diagnostics_output.setMinimumHeight(140)
+            diagnostics_layout.addWidget(self.diagnostics_output)
+
+            general_layout.addWidget(diagnostics_group)
+
         general_layout.addStretch()
         
         self.tabs.addTab(general_tab, "General")
@@ -177,7 +215,21 @@ class InterfaceConfigDialog(QDialog):
         )
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
-        layout.addWidget(self.buttons)
+        content_layout.addWidget(self.buttons)
+
+        scroll_area.setWidget(content)
+        layout.addWidget(scroll_area)
+
+    def _apply_screen_friendly_size(self):
+        screen = self.screen()
+        if not screen:
+            return
+
+        available = screen.availableGeometry()
+        target_width = min(max(560, int(available.width() * 0.55)), 900)
+        target_height = min(max(520, int(available.height() * 0.8)), 820)
+        self.resize(QSize(target_width, target_height))
+        self.setMaximumSize(available.width() - 40, available.height() - 40)
         
     def _create_field_widget(self, key, field_config):
         field_type = field_config.get("type", "string")
@@ -277,33 +329,8 @@ class InterfaceConfigDialog(QDialog):
             self.status_label.setStyleSheet(f"color: {COLORS.TEXT_SECONDARY};")
 
     def on_connect_clicked(self):
-        if not self.interface_instance:
-            # Try to create a temporary instance of the class for testing connection
-            if self.interface_class:
-                try:
-                    # Initialize with default config from UI
-                    current_config = self.get_config()
-                    
-                    # Robust instantiation: only pass arguments that the constructor actually accepts
-                    import inspect
-                    sig = inspect.signature(self.interface_class.__init__)
-                    valid_params = sig.parameters.keys()
-                    
-                    # Filter config to only include keys that are in the __init__ arguments
-                    # This prevents "unexpected keyword argument" errors for standard fields like 'enabled'
-                    filtered_config = {k: v for k, v in current_config.items() if k in valid_params}
-                    
-                    # If the class accepts **kwargs, we can pass everything
-                    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
-                        filtered_config = current_config
-                        
-                    self.interface_instance = self.interface_class(**filtered_config)
-                except Exception as e:
-                    QMessageBox.warning(self, "Connection", f"Could not initialize interface: {e}")
-                    return
-            else:
-                QMessageBox.information(self, "Connection", "Interface not initialized. Please try again or restart the application.")
-                return
+        if not self._ensure_interface_instance():
+            return
             
         if self.interface_instance.is_connected():
             self.interface_instance.disconnect()
@@ -325,6 +352,121 @@ class InterfaceConfigDialog(QDialog):
             self.connection_status_changed.emit(self.display_name, False)
         
         self.update_connection_state()
+
+    def _ensure_interface_instance(self):
+        if self.interface_instance:
+            return True
+
+        if not self.interface_class:
+            QMessageBox.information(self, "Connection", "Interface not initialized. Please try again or restart the application.")
+            return False
+
+        try:
+            current_config = self.get_config()
+            
+            # --- ADDED: Try to find an active instance for this interface type ---
+            # This prevents PermissionError if the port is already open by the app
+            dcc = getattr(self.parent_window, 'data_collection_controller', None)
+            if not dcc and hasattr(self.parent_window, 'main_window'): # Some parents are controllers
+                dcc = getattr(self.parent_window.main_window, 'data_collection_controller', None)
+            
+            if dcc:
+                # 1. Check interface_threads (plugins)
+                device_type = getattr(self.interface_class, 'DISPLAY_NAME', self.display_name)
+                if device_type in dcc.interface_threads:
+                    thread = dcc.interface_threads[device_type]
+                    if hasattr(thread, 'interface'):
+                        self.interface_instance = thread.interface
+                        return True
+                
+                # 2. Check standard interfaces
+                st_lower = device_type.lower()
+                if st_lower == "arduino" and hasattr(dcc, 'arduino_thread'):
+                    self.interface_instance = dcc.arduino_thread
+                    return True
+                elif st_lower == "labjack" and hasattr(dcc, 'labjack_thread'):
+                    self.interface_instance = dcc.labjack_thread
+                    return True
+                elif st_lower == "mqtt" and hasattr(dcc, 'mqtt_thread'):
+                    self.interface_instance = dcc.mqtt_thread
+                    return True
+            # ---------------------------------------------------------------------
+
+            import inspect
+            sig = inspect.signature(self.interface_class.__init__)
+            valid_params = sig.parameters.keys()
+
+            filtered_config = {k: v for k, v in current_config.items() if k in valid_params}
+
+            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                filtered_config = current_config
+
+            self.interface_instance = self.interface_class(**filtered_config)
+            return True
+        except Exception as e:
+            QMessageBox.warning(self, "Connection", f"Could not initialize interface: {e}")
+            return False
+
+    def _append_diagnostics_output(self, text):
+        output = getattr(self, "diagnostics_output", None)
+        if output:
+            output.append(text)
+
+    def _run_test_action(self, action):
+        if not self._ensure_interface_instance():
+            return
+
+        if not hasattr(self.interface_instance, "run_test_action"):
+            QMessageBox.information(self, "Diagnostics", "No test actions are available for this interface.")
+            return
+
+        input_value = None
+        input_label = action.get("input_label")
+        if input_label:
+            default_value = str(action.get("default_value", ""))
+            value, ok = QInputDialog.getText(
+                self,
+                action.get("label", "Test Input"),
+                input_label,
+                text=default_value,
+            )
+            if not ok:
+                return
+            input_value = value
+
+        self.apply_config_to_instance()
+
+        was_connected = self.interface_instance.is_connected()
+        connected_for_test = False
+
+        if not was_connected:
+            if not self.interface_instance.connect():
+                error = getattr(self.interface_instance, "error_message", "Unknown error")
+                QMessageBox.critical(self, "Diagnostics", f"Could not connect to {self.display_name}:\n{error}")
+                self._append_diagnostics_output(f"Connection failed:\n{error}")
+                self.update_connection_state()
+                return
+            connected_for_test = True
+
+        try:
+            result = self.interface_instance.run_test_action(action.get("id"), input_value=input_value)
+            success = bool(result.get("success")) if isinstance(result, dict) else bool(result)
+            message = result.get("message", str(result)) if isinstance(result, dict) else str(result)
+
+            prefix = "SUCCESS" if success else "FAILED"
+            self._append_diagnostics_output(f"[{prefix}] {action.get('label', action.get('id'))}\n{message}\n")
+
+            if success:
+                QMessageBox.information(self, "Diagnostics", message)
+            else:
+                QMessageBox.warning(self, "Diagnostics", message)
+        except Exception as e:
+            QMessageBox.critical(self, "Diagnostics", f"Test failed with an exception:\n{e}")
+            self._append_diagnostics_output(f"[EXCEPTION] {action.get('label', action.get('id'))}\n{e}\n")
+        finally:
+            if connected_for_test and self.interface_instance.is_connected():
+                self.interface_instance.disconnect()
+            self.update_connection_state()
 
     def apply_config_to_instance(self):
         """Applies current UI configuration to the interface instance."""

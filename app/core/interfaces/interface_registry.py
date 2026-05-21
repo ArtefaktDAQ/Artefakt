@@ -15,6 +15,11 @@ class InterfaceRegistry:
     _interfaces = {}  # {display_name: class}
     _outbound_interfaces = {} # {display_name: class}
     _initialized = False
+    _legacy_aliases = {
+        # Legacy names kept for backward compatibility with saved sensor configs.
+        "Love Controls 16B": "Dwyer16B",
+        "LoveControls16B": "Dwyer16B",
+    }
 
     @classmethod
     def initialize(cls):
@@ -150,7 +155,25 @@ class InterfaceRegistry:
         """Get a specific interface class by its display name."""
         if not cls._initialized:
             cls.initialize()
+
+        if not display_name:
+            return None
+
+        # First resolve known legacy names to current display names.
+        lookup_name = cls._legacy_aliases.get(display_name, display_name)
+
         # Check both registries
-        if display_name in cls._interfaces:
-            return cls._interfaces[display_name]
-        return cls._outbound_interfaces.get(display_name)
+        if lookup_name in cls._interfaces:
+            return cls._interfaces[lookup_name]
+        if lookup_name in cls._outbound_interfaces:
+            return cls._outbound_interfaces[lookup_name]
+
+        # Fallback: case-insensitive lookup (helps with older persisted values).
+        target_lower = str(lookup_name).lower()
+        for key, value in cls._interfaces.items():
+            if str(key).lower() == target_lower:
+                return value
+        for key, value in cls._outbound_interfaces.items():
+            if str(key).lower() == target_lower:
+                return value
+        return None

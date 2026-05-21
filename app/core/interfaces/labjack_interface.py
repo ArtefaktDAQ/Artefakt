@@ -88,12 +88,48 @@ class LabJackInterface(BaseInterface):
         }
     }
 
+    @classmethod
+    def get_output_keys(cls):
+        """Return a list of common analog input channels available on most LabJack devices."""
+        return [f"AIN{i}" for i in range(14)]
+
+    def get_instance_output_keys(self):
+        """Return a list of all available channels on the connected LabJack, including EF channels."""
+        channels = []
+        
+        # Add analog inputs (AIN0-AIN13 for T7)
+        for i in range(14):
+            channels.append(f"AIN{i}")
+            
+        # Add digital I/O (FIO0-FIO7, EIO0-EIO7, CIO0-CIO3)
+        for i in range(8):
+            channels.append(f"FIO{i}")
+        for i in range(8):
+            channels.append(f"EIO{i}")
+        for i in range(4):
+            channels.append(f"CIO{i}")
+            
+        # Add EF channels - these are extended feature modes for digital lines
+        if self.is_connected():
+            ef_channels = self.get_ef_channels()
+            for ch in ef_channels:
+                channels.append(ch['name'])
+            
+        # Add DAC outputs
+        channels.append("DAC0")
+        channels.append("DAC1")
+        
+        return sorted(list(set(channels)))
+
     # Maximum queue sizes to prevent memory exhaustion
     MAX_STATUS_QUEUE_SIZE = 100
     MAX_DATA_QUEUE_SIZE = 1000
     
     # Cache timeout for EF channels (seconds)
     EF_CACHE_TIMEOUT = 30.0
+    # Auto-refresh EF discovery can introduce read stalls on some systems.
+    # Keep discovery stable once found; allow explicit refresh when needed.
+    AUTO_REFRESH_EF_CHANNELS = False
     
     def __init__(self, port="ANY", connection_type="ANY", device_type="T7", 
                  sampling_rate=1000, auto_reconnect=False):
@@ -226,6 +262,13 @@ class LabJackInterface(BaseInterface):
                 self._ef_cache_time = 0
                 self._tc_channels_cache = []
                 self._tc_cache_time = 0
+
+                # Prime EF cache once on connect to avoid expensive periodic scans
+                # during high-frequency reads. Failures are non-fatal.
+                try:
+                    self.get_ef_channels(force_refresh=True)
+                except Exception as e:
+                    logger.debug(f"Initial EF cache warmup failed: {e}")
                 
                 # Mark as connected
                 self.connected = True
@@ -314,6 +357,15 @@ class LabJackInterface(BaseInterface):
                 # Add EF channels from cache
                 ef_channels = self.get_ef_channels()
                 ef_names = [channel['name'] for channel in ef_channels]
+
+                # If EF channels are active on AINx, avoid simultaneously reading the
+                # corresponding base AINx key to prevent ambiguous downstream matching.
+                ef_base_ains = set()
+                for ef_name in ef_names:
+                    if isinstance(ef_name, str) and "_EF_READ_" in ef_name:
+                        ef_base_ains.add(ef_name.split("_EF_READ_", 1)[0].upper())
+                if ef_base_ains:
+                    standard_names = [n for n in standard_names if n.upper() not in ef_base_ains]
                 
                 # Combine all names for a single bulk read
                 all_names_to_read = standard_names + ef_names
@@ -711,6 +763,11 @@ class LabJackInterface(BaseInterface):
         if not self.is_connected():
             return []
         
+        # In streaming mode we prefer stable cache over periodic rediscovery,
+        # because full EF scans can briefly interrupt high-rate reads.
+        if not force_refresh and not self.AUTO_REFRESH_EF_CHANNELS and self._ef_channels_cache:
+            return self._ef_channels_cache
+
         # Check cache validity
         current_time = time.time()
         if not force_refresh and self._ef_channels_cache and \

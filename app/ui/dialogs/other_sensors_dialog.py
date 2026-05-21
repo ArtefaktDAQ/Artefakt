@@ -21,7 +21,9 @@ class AddEditSensorDialog(QDialog):
         self.setWindowTitle("Add Sensor" if sensor is None else "Edit Sensor")
         self.resize(400, 300)
         self.setStyleSheet(DialogStyles.dark_dialog())
-        self.sensor = sensor.copy() if sensor else {"name": "", "type": "", "mapping": "", "unit": "", "offset": 0.0, "color": "#4287f5", "show_in_graph": True}
+        self.sensor = sensor.copy() if sensor else {"name": "", "type": "", "mapping": "", "unit": "", "offset": 0.0, "conversion_factor": 1.0, "color": "#4287f5", "show_in_graph": True}
+        if "conversion_factor" not in self.sensor:
+            self.sensor["conversion_factor"] = 1.0
         if not self.sensor.get("interface_type"):
             self.sensor["interface_type"] = "OtherSerial"
         self.sequences = sequences or []
@@ -42,6 +44,11 @@ class AddEditSensorDialog(QDialog):
         # Offset
         self.offset_edit = QLineEdit(str(self.sensor.get("offset", 0.0)))
         layout.addRow("Offset:", self.offset_edit)
+        
+        # Multiplier (Conversion Factor)
+        self.conversion_factor_edit = QLineEdit(str(self.sensor.get("conversion_factor", 1.0)))
+        self.conversion_factor_edit.setToolTip("Scaling factor applied to raw value (e.g., 0.1 for divide by 10)")
+        layout.addRow("Multiplier:", self.conversion_factor_edit)
 
         # Color with color picker button
         color_layout = QHBoxLayout()
@@ -79,15 +86,38 @@ class AddEditSensorDialog(QDialog):
 
         # If editing, preselect mapping
         mapping = self.sensor.get("mapping", "")
-        if mapping and ":" in mapping:
-            seq_name, var = mapping.split(":", 1)
-            idx = self.sequence_combo.findText(seq_name)
-            if idx >= 0:
-                self.sequence_combo.setCurrentIndex(idx)
-                self.update_variable_combo()
-                var_idx = self.variable_combo.findText(var)
-                if var_idx >= 0:
-                    self.variable_combo.setCurrentIndex(var_idx)
+        if mapping:
+            if ":" in mapping:
+                seq_name, var = mapping.split(":", 1)
+                idx = self.sequence_combo.findText(seq_name)
+                if idx >= 0:
+                    self.sequence_combo.setCurrentIndex(idx)
+                    self.update_variable_combo()
+                    var_idx = self.variable_combo.findText(var)
+                    if var_idx >= 0:
+                        self.variable_combo.setCurrentIndex(var_idx)
+            else:
+                # Try to find which sequence has this variable
+                found = False
+                for i in range(1, self.sequence_combo.count()):
+                    seq = self.sequence_combo.itemData(i)
+                    if not seq: continue
+                    steps_or_actions = seq.get("actions") or seq.get("steps") or []
+                    for action in steps_or_actions:
+                        if (action.get("type") or "").strip().lower() == "publish":
+                            target = action.get("target")
+                            if target == mapping:
+                                self.sequence_combo.setCurrentIndex(i)
+                                self.update_variable_combo()
+                                var_idx = self.variable_combo.findText(mapping)
+                                if var_idx >= 0:
+                                    self.variable_combo.setCurrentIndex(var_idx)
+                                found = True
+                                break
+                    if found: break
+                
+                if not found:
+                    self.update_variable_combo()
         else:
             self.update_variable_combo()
 
@@ -157,15 +187,22 @@ class AddEditSensorDialog(QDialog):
         var = self.variable_combo.currentText() if self.variable_combo.isEnabled() else ""
         if seq and var:
             mapping = f"{seq.get('name','')}:{var}"
+        
+        # Preserve original interface_type if it was Serial or OtherSerial
+        orig_type = self.sensor.get("interface_type", "OtherSerial")
+        if orig_type not in ("Serial", "OtherSerial"):
+            orig_type = "OtherSerial"
+            
         return {
             "name": self.name_edit.text().strip(),
             "type": self.type_edit.text().strip(),
             "mapping": mapping,
             "unit": self.unit_edit.text().strip(),
             "offset": float(self.offset_edit.text().strip() or 0.0),
+            "conversion_factor": float(self.conversion_factor_edit.text().strip() or 1.0),
             "color": self.color_edit.text().strip() or "#4287f5",
             "show_in_graph": self.show_in_graph_checkbox.isChecked(),
-            "interface_type": "OtherSerial",
+            "interface_type": orig_type,
         }
 
 class OtherSensorsDialog(QDialog):
@@ -600,8 +637,9 @@ class OtherSensorsDialog(QDialog):
     def handle_autoconnect(self):
         """Handle auto-connect if the checkbox is checked"""
         if self.autoconnect_checkbox.isChecked():
-            # Check if the user has manually disconnected
+            # Check current connection state and manual-disconnect guard
             is_connected = False
+            manually_disconnected = False
             if hasattr(self.parent(), 'data_collection_controller'):
                 data_controller = self.parent().data_collection_controller
                 if hasattr(data_controller, 'interfaces') and 'other_serial' in data_controller.interfaces:
@@ -613,11 +651,18 @@ class OtherSensorsDialog(QDialog):
                             if isinstance(value, dict) and value.get('connected', False):
                                 is_connected = True
                                 break
-            if not is_connected:
-                print("DEBUG OtherSensorsDialog: Auto-connect is enabled, but respecting manual disconnection. Not reconnecting.")
+                manually_disconnected = bool(getattr(data_controller, 'other_serial_manually_disconnected', False))
+
+            if is_connected:
+                print("DEBUG OtherSensorsDialog: Auto-connect enabled, interface already connected. Skipping.")
+                return
+
+            if manually_disconnected:
+                print("DEBUG OtherSensorsDialog: Auto-connect enabled, but respecting manual disconnection. Not reconnecting.")
                 if hasattr(self.parent(), 'logger'):
                     self.parent().logger.log("Auto-connect enabled but respecting manual disconnection. Not reconnecting.", "INFO")
                 return
+
             print("DEBUG OtherSensorsDialog: Auto-connect is enabled, connecting...")
             if hasattr(self.parent(), 'logger'):
                 self.parent().logger.log("Auto-connecting Other Serial sensors...", "INFO")
@@ -650,8 +695,18 @@ class OtherSensorsDialog(QDialog):
                     actual_connected = data_controller.interfaces['other_serial']['connected']
                     print(f"DEBUG OtherSensorsDialog: accept - actual connection status from data_collection_controller: {actual_connected}")
         
-        # Use the actual connection status, or fallback to button status
-        is_connected = actual_connected or is_connected
+        # Prefer actual runtime connection status when available.
+        # Falling back to button text can keep stale UI state after failed connections.
+        has_actual_status = False
+        if hasattr(self.parent(), 'data_collection_controller'):
+            data_controller = self.parent().data_collection_controller
+            if hasattr(data_controller, 'interfaces') and 'other_serial' in data_controller.interfaces:
+                if isinstance(data_controller.interfaces['other_serial'], dict) and 'connected' in data_controller.interfaces['other_serial']:
+                    has_actual_status = True
+
+        if has_actual_status:
+            is_connected = actual_connected
+
         print(f"DEBUG OtherSensorsDialog: accept - using connection status: {is_connected}")
         
         # If we're in a disconnected state when closing, ensure values show as "--"
@@ -705,7 +760,9 @@ class AddEditActionDialog(QDialog):
         self.setWindowTitle("Add Action" if action is None else "Edit Action")
         self.resize(400, 220)
         self.setStyleSheet(DialogStyles.dark_dialog())
-        self.action = action.copy() if action else {"type": "send", "command": "", "ms": 200, "source": "", "target": "", "parse_mode": "after", "start": "", "end": ""}
+        self.action = action.copy() if action else {"type": "send", "command": "", "ms": 200, "source": "", "target": "", "parse_mode": "after", "start": "", "end": "", "line_ending": "LF (\\n)", "multiplier": 1.0}
+        if "multiplier" not in self.action:
+            self.action["multiplier"] = 1.0
         self.variables = variables or []
         self.setup_ui()
 
@@ -717,6 +774,14 @@ class AddEditActionDialog(QDialog):
         layout.addRow("Type:", self.type_combo)
 
         self.command_edit = QLineEdit(self.action.get("command", ""))
+        self.line_ending_combo = QComboBox()
+        self.line_ending_combo.addItems(["None", "LF (\\n)", "CR (\\r)", "CRLF (\\r\\n)"])
+        current_le = self.action.get("line_ending", "None")
+        if current_le == "\n": current_le = "LF (\\n)"
+        elif current_le == "\r": current_le = "CR (\\r)"
+        elif current_le == "\r\n": current_le = "CRLF (\\r\\n)"
+        self.line_ending_combo.setCurrentText(current_le)
+
         self.ms_edit = QLineEdit(str(self.action.get("ms", 200)))
         self.source_edit = QLineEdit(self.action.get("source", ""))
         self.target_edit = QLineEdit(self.action.get("target", ""))
@@ -726,9 +791,15 @@ class AddEditActionDialog(QDialog):
         # For publish: dropdown of known variables
         self.publish_var_combo = QComboBox()
         self.publish_var_combo.addItems(self.variables)
-        if self.action.get("target") and self.action["target"] in self.variables:
-            self.publish_var_combo.setCurrentText(self.action["target"])
+        if self.action.get("source_var") and self.action["source_var"] in self.variables:
+            self.publish_var_combo.setCurrentText(self.action["source_var"])
+        elif self.action.get("source") and self.action["source"] in self.variables:
+            self.publish_var_combo.setCurrentText(self.action["source"])
         self.publish_var_combo.setToolTip("Select the variable to publish as the sensor value.")
+
+        # For publish: edit for the published name
+        self.publish_target_edit = QLineEdit(self.action.get("target", "value"))
+        self.publish_target_edit.setToolTip("The name the variable will be known as in the system.")
 
         # Parse options
         self.parse_mode_combo = QComboBox()
@@ -747,8 +818,11 @@ class AddEditActionDialog(QDialog):
         self.parse_mode_combo.setCurrentIndex(parse_mode_map.get(self.action.get("parse_mode", "after"), 0))
         self.parse_start = QLineEdit(self.action.get("start", ""))
         self.parse_end = QLineEdit(self.action.get("end", ""))
+        self.multiplier_edit = QLineEdit(str(self.action.get("multiplier", 1.0)))
+        self.multiplier_edit.setToolTip("Scale factor applied to the parsed numerical value (e.g. 0.1 to divide by 10)")
 
         layout.addRow("Command (send):", self.command_edit)
+        layout.addRow("Line ending (send):", self.line_ending_combo)
         layout.addRow("Wait time ms (wait):", self.ms_edit)
         # For read: only show target
         self.read_target_label = QLabel("Store result in variable:")
@@ -764,7 +838,9 @@ class AddEditActionDialog(QDialog):
         layout.addRow("Parse mode:", self.parse_mode_combo)
         layout.addRow("Start text:", self.parse_start)
         layout.addRow("End text:", self.parse_end)
-        layout.addRow("Publish variable:", self.publish_var_combo)
+        layout.addRow("Multiplier (scale):", self.multiplier_edit)
+        layout.addRow("Source variable (publish):", self.publish_var_combo)
+        layout.addRow("Published name (publish):", self.publish_target_edit)
 
         self.type_combo.currentTextChanged.connect(self.update_fields)
         self.parse_mode_combo.currentIndexChanged.connect(self.update_parse_fields)
@@ -784,6 +860,7 @@ class AddEditActionDialog(QDialog):
 
     def update_fields(self, typ):
         self.command_edit.setVisible(typ == "send")
+        self.line_ending_combo.setVisible(typ == "send")
         self.ms_edit.setVisible(typ == "wait")
         # For read: only show target
         self.read_target_label.setVisible(typ == "read")
@@ -795,7 +872,9 @@ class AddEditActionDialog(QDialog):
         self.parse_mode_combo.setVisible(typ == "parse")
         self.parse_start.setVisible(typ == "parse")
         self.parse_end.setVisible(typ == "parse")
+        self.multiplier_edit.setVisible(typ == "parse")
         self.publish_var_combo.setVisible(typ == "publish")
+        self.publish_target_edit.setVisible(typ == "publish")
         self.update_parse_fields(self.parse_mode_combo.currentIndex())
 
     def update_parse_fields(self, idx):
@@ -825,6 +904,7 @@ class AddEditActionDialog(QDialog):
         action = {"type": typ}
         if typ == "send":
             action["command"] = self.command_edit.text()
+            action["line_ending"] = self.line_ending_combo.currentText()
         elif typ == "wait":
             action["ms"] = int(self.ms_edit.text().strip() or 200)
         elif typ == "read":
@@ -846,9 +926,10 @@ class AddEditActionDialog(QDialog):
                 action["end"] = self.parse_end.text()
             elif idx == 3:
                 action["parse_mode"] = "entire"
+            action["multiplier"] = float(self.multiplier_edit.text().strip() or 1.0)
         elif typ == "publish":
-            action["source_var"] = "value"  # Default source variable
-            action["target"] = self.publish_var_combo.currentText()
+            action["source_var"] = self.publish_var_combo.currentText()
+            action["target"] = self.publish_target_edit.text().strip() or "value"
         return action
 
 class AddEditSequenceDialog(QDialog):
@@ -883,7 +964,7 @@ class AddEditSequenceDialog(QDialog):
                         "type": "read",
                         "read_type": step.get("read_type", "Read Line"),
                         "timeout": int(step.get("timeout", 1000) or 1000),
-                        "target": step.get("result_var", "response"),
+                        "target": step.get("result_var") or step.get("target") or "response",
                     })
                 elif step_type == "ParseValue":
                     # Convert ParseValue parameters to the UI's parse schema as best as possible
@@ -897,8 +978,8 @@ class AddEditSequenceDialog(QDialog):
                         parse_mode = "before"
                     normalized = {
                         "type": "parse",
-                        "source": step.get("source_var", "response"),
-                        "target": step.get("result_var", "value"),
+                        "source": step.get("source_var") or step.get("source") or "response",
+                        "target": step.get("result_var") or step.get("target") or "value",
                         "parse_mode": parse_mode,
                     }
                     if parse_mode in ("after", "between"):
@@ -909,8 +990,8 @@ class AddEditSequenceDialog(QDialog):
                 elif st_lower == "publish":
                     normalized_actions.append({
                         "type": "publish",
-                        "source": step.get("source_var", "value"),
-                        "target": step.get("target", ""),
+                        "source_var": step.get("source_var") or step.get("source") or "value",
+                        "target": step.get("target", "value"),
                     })
             self.sequence["actions"] = normalized_actions
         if isinstance(self.sequence.get("actions"), str):
@@ -945,7 +1026,7 @@ class AddEditSequenceDialog(QDialog):
         layout.addRow("Poll Interval (seconds):", self.poll_interval_edit)
 
         self.auto_connect_checkbox = QCheckBox("Auto-connect on startup")
-        self.auto_connect_checkbox.setChecked(self.sequence.get("auto_connect", True))
+        self.auto_connect_checkbox.setChecked(self.sequence.get("auto_connect", False))
         layout.addRow("", self.auto_connect_checkbox)
 
         self.actions_table = QTableWidget()
@@ -1021,7 +1102,8 @@ class AddEditSequenceDialog(QDialog):
         for i, action in enumerate(actions):
             typ = action.get("type", "")
             if typ == "send":
-                details = f'Command: {action.get("command", "")}'
+                le = action.get("line_ending", "None")
+                details = f'Command: {action.get("command", "")} (Ending: {le})'
             elif typ == "wait":
                 details = f'Wait: {action.get("ms", "")} ms'
             elif typ == "read":
@@ -1039,7 +1121,7 @@ class AddEditSequenceDialog(QDialog):
                 else:
                     details = "Parse"
             elif typ == "publish":
-                details = f'Publish variable: {action.get("target", "")}'
+                details = f'Publish "{action.get("source_var") or action.get("source", "")}" as "{action.get("target", "")}"'
             else:
                 details = ""
             self.actions_table.setItem(i, 0, QTableWidgetItem(typ))
@@ -1227,12 +1309,37 @@ class TestSequenceDialog(QDialog):
 
     def execute_action(self, action):
         typ = action.get("type")
+        
+        def get_var_case_insensitive(name):
+            if not name: return ""
+            # Try exact match
+            if name in self.variables:
+                return self.variables[name]
+            # Try case-insensitive
+            name_lower = name.lower()
+            for k, v in self.variables.items():
+                if k.lower() == name_lower:
+                    return v
+            return ""
+
         try:
             if typ == "send":
-                cmd = action.get("command", "").encode("utf-8")
+                cmd_str = action.get("command", "")
+                le = action.get("line_ending", "None").lower()
+                
+                # Append line ending based on configuration
+                if "cr" in le and "lf" in le:
+                    cmd_str += "\r\n"
+                elif "lf" in le or le == "\\n":
+                    cmd_str += "\n"
+                elif "cr" in le or le == "\\r":
+                    cmd_str += "\r"
+                # If "None", no line ending is added, matching real behavior
+                
+                cmd = cmd_str.encode("utf-8")
                 if self.serial and self.serial.is_open:
-                    self.serial.write(cmd + b"\n")
-                    self.log(f"Sent: {cmd}")
+                    self.serial.write(cmd)
+                    self.log(f"Sent: {repr(cmd_str)}")
                 else:
                     self.log("Port not open.")
             elif typ == "wait":
@@ -1252,7 +1359,7 @@ class TestSequenceDialog(QDialog):
             elif typ == "parse":
                 source = action.get("source", "")
                 target = action.get("target", "parsed")
-                val = self.variables.get(source, "")
+                val = get_var_case_insensitive(source)
                 mode = action.get("parse_mode", "after")
                 start = action.get("start", "")
                 end = action.get("end", "")
@@ -1269,11 +1376,25 @@ class TestSequenceDialog(QDialog):
                     result = val[:idx] if idx != -1 else ""
                 elif mode == "entire":
                     result = val
+                
+                # Apply multiplier if result is a number
+                try:
+                    import re
+                    num_match = re.search(r'[-+]?\d*\.\d+|\d+', result)
+                    if num_match:
+                        multiplier = float(action.get("multiplier", 1.0))
+                        # Note: we store it back as a string or number depending on context, 
+                        # but here we'll just store the scaled value
+                        result = str(float(num_match.group(0)) * multiplier)
+                except (ValueError, TypeError):
+                    pass
+                    
                 self.variables[target] = result
                 self.log(f"Parsed {source} -> {target}: {result}")
             elif typ == "publish":
-                target = action.get("target", "")
-                value = self.variables.get(target, "")
+                # Fix: use source_var or source, not target, to look up the variable
+                source_var = action.get("source_var") or action.get("source") or "value"
+                value = get_var_case_insensitive(source_var)
                 self.log(f"Published value: {value}")
             else:
                 self.log(f"Unknown action type: {typ}")

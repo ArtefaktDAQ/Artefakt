@@ -1340,7 +1340,7 @@ PERFORMANCE:
             "title": "Custom Interfaces",
             "icon": "🐍",
             "content": """DEVELOPER GUIDE:
-You can extend EvoLabs DAQ with your own hardware interfaces using Python scripts.
+You can extend Artefakt DAQ with your own hardware interfaces using Python scripts.
 
 HOW IT WORKS:
 1. Create a new Python file in the 'plugins' folder.
@@ -1447,6 +1447,24 @@ Use curly braces {} to use sensor values or variables in commands or conditions:
 
 SENSORS IN EXPRESSIONS:
 Any active sensor name can be used as a variable in expressions."""
+        },
+        {
+            "title": "System Variables",
+            "icon": "🖥️",
+            "content": """In addition to sensors and custom variables, the system provides several built-in variables that you can use in expressions and commands:
+
+DAQ STATE:
+• {is_running}: True if data acquisition is active, False otherwise.
+• {is_recording}: True if any camera is currently recording video.
+
+SEQUENCE INFO:
+• {current_sequence_name}: The name of the sequence currently executing.
+
+HOW TO USE:
+You can use these in conditions: {is_running} == True
+Or in commands: "Current sequence: {current_sequence_name}"
+
+Note: These are updated in real-time as the system state changes."""
         },
         {
             "title": "Asynchronous Actions",

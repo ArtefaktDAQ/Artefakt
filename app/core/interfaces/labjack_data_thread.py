@@ -16,7 +16,7 @@ class LabJackDataThread(QThread):
     connection_status_signal = pyqtSignal(bool, str) # connected (bool), message (str)
     error_signal = pyqtSignal(str)
 
-    def __init__(self, labjack_interface=None, sampling_rate=10, parent=None):
+    def __init__(self, labjack_interface=None, sampling_rate=1, parent=None):
         super().__init__(parent)
         self._labjack_interface = labjack_interface
         self._sampling_rate = sampling_rate

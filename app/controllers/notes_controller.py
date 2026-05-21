@@ -116,6 +116,35 @@ class NotesController(QObject):
         # Ensure it's saved
         self.trigger_autosave()
 
+    def insert_at_location(self, html_content, search_anchor=None):
+        """
+        Insert HTML content at a specific location.
+        If search_anchor is provided, it finds that text and inserts after it.
+        Otherwise, it appends to the end of the document.
+        """
+        if not self.notes_editor:
+            return False
+            
+        document = self.notes_editor.document()
+        
+        if search_anchor:
+            # Create a virtual cursor for searching to avoid moving the visible cursor
+            search_cursor = QTextCursor(document)
+            # Find the anchor text
+            found_cursor = document.find(search_anchor, search_cursor)
+            
+            if not found_cursor.isNull():
+                # Move to the end of the block (paragraph) where it was found
+                found_cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+                # Insert a newline then the content
+                found_cursor.insertHtml("<br/>" + html_content)
+                self.trigger_autosave()
+                return True
+        
+        # Fallback: Append to the end
+        self.append_to_note(html_content)
+        return True
+
     def on_tab_changed(self, index):
         """Called when the tab selection changes in the stacked widget"""
         # Find the notes tab index dynamically

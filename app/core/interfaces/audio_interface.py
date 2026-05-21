@@ -499,6 +499,8 @@ class AudioSensorInterface(BaseInterface):
         self.mode = mode
         self.sensor_thread = None
         self.current_data = {}
+        self.last_spectrum = None # (freqs, magnitudes)
+        self.last_levels = (0.0, 0.0) # (rms, peak)
         self._data_lock = Lock()
         
         # Audio settings
@@ -541,6 +543,8 @@ class AudioSensorInterface(BaseInterface):
             
             # Connect signals
             self.sensor_thread.data_ready.connect(self._on_data_ready)
+            self.sensor_thread.level_update.connect(self._on_level_update)
+            self.sensor_thread.spectrum_update.connect(self._on_spectrum_update)
             
             if self.sensor_thread.connect(self.device_id, self.sample_rate, self.chunk_size):
                 self.connected = True
@@ -609,6 +613,16 @@ class AudioSensorInterface(BaseInterface):
         with self._data_lock:
             self.current_data = data
     
+    def _on_level_update(self, rms, peak):
+        """Handle level updates for preview"""
+        with self._data_lock:
+            self.last_levels = (rms, peak)
+            
+    def _on_spectrum_update(self, freqs, magnitudes):
+        """Handle spectrum updates for preview"""
+        with self._data_lock:
+            self.last_spectrum = (freqs, magnitudes)
+    
     def set_mode(self, mode):
         """Set measurement mode"""
         self.mode = mode
@@ -634,7 +648,8 @@ class AudioSensorInterface(BaseInterface):
         if self.sensor_thread:
             self.sensor_thread.update_settings(settings)
     
-    def get_output_keys(self):
+    @classmethod
+    def get_output_keys(cls):
         """Get list of output keys for current mode"""
         # Return all available keys - user can choose which to graph
         return [

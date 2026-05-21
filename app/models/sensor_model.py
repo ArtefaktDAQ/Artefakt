@@ -8,7 +8,7 @@ class SensorModel:
                  enabled=True, show_in_graph=True, sequence_config=None, 
                  audio_config=None, optical_config=None,
                  stale_timeout_factor=None, averaging_enabled=False,
-                 auto_connect=True, use_secondary_axis=False):
+                 auto_connect=False, use_secondary_axis=False):
         self.name = name
         self.interface_type = interface_type
         self.port = port
@@ -150,7 +150,7 @@ class SensorModel:
         # Create the basic sensor object
         sensor = cls(
             name=data.get("name", ""),
-            interface_type=data.get("interface_type", ""),
+            interface_type=data.get("interface_type") or data.get("type") or "",
             port=data.get("port", ""),
             unit=data.get("unit", ""),
             offset=data.get("offset", 0.0),
@@ -159,7 +159,7 @@ class SensorModel:
             enabled=data.get("enabled", True),
             show_in_graph=data.get("show_in_graph", True),
             averaging_enabled=data.get("averaging_enabled", False),
-            auto_connect=data.get("auto_connect", True),
+            auto_connect=data.get("auto_connect", False),
             use_secondary_axis=data.get("use_secondary_axis", False),
             sequence_config=data.get("sequence_config", {}),
             audio_config=data.get("audio_config", {}),
@@ -170,12 +170,18 @@ class SensorModel:
         if "mapping" in data:
             sensor.mapping = data["mapping"]
         
+        # Patch: Set poll rate info if present
+        if "poll_rate" in data:
+            sensor.poll_rate = float(data["poll_rate"])
+        if "poll_interval" in data:
+            sensor.poll_interval = float(data["poll_interval"])
+        
         # Load calibration data if present
         if "calibration_data" in data:
             sensor.calibration_data = data["calibration_data"]
         
         # Special handling for OtherSerial sensors - extract additional properties from sequence_config
-        if sensor.interface_type == "OtherSerial" and sensor.sequence_config:
+        if sensor.interface_type in ("OtherSerial", "Serial") and sensor.sequence_config:
             # Set properties directly from sequence_config
             sequence_config = sensor.sequence_config
             sensor.baud_rate = sequence_config.get("baud_rate", 9600)
@@ -200,18 +206,21 @@ class SensorModel:
                     # If SerialSequence import fails, we'll just keep sequence_config
                     # and the sensor will be recreated when used
                     sensor.sequence = None
+                except Exception:
+                    sensor.sequence = None
         
         # Special handling for LabJack sensors to ensure all properties are set
         elif sensor.interface_type == "LabJack":
-            # Properly initialize LabJack-specific properties
+            # properly initialize LabJack-specific properties
             # Make sure the port is exactly as expected for a LabJack channel
             if sensor.port:
-                if " - " in sensor.port:
+                sensor_port_str = str(sensor.port)
+                if " - " in sensor_port_str:
                     # Extract the actual channel name from the description format
-                    sensor.port = sensor.port.split(" - ")[0].strip()
+                    sensor.port = sensor_port_str.split(" - ")[0].strip()
                 
                 # Make sure we don't have a header
-                if sensor.port.startswith("---"):
+                if str(sensor.port).startswith("---"):
                     sensor.port = ""
                 
             # Make sure conversion_factor is properly set

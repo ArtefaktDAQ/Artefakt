@@ -10,7 +10,7 @@ from app.ui.theme import GroupBoxStyles, DialogStyles, TableStyles
 from app.models.automation import (  # Adjusted import
     TimeDurationTrigger, TimeSpecificTrigger, SensorValueTrigger, EventTrigger,
     OpticalEventTrigger, AudioEventTrigger, CompoundTrigger,
-    ArduinoCommandAction, LabJackCommandAction, SerialCommandAction, SystemAction,
+    ArduinoCommandAction, LabJackCommandAction, SerialCommandAction, PluginCommandAction, SystemAction,
     SetVariableAction, JumpToStepAction, ConditionAction, InfoMarkerAction,
     MQTTPublishAction,
     AutomationStep, AutomationSequence
@@ -702,6 +702,7 @@ class ActionDialog(QDialog):
             "Send Arduino Command": ArduinoCommandAction,
             "Send LabJack Command": LabJackCommandAction,
             "Send Serial Command": SerialCommandAction,
+            "Send Plugin Command": PluginCommandAction,
             "MQTT Publish": MQTTPublishAction,
             "System Action": SystemAction,
             "Set Variable": SetVariableAction,
@@ -732,6 +733,7 @@ class ActionDialog(QDialog):
             "Send Arduino Command",
             "Send LabJack Command",
             "Send Serial Command",
+            "Send Plugin Command",
             "MQTT Publish",
             "System Action",
             "Set Variable",
@@ -759,6 +761,10 @@ class ActionDialog(QDialog):
         # Serial command options
         self.serial_widget = self.create_serial_options()
         self.action_options.addTab(self.serial_widget, "Serial")
+        
+        # Plugin command options
+        self.plugin_widget = self.create_plugin_options()
+        self.action_options.addTab(self.plugin_widget, "Plugin")
         
         # System action options
         self.system_widget = self.create_system_options()
@@ -890,6 +896,38 @@ class ActionDialog(QDialog):
         
         layout.addRow("Port:", self.serial_port)
         layout.addRow("Command:", self.serial_command)
+        
+        return widget
+
+    def create_plugin_options(self):
+        """Create options for direct plugin command"""
+        widget = QGroupBox("Plugin Command")
+        widget.setStyleSheet(GroupBoxStyles.compact())
+        layout = QFormLayout(widget)
+        
+        self.plugin_selector = QComboBox()
+        # Populate with available plugins from context if possible
+        available_plugins = []
+        if self.app_context and 'interfaces' in self.app_context:
+            serial_manager = self.app_context['interfaces'].get('serial_manager')
+            if serial_manager and hasattr(serial_manager, 'interface_threads'):
+                available_plugins = list(serial_manager.interface_threads.keys())
+        
+        if not available_plugins:
+            available_plugins = ["Dwyer16B"] # Fallback
+            
+        self.plugin_selector.addItems(available_plugins)
+        self.plugin_selector.setEditable(True)
+        
+        self.plugin_command = QLineEdit()
+        self.plugin_command.setPlaceholderText("Enter command (e.g., SV=25.0)")
+        
+        layout.addRow("Plugin:", self.plugin_selector)
+        layout.addRow("Command:", self.plugin_command)
+        
+        help_label = QLabel("Directly talk to a plugin. For Dwyer16B use SV=value.")
+        help_label.setStyleSheet("font-size: 9pt; color: gray;")
+        layout.addRow(help_label)
         
         return widget
 
@@ -1114,12 +1152,13 @@ class ActionDialog(QDialog):
             "Send Arduino Command": 0,
             "Send LabJack Command": 1,
             "Send Serial Command": 2,
-            "System Action": 3,
-            "Set Variable": 4,
-            "Info Marker": 5,
-            "MQTT Publish": 6,
-            "Jump to Step": 7,
-            "Condition (If/Else Jump)": 8
+            "Send Plugin Command": 3,
+            "System Action": 4,
+            "Set Variable": 5,
+            "Info Marker": 6,
+            "MQTT Publish": 7,
+            "Jump to Step": 8,
+            "Condition (If/Else Jump)": 9
         }
         action_text = self.action_type.currentText()
         index = type_map.get(action_text, 0) # Default to first tab if not found
@@ -1133,6 +1172,7 @@ class ActionDialog(QDialog):
             ArduinoCommandAction: ("Send Arduino Command", self.arduino_command, "command"),
             LabJackCommandAction: ("Send LabJack Command", None, None), # Special handling
             SerialCommandAction: ("Send Serial Command", self.serial_command, "command"), # Port handling needed
+            PluginCommandAction: ("Send Plugin Command", self.plugin_command, "command"),
             MQTTPublishAction: ("MQTT Publish", None, None),
             SystemAction: ("System Action", None, None), # Special handling
             SetVariableAction: ("Set Variable", None, None), # <<< Added, special handling
@@ -1176,6 +1216,9 @@ class ActionDialog(QDialog):
             elif isinstance(action, SerialCommandAction):
                  self.serial_port.setCurrentText(action.port) # Set port separately
                  self.serial_command.setText(action.command)
+            elif isinstance(action, PluginCommandAction):
+                 self.plugin_selector.setCurrentText(action.plugin_name)
+                 self.plugin_command.setText(action.command)
             elif isinstance(action, MQTTPublishAction):
                  self.mqtt_topic.setText(action.topic)
                  self.mqtt_payload.setText(action.payload)
@@ -1245,6 +1288,11 @@ class ActionDialog(QDialog):
             port = self.serial_port.currentText().strip() # Use currentText for editable combo box
             command = self.serial_command.text().strip()
             return SerialCommandAction(name, port, command)
+
+        elif action_type == "Send Plugin Command":
+            plugin_name = self.plugin_selector.currentText().strip()
+            command = self.plugin_command.text().strip()
+            return PluginCommandAction(name, plugin_name, command)
 
         elif action_type == "MQTT Publish":
             topic = self.mqtt_topic.text().strip()
@@ -1730,7 +1778,7 @@ class SequenceDialog(QDialog):
         # If we were editing an existing sequence, return the modified original
         if self.original_sequence:
              self.original_sequence.name = name
-             self.original_sequence.steps = self.steps.copy()
+             self.original_sequence.set_steps(self.steps.copy())
              self.original_sequence.loop = is_loop
              self.original_sequence.run_linked = is_run_linked
              return self.original_sequence

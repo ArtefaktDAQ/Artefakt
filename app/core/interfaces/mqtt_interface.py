@@ -46,6 +46,18 @@ class MQTTInterface(BaseInterface):
     # Connection lost callback
     on_connection_lost = None
     
+    @classmethod
+    def get_output_keys(cls):
+        """Return a list of available MQTT topics.
+        Note: For MQTT, this is dynamic and requires a connection.
+        """
+        return []
+
+    def get_instance_output_keys(self):
+        """Return a list of topics received during the current connection."""
+        with self._buffer_lock:
+            return sorted(list(self.subscribed_topics))
+
     def __init__(self, broker="localhost", port=1883, client_id="ArtefaktDAQ", 
                  username=None, password=None, keepalive=60):
         """
@@ -242,3 +254,10 @@ class MQTTInterface(BaseInterface):
         except Exception as e:
             self.error_message = f"Failed to publish MQTT message: {e}"
             return False
+            
+    def update_settings(self, settings):
+        """Update MQTT settings at runtime (limited)"""
+        if "broker" in settings or "port" in settings:
+            # Requires reconnect
+            pass
+        return True

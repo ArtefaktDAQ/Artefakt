@@ -42,7 +42,11 @@ class AutomationController(QObject):
         # for executing system actions.
         initial_context = {
             'main_window': self.main_window,
-            'interfaces': getattr(self.main_window, 'interfaces', {}),
+            'interfaces': {
+                'arduino': getattr(self.main_window, 'interfaces', {}).get('arduino'),
+                'labjack': getattr(self.main_window, 'interfaces', {}).get('labjack'),
+                'serial_manager': getattr(self.main_window, 'data_collection_controller', None)
+            },
             'data_logger': getattr(self.main_window, 'data_logger', None),
             'sound_player': getattr(self.main_window, 'sound_player', None),
             'sensor_controller': getattr(self.main_window, 'sensor_controller', None),
@@ -528,8 +532,6 @@ class AutomationController(QObject):
         print(f"Sequence '{sequence.name}' completed.")
         # Ensure timer continues running 
         self._ensure_dashboard_timer_active()
-        # Show completion notification
-        QMessageBox.information(self.main_window, "Sequence Complete", f"Automation sequence '{sequence.name}' finished successfully.")
 
     def on_sequence_step_changed(self, sequence, step_index):
          # This signal is crucial for updating step info promptly
@@ -1344,6 +1346,46 @@ class AutomationController(QObject):
                     {
                         "trigger": {"type": "TIME_DURATION", "name": "10s Burst", "minutes": 0, "seconds": 10},
                         "action": {"type": "SYSTEM_ACTION", "name": "Stop Recording", "specific_action_type": "stop_recording", "parameters": {}},
+                        "enabled": True
+                    }
+                ]
+            },
+            "🌡️ Temp Ramp (Love 16B)": {
+                "name": "Temperature Ramp Sequence",
+                "loop": False,
+                "run_linked": True,
+                "steps": [
+                    {
+                        "trigger": {"type": "TIME_DURATION", "name": "Start Delay", "minutes": 0, "seconds": 5},
+                        "action": {
+                            "type": "SERIAL_COMMAND", 
+                            "name": "Set 100°C", 
+                            "port": "COM1", 
+                            "command": "SV=100.0",
+                            "baudrate": 9600
+                        },
+                        "enabled": True
+                    },
+                    {
+                        "trigger": {"type": "TIME_DURATION", "name": "Hold 100°C", "minutes": 10, "seconds": 0},
+                        "action": {
+                            "type": "SERIAL_COMMAND", 
+                            "name": "Set 200°C", 
+                            "port": "COM1", 
+                            "command": "SV=200.0",
+                            "baudrate": 9600
+                        },
+                        "enabled": True
+                    },
+                    {
+                        "trigger": {"type": "TIME_DURATION", "name": "Hold 200°C", "minutes": 10, "seconds": 0},
+                        "action": {
+                            "type": "SERIAL_COMMAND", 
+                            "name": "Set 250°C", 
+                            "port": "COM1", 
+                            "command": "SV=250.0",
+                            "baudrate": 9600
+                        },
                         "enabled": True
                     }
                 ]

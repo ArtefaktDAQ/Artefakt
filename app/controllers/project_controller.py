@@ -1263,7 +1263,7 @@ class ProjectController(QObject):
 
         # Load CSV configuration from the run directory if it exists
         if hasattr(self.main_window, 'load_virtual_sensors'):
-            self.main_window.load_virtual_sensors()
+            self.main_window.load_virtual_sensors(is_run_load=True)
 
         # Update sidebar status
         self.main_window.sidebar_project_name.setText(project_name)
@@ -1277,9 +1277,6 @@ class ProjectController(QObject):
         self.update_status_text(f"Run '{run_name}' loaded successfully", "green")
         if hasattr(self.main_window, "update_run_context_text"):
             self.main_window.update_run_context_text("Loaded run", run_name)
-        
-        # Load sensor configuration from the run directory
-        self.load_sensors_from_run(run_dir)
         
         # Update project tree to show highlighting for the loaded run
         self.update_project_tree()
@@ -1412,7 +1409,7 @@ class ProjectController(QObject):
         # This prevents run-specific settings from overwriting global user preferences on startup
         if is_startup_load and hasattr(self.main_window, 'load_settings'):
             self.main_window.logger.log("Startup load: Overriding with global settings", "INFO")
-            self.main_window.load_settings(is_startup_load=True)
+            self.main_window.load_settings(is_startup_load=True, defer_hardware_init=True)
 
         # Emit status changed signal
         self.status_changed.emit()

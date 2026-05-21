@@ -46,7 +46,8 @@ class BaseTrigger(QObject):
         """Serialize trigger to a dictionary"""
         return {
             'type': self.trigger_type.name,
-            'name': self.name
+            'name': self.name,
+            'description': getattr(self, 'description', 'Base Trigger')
             # Subclasses will add their specific attributes
         }
 
@@ -54,19 +55,36 @@ class BaseTrigger(QObject):
     def from_dict(data):
         """Deserialize trigger from a dictionary"""
         trigger_type_name = data.get('type')
+        if not trigger_type_name:
+            raise KeyError("Missing 'type' in trigger data")
+            
         name = data.get('name')
+        if not name:
+            raise KeyError("Missing 'name' in trigger data")
         
         if trigger_type_name == TriggerType.TIME_DURATION.name:
+            if 'minutes' not in data or 'seconds' not in data:
+                raise KeyError(f"Trigger '{name}' (TIME_DURATION) requires 'minutes' and 'seconds'")
             return TimeDurationTrigger.from_dict(data)
         elif trigger_type_name == TriggerType.TIME_SPECIFIC.name:
+            if 'hour' not in data or 'minute' not in data:
+                raise KeyError(f"Trigger '{name}' (TIME_SPECIFIC) requires 'hour' and 'minute'")
             return TimeSpecificTrigger.from_dict(data)
         elif trigger_type_name == TriggerType.SENSOR_VALUE.name:
+            if 'sensor_name' not in data or 'operator' not in data or 'threshold' not in data:
+                raise KeyError(f"Trigger '{name}' (SENSOR_VALUE) requires 'sensor_name', 'operator', and 'threshold'")
             return SensorValueTrigger.from_dict(data)
         elif trigger_type_name == TriggerType.EVENT.name:
+            if 'event_type' not in data:
+                raise KeyError(f"Trigger '{name}' (EVENT) requires 'event_type'")
             return EventTrigger.from_dict(data)
         elif trigger_type_name == TriggerType.OPTICAL_EVENT.name:
+            if 'sensor_name' not in data or 'event_type' not in data:
+                raise KeyError(f"Trigger '{name}' (OPTICAL_EVENT) requires 'sensor_name' and 'event_type'")
             return OpticalEventTrigger.from_dict(data)
         elif trigger_type_name == TriggerType.AUDIO_EVENT.name:
+            if 'sensor_name' not in data or 'event_type' not in data:
+                raise KeyError(f"Trigger '{name}' (AUDIO_EVENT) requires 'sensor_name' and 'event_type'")
             return AudioEventTrigger.from_dict(data)
         elif trigger_type_name == TriggerType.COMPOUND.name:
             return CompoundTrigger.from_dict(data)
@@ -794,6 +812,7 @@ class ActionType(Enum):
     CONDITION = 7 # Added for conditional branching
     MQTT_PUBLISH = 8 # Added for MQTT support
     INFO_MARKER = 9 # Added for info markers on graph
+    PLUGIN_COMMAND = 10 # Added for direct plugin control
 
 class BaseAction(QObject):
     action_completed = pyqtSignal(object) # Signal when action is done
@@ -806,6 +825,7 @@ class BaseAction(QObject):
         self.description = "Base Action"
         self.is_async = False # Whether to run in a separate thread
         self.last_image_path = None # Store path of any image created by this action
+        self.last_error = ""
 
     def execute(self, context): # context provides access to interfaces (arduino, labjack, etc.)
         """Execute the action."""
@@ -819,7 +839,8 @@ class BaseAction(QObject):
         """Serialize action to a dictionary"""
         return {
             'type': self.action_type.name,
-            'name': self.name
+            'name': self.name,
+            'description': getattr(self, 'description', 'Base Action')
             # Subclasses add their specific attributes
         }
 
@@ -827,24 +848,52 @@ class BaseAction(QObject):
     def from_dict(data):
         """Deserialize action from a dictionary"""
         action_type_name = data.get('type')
+        if not action_type_name:
+            raise KeyError("Missing 'type' in action data")
+            
+        name = data.get('name')
+        if not name:
+            raise KeyError("Missing 'name' in action data")
         
         if action_type_name == ActionType.ARDUINO_COMMAND.name:
+            if 'command' not in data:
+                raise KeyError(f"Action '{name}' (ARDUINO_COMMAND) requires 'command'")
             return ArduinoCommandAction.from_dict(data)
         elif action_type_name == ActionType.LABJACK_COMMAND.name:
+            if 'channel' not in data or 'value' not in data:
+                raise KeyError(f"Action '{name}' (LABJACK_COMMAND) requires 'channel' and 'value'")
             return LabJackCommandAction.from_dict(data)
         elif action_type_name == ActionType.SERIAL_COMMAND.name:
+            if 'port' not in data or 'command' not in data:
+                raise KeyError(f"Action '{name}' (SERIAL_COMMAND) requires 'port' and 'command'")
             return SerialCommandAction.from_dict(data)
+        elif action_type_name == ActionType.PLUGIN_COMMAND.name:
+            if 'plugin_name' not in data or 'command' not in data:
+                raise KeyError(f"Action '{name}' (PLUGIN_COMMAND) requires 'plugin_name' and 'command'")
+            return PluginCommandAction.from_dict(data)
         elif action_type_name == ActionType.SYSTEM_ACTION.name:
+            if 'specific_action_type' not in data:
+                raise KeyError(f"Action '{name}' (SYSTEM_ACTION) requires 'specific_action_type'")
             return SystemAction.from_dict(data)
         elif action_type_name == ActionType.SET_VARIABLE.name:
+            if 'variable_name' not in data or 'expression' not in data:
+                raise KeyError(f"Action '{name}' (SET_VARIABLE) requires 'variable_name' and 'expression'")
             return SetVariableAction.from_dict(data)
         elif action_type_name == ActionType.JUMP_TO_STEP.name:
+            if 'target_step_index' not in data:
+                raise KeyError(f"Action '{name}' (JUMP_TO_STEP) requires 'target_step_index'")
             return JumpToStepAction.from_dict(data)
         elif action_type_name == ActionType.CONDITION.name:
+            if 'condition_expression' not in data or 'if_true_step' not in data:
+                raise KeyError(f"Action '{name}' (CONDITION) requires 'condition_expression' and 'if_true_step'")
             return ConditionAction.from_dict(data)
         elif action_type_name == ActionType.MQTT_PUBLISH.name:
+            if 'topic' not in data or 'payload' not in data:
+                raise KeyError(f"Action '{name}' (MQTT_PUBLISH) requires 'topic' and 'payload'")
             return MQTTPublishAction.from_dict(data)
         elif action_type_name == ActionType.INFO_MARKER.name:
+            if 'marker_text' not in data:
+                raise KeyError(f"Action '{name}' (INFO_MARKER) requires 'marker_text'")
             return InfoMarkerAction.from_dict(data)
         else:
             raise ValueError(f"Unknown action type: {action_type_name}")
@@ -862,19 +911,22 @@ class ArduinoCommandAction(BaseAction):
                 # Substitute variables if present
                 resolved_command = context.get('resolve_variables', lambda x: x)(self.command)
                 # Send command (assuming a method like send_command exists)
-                arduino_interface.send_command(resolved_command)
+                success = arduino_interface.send_command(resolved_command)
                 
-                # Track outbound command for data flow monitoring
-                main_window = context.get('main_window')
-                if main_window and hasattr(main_window, 'data_flow_controller'):
-                    sequence_name = context.get('current_sequence_name', 'Automation')
-                    main_window.data_flow_controller.record_outbound_command(
-                        target='arduino',
-                        command=resolved_command,
-                        source_automation=sequence_name
-                    )
-                
-                self.action_completed.emit(self)
+                if success:
+                    # Track outbound command for data flow monitoring
+                    main_window = context.get('main_window')
+                    if main_window and hasattr(main_window, 'data_flow_controller'):
+                        sequence_name = context.get('current_sequence_name', 'Automation')
+                        main_window.data_flow_controller.record_outbound_command(
+                            target='arduino',
+                            command=resolved_command,
+                            source_automation=sequence_name
+                        )
+                    
+                    self.action_completed.emit(self)
+                else:
+                    self.action_failed.emit(self, f"Arduino failed to execute command: {resolved_command}")
             except Exception as e:
                 self.action_failed.emit(self, f"Failed to send Arduino command: {e}")
         else:
@@ -918,21 +970,24 @@ class LabJackCommandAction(BaseAction):
                      resolved_value = self.value # Use original numeric value
                 
                 # Send command (assuming a method like write_channel exists)
-                labjack_interface.write_channel(resolved_channel, resolved_value)
+                success = labjack_interface.write_channel(resolved_channel, resolved_value)
                 
-                # Track outbound command for data flow monitoring
-                main_window = context.get('main_window')
-                if main_window and hasattr(main_window, 'data_flow_controller'):
-                    sequence_name = context.get('current_sequence_name', 'Automation')
-                    main_window.data_flow_controller.record_outbound_command(
-                        target='labjack',
-                        command=f"{resolved_channel}={resolved_value}",
-                        source_automation=sequence_name,
-                        channel=resolved_channel,
-                        value=resolved_value
-                    )
-                
-                self.action_completed.emit(self)
+                if success:
+                    # Track outbound command for data flow monitoring
+                    main_window = context.get('main_window')
+                    if main_window and hasattr(main_window, 'data_flow_controller'):
+                        sequence_name = context.get('current_sequence_name', 'Automation')
+                        main_window.data_flow_controller.record_outbound_command(
+                            target='labjack',
+                            command=f"{resolved_channel}={resolved_value}",
+                            source_automation=sequence_name,
+                            channel=resolved_channel,
+                            value=resolved_value
+                        )
+                    
+                    self.action_completed.emit(self)
+                else:
+                    self.action_failed.emit(self, f"LabJack failed to set {resolved_channel} to {resolved_value}")
             except Exception as e:
                 self.action_failed.emit(self, f"Failed to send LabJack command: {e}")
         else:
@@ -963,32 +1018,45 @@ class SerialCommandAction(BaseAction):
         
     def execute(self, context):
         # This requires a generic serial interface manager in the context
-        serial_manager = context.get('interfaces', {}).get('serial_manager') 
+        serial_manager = context.get('interfaces', {}).get('serial_manager')
         if serial_manager:
             try:
+                self.last_error = ""
                 # Substitute variables if present
                 resolved_port = context.get('resolve_variables', lambda x: x)(self.port)
                 resolved_command = context.get('resolve_variables', lambda x: x)(self.command)
                 
                 # Send command using the manager
-                serial_manager.send_command(resolved_port, resolved_command, self.baudrate, self.timeout)
+                success = serial_manager.send_command(resolved_port, resolved_command, self.baudrate, self.timeout)
                 
-                # Track outbound command for data flow monitoring
-                main_window = context.get('main_window')
-                if main_window and hasattr(main_window, 'data_flow_controller'):
-                    sequence_name = context.get('current_sequence_name', 'Automation')
-                    main_window.data_flow_controller.record_outbound_command(
-                        target='serial',
-                        command=resolved_command.strip(),
-                        source_automation=sequence_name,
-                        port=resolved_port
-                    )
-                
-                self.action_completed.emit(self)
+                if success:
+                    print(f"[Automation] Serial command success: {resolved_command.strip()} to {resolved_port}")
+                    # Track outbound command for data flow monitoring
+                    main_window = context.get('main_window')
+                    if main_window and hasattr(main_window, 'data_flow_controller'):
+                        sequence_name = context.get('current_sequence_name', 'Automation')
+                        main_window.data_flow_controller.record_outbound_command(
+                            target='serial',
+                            command=resolved_command.strip(),
+                            source_automation=sequence_name,
+                            port=resolved_port
+                        )
+                    
+                    self.action_completed.emit(self)
+                    return True
+                else:
+                    print(f"[Automation] Serial command FAILED: {resolved_command.strip()} to {resolved_port}")
+                    self.last_error = f"Serial manager failed to send command to {resolved_port}"
+                    self.action_failed.emit(self, self.last_error)
+                    return False
             except Exception as e:
-                self.action_failed.emit(self, f"Failed to send Serial command to {self.port}: {e}")
+                self.last_error = f"Failed to send Serial command to {self.port}: {e}"
+                self.action_failed.emit(self, self.last_error)
+                return False
         else:
-            self.action_failed.emit(self, "Serial manager not available")
+            self.last_error = "Serial manager not available"
+            self.action_failed.emit(self, self.last_error)
+            return False
             
     def to_dict(self):
         data = super().to_dict()
@@ -1006,6 +1074,73 @@ class SerialCommandAction(BaseAction):
             data['name'], data['port'], data['command'],
             data.get('baudrate', 9600), data.get('timeout', 1)
         )
+
+class PluginCommandAction(BaseAction):
+    def __init__(self, name, plugin_name, command):
+        super().__init__(name, ActionType.PLUGIN_COMMAND)
+        self.plugin_name = str(plugin_name)
+        self.command = str(command)
+        self.description = f"Plugin '{self.plugin_name}': {self.command}"
+        
+    def execute(self, context):
+        main_window = context.get('main_window')
+        if main_window and hasattr(main_window, 'data_collection_controller'):
+            dcc = main_window.data_collection_controller
+            try:
+                # Resolve variables in command
+                resolve_func = context.get('resolve_variables', lambda x: x)
+                resolved_command = resolve_func(self.command)
+                resolved_plugin_name = resolve_func(self.plugin_name)
+                
+                # Directly check interface_threads for the plugin
+                plugin_instance = None
+                if resolved_plugin_name in dcc.interface_threads:
+                    thread = dcc.interface_threads[resolved_plugin_name]
+                    if hasattr(thread, 'interface'):
+                        plugin_instance = thread.interface
+                
+                if plugin_instance:
+                    if not plugin_instance.is_connected():
+                        if not plugin_instance.connect():
+                            self.action_failed.emit(self, f"Plugin '{resolved_plugin_name}' is not connected and auto-connect failed.")
+                            return False
+                    
+                    success = plugin_instance.write_data(resolved_command)
+                    if success:
+                        # Track outbound command
+                        if hasattr(main_window, 'data_flow_controller'):
+                            sequence_name = context.get('current_sequence_name', 'Automation')
+                            main_window.data_flow_controller.record_outbound_command(
+                                target=resolved_plugin_name,
+                                command=resolved_command,
+                                source_automation=sequence_name
+                            )
+                        self.action_completed.emit(self)
+                        return True
+                    else:
+                        self.action_failed.emit(self, f"Plugin '{resolved_plugin_name}' failed to execute command: {resolved_command}")
+                        return False
+                else:
+                    self.action_failed.emit(self, f"Plugin '{resolved_plugin_name}' not found or not active.")
+                    return False
+            except Exception as e:
+                self.action_failed.emit(self, f"Plugin command error: {e}")
+                return False
+        else:
+            self.action_failed.emit(self, "Data collection controller not available")
+            return False
+            
+    def to_dict(self):
+        data = super().to_dict()
+        data.update({
+            'plugin_name': self.plugin_name,
+            'command': self.command
+        })
+        return data
+
+    @staticmethod
+    def from_dict(data):
+        return PluginCommandAction(data['name'], data['plugin_name'], data['command'])
 
 class MQTTPublishAction(BaseAction):
     def __init__(self, name, topic, payload):
@@ -1380,7 +1515,7 @@ class AutomationStep(QObject):
             return
             
         if self.is_running:
-             print(f"Warning: Action '{self.action.name}' already running for step.")
+             print(f"[Automation] Warning: Action '{self.action.name}' already running for step.")
              return
              
         self.is_running = True
@@ -1392,10 +1527,6 @@ class AutomationStep(QObject):
         
         self.step_started.emit(self)
         
-        # We now log action execution AFTER completion to capture any generated data (like snapshot paths)
-        # unless it's an async action that might take a long time.
-        # For simplicity, we'll log most actions on completion.
-            
         # Execute the action (async if requested)
         if getattr(self.action, 'is_async', False):
             # For async actions, we still log at the start because completion might be much later
@@ -1403,8 +1534,27 @@ class AutomationStep(QObject):
             worker = ActionWorker(self.action, context)
             QThreadPool.globalInstance().start(worker)
         else:
-            self.action.execute(context)
-            # Synchronous actions are logged in _on_action_completed which is called at the end of execute()
+            try:
+                result = self.action.execute(context)
+                # Synchronous actions are logged in _on_action_completed which is called at the end of execute()
+                # BUT if execute() didn't result in a signal emission (e.g. error caught but not emitted), 
+                # we need a safety check here.
+                if self.is_running and not getattr(self.action, 'is_async', False):
+                    if result is False:
+                        self.is_running = False
+                        failure_reason = getattr(self.action, 'last_error', '') or "Action reported failure"
+                        self.step_failed.emit(self, failure_reason)
+                        return
+                    # If it's still marked as running, it means no completion/failure signal was processed.
+                    print(f"[Automation] CRITICAL: Synchronous action '{self.action.name}' finished but step is still marked as running.")
+                    # Force a failure to prevent hanging the whole sequence
+                    self.is_running = False
+                    self.step_failed.emit(self, "Action finished without reporting status")
+            except Exception as e:
+                print(f"[Automation] Exception during synchronous action execution: {e}")
+                traceback.print_exc()
+                self.is_running = False
+                self.step_failed.emit(self, f"Execution error: {e}")
     
     def _log_action_event(self, context, timestamp=None):
         """Log when an action is executed"""
@@ -1431,16 +1581,11 @@ class AutomationStep(QObject):
         
     def _on_action_completed(self, action_obj):
         if action_obj == self.action:
+            print(f"[Automation] Step action completed: {self.action.name}")
             # For synchronous actions, log now so we include any result data (like last_image_path)
             if not getattr(self.action, 'is_async', False):
                 # Retrieve context from parent sequence if possible
                 context = getattr(self.parent(), '_context', {}) if hasattr(self, 'parent') else {}
-                # If we can't get context easily, we'll use a minimal one or find it from main_window
-                if not context:
-                    main_window = None
-                    # Try to find main_window to get controller
-                    # This is a bit of a hack but AutomationStep doesn't store context
-                    pass 
                 
                 # Actually, AutomationStep.execute_action receives context. 
                 # Let's store a reference to the last context.
@@ -1452,6 +1597,7 @@ class AutomationStep(QObject):
             
     def _on_action_failed(self, action_obj, reason):
         if action_obj == self.action:
+            print(f"[Automation] Step action FAILED: {self.action.name} - Reason: {reason}")
             self.is_running = False
             self.step_failed.emit(self, reason)
 
@@ -1518,10 +1664,34 @@ class AutomationSequence(QObject):
         self._current_step_failed = False
         
         # Connect signals from steps
+        self._connect_step_signals()
+            
+    def _connect_step_signals(self):
+        """Connect completion/failure signals for all steps in the sequence."""
         for step in self.steps:
+            # Safely disconnect first to avoid multiple connections
+            try:
+                step.step_completed.disconnect(self._handle_step_completed)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                step.step_failed.disconnect(self._handle_step_failed)
+            except (TypeError, RuntimeError):
+                pass
+                
+            # Connect signals
             step.step_completed.connect(self._handle_step_completed)
             step.step_failed.connect(self._handle_step_failed)
             
+    def set_steps(self, steps):
+        """Update the steps list and reconnect signals."""
+        # Cleanup old steps if needed?
+        # for step in self.steps:
+        #     step.cleanup()
+            
+        self.steps = steps
+        self._connect_step_signals()
+
     def set_context(self, context):
         self._context = context
         
@@ -1899,6 +2069,7 @@ class AutomationManager(QObject):
             self.sequences.append(sequence)
             self._connect_sequence_signals(sequence)
             self.sequences_changed.emit()
+            self.status_changed.emit() # Ensure UI (dashboard etc.) updates
             self.save_sequences()
         else:
             print("Error: Attempted to add non-sequence object to manager.")
@@ -2127,7 +2298,7 @@ class AutomationManager(QObject):
             return
 
         try:
-            with open(self.sequences_file, 'r') as f:
+            with open(self.sequences_file, 'r', encoding='utf-8') as f:
                 # Handle empty file case
                 content = f.read()
                 if not content:

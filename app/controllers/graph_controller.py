@@ -67,14 +67,34 @@ class GraphController:
         """Resolve a start_time for marker placement with sensible fallbacks."""
         if preferred is not None:
             return preferred
-        if self.dashboard_start_time:
-            return self.dashboard_start_time
-        if hasattr(self.main_window, "data_collection_controller"):
+            
+        # Determine current state
+        is_collecting = False
+        if hasattr(self.main_window, 'data_collection_controller'):
+            is_collecting = getattr(self.main_window.data_collection_controller, 'collecting_data', False)
+
+        # 1. If actively collecting, use DCC's start_time as source of truth
+        if is_collecting:
             st = getattr(self.main_window.data_collection_controller, "start_time", None)
             if st is not None:
                 return st
+        
+        # 2. If live plotting (monitoring) is active, use the dashboard start time
+        if self.live_plotting_active and self.dashboard_start_time:
+            return self.dashboard_start_time
+            
+        # 3. If we have event markers (likely historical/replay), use the first marker as a hint
         if hasattr(self, "event_markers") and self.event_markers:
-            return min(e.get("timestamp", time.time()) for e in self.event_markers)
+            try:
+                return min(float(e.get("timestamp", time.time())) for e in self.event_markers)
+            except (ValueError, TypeError):
+                pass
+            
+        # 4. Fallback to dashboard_start_time if it exists at all
+        if self.dashboard_start_time:
+            return self.dashboard_start_time
+            
+        # 5. Last resort: current time if allowed
         return time.time() if allow_now else None
 
     def _update_dashboard_axis_labels(self):
@@ -780,41 +800,7 @@ class GraphController:
                     # print(f"DEBUG GRAPH: Adding sensor {sensor_name_for_legend} (type {interface_type}) to graph")
 
                     # --- Determine the CORRECT key for matching incoming data --- 
-                    sensor_key_for_data = None
-                    if interface_type == "ARDUINO":
-                        # Use the sensor name for Arduino data keys (address is often empty)
-                        sensor_key_for_data = getattr(sensor, 'name', None)
-                        if not sensor_key_for_data:
-                            print(f"WARNING GRAPH: Arduino sensor '{sensor_name_for_legend}' has no name defined. Skipping plot.")
-                            continue
-                    elif interface_type == "LABJACK":
-                        # LabJack uses channel name (port/address field in SensorModel)
-                        sensor_key_for_data = getattr(sensor, 'port', None) # Assuming 'port' holds the channel name
-                        if not sensor_key_for_data:
-                            print(f"WARNING GRAPH: LabJack sensor '{sensor_name_for_legend}' has no port/channel defined. Skipping plot.")
-                            continue
-                    elif interface_type == "OTHERSERIAL":
-                        # OtherSerial data is keyed by the user-defined sensor name
-                        sensor_key_for_data = sensor_name_for_legend 
-                    elif interface_type == "OPTICALSENSOR":
-                        # OpticalSensor uses the sensor name for data keys
-                        sensor_key_for_data = sensor_name_for_legend
-                    elif interface_type == "AUDIOSENSOR":
-                        # AudioSensor uses the sensor name for data keys
-                        sensor_key_for_data = sensor_name_for_legend
-                    elif interface_type == "CSV":
-                        # CSV uses the prefixed key stored in the port field
-                        sensor_key_for_data = getattr(sensor, 'port', None)
-                        if not sensor_key_for_data:
-                            sensor_key_for_data = f"csv_{sensor_name_for_legend}"
-                    else:
-                        # Handle generic plugins
-                        # For dynamic plugins, the key is "Interface Name_Measurement" or "Interface Name_Sensor Name"
-                        if hasattr(sensor, 'mapping') and sensor.mapping:
-                            sensor_key_for_data = f"{sensor.interface_type}_{sensor.mapping}"
-                        else:
-                            sensor_key_for_data = f"{sensor.interface_type}_{sensor.name}"
-                        print(f"DEBUG GRAPH: Using generic key '{sensor_key_for_data}' for plugin sensor '{sensor_name_for_legend}'")
+                    sensor_key_for_data = self.main_window.sensor_controller.get_historical_buffer_key(sensor)
                     # --------------------------------------------------------
 
                     print(f"DEBUG: Adding sensor to graph: Name='{sensor_name_for_legend}', KeyForData='{sensor_key_for_data}', Type='{interface_type}', Color='{color_str}'")
@@ -1190,6 +1176,9 @@ class GraphController:
             
         try:
             # --- Timestamp handling ---
+            self._current_processing_data = data
+            self._keys_processed_in_packet = set()
+            
             timestamp = None
             if 'timestamp' in data:
                 try:
@@ -1319,7 +1308,7 @@ class GraphController:
         if sensor_id in self.dashboard_plot_data:
             plot_info = self.dashboard_plot_data[sensor_id]
             matched_key = sensor_id
-            self._debug(f"Graph: Direct match found for sensor_id='{sensor_id}'")
+            # self._debug(f"Graph: Direct match found for sensor_id='{sensor_id}'")
         # Try for OtherSerial sensors which may have prefixes
         elif sensor_id.startswith("other_serial_"):
             # Extract the actual sensor name from the prefixed key
@@ -1327,7 +1316,7 @@ class GraphController:
             if unprefixed_key in self.dashboard_plot_data:
                 plot_info = self.dashboard_plot_data[unprefixed_key]
                 matched_key = unprefixed_key
-                self._debug(f"Graph: OtherSerial match found: prefixed_key='{sensor_id}', unprefixed='{unprefixed_key}'")
+                # self._debug(f"Graph: OtherSerial match found: prefixed_key='{sensor_id}', unprefixed='{unprefixed_key}'")
         # Check for other prefixed keys like arduino_, labjack_, or audio_
         elif any(sensor_id.startswith(prefix) for prefix in ["arduino_", "labjack_", "audio_"]):
             # Extract the actual sensor name from the prefixed key
@@ -1341,15 +1330,25 @@ class GraphController:
             if unprefixed_key in self.dashboard_plot_data:
                 plot_info = self.dashboard_plot_data[unprefixed_key]
                 matched_key = unprefixed_key
-                self._debug(f"Graph: Prefix match found: prefixed_key='{sensor_id}', unprefixed='{unprefixed_key}'")
-        else:
-            # Handle generic plugins: just try the sensor_id directly if not caught above
-            # (In some cases the sensor_id might already be the full prefixed key)
+                # self._debug(f"Graph: Prefix match found: prefixed_key='{sensor_id}', unprefixed='{unprefixed_key}'")
+        
+        # --- Fallback for generic keys (Plugins, etc.) ---
+        if not plot_info:
             if sensor_id in self.dashboard_plot_data:
                 plot_info = self.dashboard_plot_data[sensor_id]
                 matched_key = sensor_id
-            
+        
+        # Guard against double-adding same value from same packet
+        # If the incoming data dictionary has both prefixed and unprefixed versions of the same sensor,
+        # we only want to process it once per tick. We can use a per-packet cache.
         if plot_info:
+            packet_id = id(self._current_processing_data) if hasattr(self, '_current_processing_data') else 0
+            processed_keys = getattr(self, '_keys_processed_in_packet', set())
+            if matched_key in processed_keys:
+                return False # Already added this sensor from this packet
+            processed_keys.add(matched_key)
+            self._keys_processed_in_packet = processed_keys
+            
             # Ensure monotonicity to prevent "zigzag" jumping if sensor clocks or timestamps jitter
             if plot_info['x']:
                 last_x = plot_info['x'][-1]
@@ -1822,19 +1821,24 @@ class GraphController:
             self._debug(f"Graph: OtherSerial sensors in regular keys: {other_serial_keys}")
         
         # Determine the start_time to use for relative time calculation
-        # PRIORITY: DCC Source of Truth > dashboard_start_time
+        # PRIORITY: Active DCC Start Time > Dashboard Start Time (only if live/monitoring) > None (self-calculate)
         graph_start_time = None
+        is_collecting = False
+        
         if hasattr(self.main_window, 'data_collection_controller'):
             dc = self.main_window.data_collection_controller
-            # Use active run start time if it exists
-            graph_start_time = getattr(dc, 'start_time', None)
+            is_collecting = getattr(dc, 'collecting_data', False)
+            if is_collecting:
+                # Use active run start time if it exists
+                graph_start_time = getattr(dc, 'start_time', None)
             
-        # Fallback to internal dashboard start time if run haven't started or DCC not found
-        if graph_start_time is None:
+        # Fallback to internal dashboard start time ONLY if live plotting is active or we are collecting
+        # This prevents past runs (loaded from CSV) from using "now" as start time
+        if graph_start_time is None and (self.live_plotting_active or is_collecting):
             graph_start_time = self.dashboard_start_time
         
         # Ensure we update our internal dashboard_start_time if DCC has a more official one
-        if graph_start_time is not None and self.dashboard_start_time is None:
+        if graph_start_time is not None and self.dashboard_start_time is None and (is_collecting or self.live_plotting_active):
             self.dashboard_start_time = graph_start_time
         # -----------------------------------------------------------------
         
@@ -2604,18 +2608,13 @@ class GraphController:
         if graph_type not in ["Histogram", "Box Plot"]:
             # Use the same start_time that was used for relative time calculation
             # This ensures markers align correctly with the plotted data
-            start_time = None
-            if graph_start_time is not None:
-                start_time = graph_start_time
-            elif hasattr(self.main_window, 'data_collection_controller'):
-                start_time = getattr(self.main_window.data_collection_controller, 'start_time', None)
+            resolved_marker_start = self._resolve_start_time(graph_start_time, allow_now=self.show_automation_markers)
             
-            if start_time is not None:
-                start_time = self._resolve_start_time(start_time, allow_now=self.show_automation_markers)
-                print(f"DEBUG: update_specific_graph: Adding event markers with start_time={start_time}, show_automation_markers={self.show_automation_markers}")
-                self._add_event_markers_to_graph(graph_widget, start_time, force=self.show_automation_markers)
+            if resolved_marker_start is not None:
+                self._debug(f"Graph: Adding event markers to specific graph with start_time={resolved_marker_start}")
+                self._add_event_markers_to_graph(graph_widget, resolved_marker_start, force=self.show_automation_markers)
             else:
-                print(f"DEBUG: update_specific_graph: Cannot add event markers - no start_time available") 
+                self._debug("Graph: Cannot add event markers to specific graph - no start_time resolved") 
     
     def apply_plot_formatting(self):
         """Apply plot formatting based on settings"""

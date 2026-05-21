@@ -156,6 +156,7 @@ class CameraController(QObject):
         
         self.show_on_dashboard = True # Global flag to control dashboard display
         self.current_frames = [None] * 4
+        self.last_error_messages = [""] * 4
         self._frame_skips = [0] * 4
         self.should_reconnect = [False] * 4
         
@@ -185,6 +186,11 @@ class CameraController(QObject):
         self.fps_update_timer.timeout.connect(self._update_fps_display)
         self.fps_update_timer.start(1000) # Update once per second
         
+        # Timer for pushing sensor data to camera overlays
+        self.sensor_push_timer = QTimer()
+        self.sensor_push_timer.timeout.connect(self.push_sensor_data_to_thread)
+        self.sensor_push_timer.start(1000) # Update once per second
+        
         # Track previous motion detection state for edge detection
         self._last_motion_detected = False
         
@@ -194,6 +200,12 @@ class CameraController(QObject):
         # Timer for NDI source discovery
         self.ndi_discovery_timer = QTimer()
         self.ndi_discovery_timer.timeout.connect(self.discover_ndi_sources)
+        
+        # Start NDI discovery in the background with a slow interval (5s) to keep list warm
+        if NDI_AVAILABLE:
+            if not hasattr(self, '_ndi_finder'):
+                self._ndi_finder = NDISourceFinder()
+            self.ndi_discovery_timer.start(5000)
         
         # Initialize camera mode UI state
         if self.camera_mode:
@@ -733,8 +745,11 @@ class CameraController(QObject):
             self.main_window.camera_controls_group.setVisible(not is_ndi)
             
         if index == 1 and NDI_AVAILABLE:
-            if not self.ndi_discovery_timer.isActive():
-                self.ndi_discovery_timer.start(500) # Reverted to 500ms as requested
+            # Speed up discovery when NDI mode is active (500ms)
+            self.ndi_discovery_timer.start(500)
+        elif NDI_AVAILABLE:
+            # Slow down discovery when in Local mode (5s) but keep it running for AI
+            self.ndi_discovery_timer.start(5000)
         else:
             self.ndi_discovery_timer.stop()
 
@@ -756,7 +771,10 @@ class CameraController(QObject):
             try:
                 from PyQt6.QtMultimedia import QMediaDevices
                 devices = QMediaDevices.videoInputs()
-                for i in range(max(len(devices), 1)):
+                # Always show at least 10 indices to allow manual selection of higher indices
+                # (e.g. virtual cameras or devices not reported by QMediaDevices)
+                num_to_show = max(len(devices), 10)
+                for i in range(num_to_show):
                     name = devices[i].description() if i < len(devices) else f"Camera index {i}"
                     self.camera_select.addItem(f"Camera index {i}", i)
             except Exception as e:
@@ -767,13 +785,19 @@ class CameraController(QObject):
 
     def discover_ndi_sources(self):
         """Discover NDI sources on the network and update UI."""
-        if not NDI_AVAILABLE or (self.camera_mode and self.camera_mode.currentIndex() != 1):
+        if not NDI_AVAILABLE:
             return
-        if not hasattr(self, '_ndi_finder'):
+        if not hasattr(self, '_ndi_finder') or self._ndi_finder is None:
             self._ndi_finder = NDISourceFinder()
         
         sources = self._ndi_finder.get_sources()
+        
+        # If no sources yet, don't clear the list (might still be searching)
         if not sources:
+            return
+
+        # Update the UI dropdown if NDI mode is currently active
+        if self.camera_mode and self.camera_mode.currentIndex() != 1:
             return
 
         # Update the dropdown if it's currently showing "Searching..." or we have new sources
@@ -966,6 +990,7 @@ class CameraController(QObject):
         if index < 4: 
             old_connected = self.is_connected[index]
             self.is_connected[index] = connected
+            self.last_error_messages[index] = message if not connected else ""
             
             # If camera just connected and we are in a run, start recording if enabled
             if connected and not old_connected:
@@ -1202,7 +1227,13 @@ class CameraController(QObject):
                 if success:
                     count += 1
                     self.is_recording[i] = True
-                    self._append_video_segment_metadata({"path": os.path.join(output_dir, fname), "start_epoch": time.time(), "camera_index": i})
+                    actual_fps = self.camera_threads[i].fps if hasattr(self.camera_threads[i], 'fps') else 30
+                    self._append_video_segment_metadata({
+                        "path": os.path.join(output_dir, fname), 
+                        "start_epoch": time.time(), 
+                        "camera_index": i,
+                        "fps": actual_fps
+                    })
             
             if count > 0:
                 self.logger.log(f"Started {count} recordings")
@@ -1827,6 +1858,9 @@ class CameraController(QObject):
     def set_main_view(self, index):
         if 0 <= index < 4: 
             self.main_view_index = index
+            # When switching the main view (selecting a different camera source to view),
+            # we also want to update the active configuration slot and refresh its UI.
+            self.set_active_config_slot(index)
             self._refresh_camera_styles()
             self.update_camera_display()
 
@@ -1840,117 +1874,118 @@ class CameraController(QObject):
             self._update_fps_display() # Update FPS display immediately for the new slot
 
     def refresh_settings_ui(self):
-        idx = self.active_camera_index
+        # Prevent recursion (e.g. from refresh_camera_list calling this back)
+        if hasattr(self, '_refreshing_ui') and self._refreshing_ui:
+            return
+        self._refreshing_ui = True
         
-        if hasattr(self.main_window, 'camera_mode'):
-            self.main_window.camera_mode.blockSignals(True)
-            self.main_window.camera_mode.setCurrentIndex(self.camera_configs[idx].get("mode", 0))
-            self.main_window.camera_mode.blockSignals(False)
-            # Ensure visibility of mode-specific fields is updated (without triggering recursion)
-            self._handle_camera_mode_changed(self.camera_configs[idx].get("mode", 0), refresh_list=False)
+        try:
+            idx = self.active_camera_index
+            
+            if hasattr(self.main_window, 'camera_mode'):
+                self.main_window.camera_mode.blockSignals(True)
+                self.main_window.camera_mode.setCurrentIndex(self.camera_configs[idx].get("mode", 0))
+                self.main_window.camera_mode.blockSignals(False)
+                # Ensure visibility of mode-specific fields is updated and the source list is refreshed
+                self._handle_camera_mode_changed(self.camera_configs[idx].get("mode", 0), refresh_list=True)
 
-        if self.camera_select:
-            source = self.camera_configs[idx]["source"]
-            source_idx = self.camera_select.findData(source)
-            
-            # Type-robust matching: try both int and string if it's a digit
-            if source_idx < 0 and source is not None:
-                if isinstance(source, str) and source.isdigit():
-                    source_idx = self.camera_select.findData(int(source))
-                elif isinstance(source, int):
-                    source_idx = self.camera_select.findData(str(source))
-            
-            if source_idx >= 0: 
-                self.camera_select.blockSignals(True)
-                self.camera_select.setCurrentIndex(source_idx)
-                self.camera_select.blockSignals(False)
-            else:
-                # The saved source is not in the current list (e.g. mode changed)
-                # Update config to match the currently selected item in the dropdown
-                # but only if the dropdown actually has items and signals are not blocked
-                if self.camera_select.count() > 0:
-                    current_source = self.camera_select.currentData()
-                    if current_source is not None:
-                        # Don't save if it's just "Searching..." or empty
-                        if not (isinstance(current_source, str) and "Searching" in current_source):
-                            self.camera_configs[idx]["source"] = current_source
-                            # Note: We don't save to settings here to avoid accidental overrides
-                            # during rapid UI switching, but the internal state is now correct.
-        
-        # Update connection button for this slot
-        if self.camera_connect_btn:
-            connected = self.is_connected[idx]
-            self.camera_connect_btn.setText("Disconnect" if connected else "Connect")
-            from app.ui.theme import ButtonStyles
-            self.camera_connect_btn.setStyleSheet(ButtonStyles.danger("small") if connected else ButtonStyles.success("small"))
             if self.camera_select:
-                self.camera_select.setEnabled(not connected)
+                source = self.camera_configs[idx]["source"]
+                source_idx = self.camera_select.findData(source)
+                
+                # Type-robust matching: try both int and string if it's a digit
+                if source_idx < 0 and source is not None:
+                    if isinstance(source, str) and source.isdigit():
+                        source_idx = self.camera_select.findData(int(source))
+                    elif isinstance(source, int):
+                        source_idx = self.camera_select.findData(str(source))
+                
+                if source_idx >= 0: 
+                    self.camera_select.blockSignals(True)
+                    self.camera_select.setCurrentIndex(source_idx)
+                    self.camera_select.blockSignals(False)
+                else:
+                    # The saved source is not in the current list (e.g. mode changed)
+                    # We DO NOT update the config here, as it would overwrite a valid 
+                    # background connection (like from AI) with whatever happens to be index 0.
+                    pass
             
-            # If connected, clear any "No camera connected" text from the labels
-            if connected:
-                self.update_camera_display()
+            # Update connection button for this slot
+            if self.camera_connect_btn:
+                connected = self.is_connected[idx]
+                self.camera_connect_btn.setText("Disconnect" if connected else "Connect")
+                from app.ui.theme import ButtonStyles
+                self.camera_connect_btn.setStyleSheet(ButtonStyles.danger("small") if connected else ButtonStyles.success("small"))
+                if self.camera_select:
+                    self.camera_select.setEnabled(not connected)
+                
+                # If connected, clear any "No camera connected" text from the labels
+                if connected:
+                    self.update_camera_display()
 
-        # Update recording checkboxes
-        if hasattr(self.main_window, 'record_video_checkbox'):
-            self.main_window.record_video_checkbox.blockSignals(True)
-            self.main_window.record_video_checkbox.setChecked(self.camera_configs[idx].get("record_video", True))
-            self.main_window.record_video_checkbox.blockSignals(False)
-        if hasattr(self.main_window, 'record_audio_checkbox'):
-            self.main_window.record_audio_checkbox.blockSignals(True)
-            self.main_window.record_audio_checkbox.setChecked(self.camera_configs[idx].get("record_audio", False))
-            self.main_window.record_audio_checkbox.blockSignals(False)
-            
-        if hasattr(self.main_window, 'camera_audio_device'):
-            self.main_window.camera_audio_device.blockSignals(True)
-            audio_idx = self.main_window.camera_audio_device.findData(self.camera_configs[idx].get("audio_device", -1))
-            if audio_idx >= 0: self.main_window.camera_audio_device.setCurrentIndex(audio_idx)
-            self.main_window.camera_audio_device.blockSignals(False)
-            
-        if hasattr(self.main_window, 'camera_auto_connect_checkbox'):
-            self.main_window.camera_auto_connect_checkbox.blockSignals(True)
-            self.main_window.camera_auto_connect_checkbox.setChecked(self.camera_configs[idx].get("auto_connect", False))
-            self.main_window.camera_auto_connect_checkbox.blockSignals(False)
+            # Update recording checkboxes
+            if hasattr(self.main_window, 'record_video_checkbox'):
+                self.main_window.record_video_checkbox.blockSignals(True)
+                self.main_window.record_video_checkbox.setChecked(self.camera_configs[idx].get("record_video", True))
+                self.main_window.record_video_checkbox.blockSignals(False)
+            if hasattr(self.main_window, 'record_audio_checkbox'):
+                self.main_window.record_audio_checkbox.blockSignals(True)
+                self.main_window.record_audio_checkbox.setChecked(self.camera_configs[idx].get("record_audio", False))
+                self.main_window.record_audio_checkbox.blockSignals(False)
+                
+            if hasattr(self.main_window, 'camera_audio_device'):
+                self.main_window.camera_audio_device.blockSignals(True)
+                audio_idx = self.main_window.camera_audio_device.findData(self.camera_configs[idx].get("audio_device", -1))
+                if audio_idx >= 0: self.main_window.camera_audio_device.setCurrentIndex(audio_idx)
+                self.main_window.camera_audio_device.blockSignals(False)
+                
+            if hasattr(self.main_window, 'camera_auto_connect_checkbox'):
+                self.main_window.camera_auto_connect_checkbox.blockSignals(True)
+                self.main_window.camera_auto_connect_checkbox.setChecked(self.camera_configs[idx].get("auto_connect", False))
+                self.main_window.camera_auto_connect_checkbox.blockSignals(False)
 
-        if hasattr(self.main_window, 'camera_resolution'):
-            self.main_window.camera_resolution.blockSignals(True)
-            self.main_window.camera_resolution.setCurrentText(self.camera_configs[idx].get("resolution", "1280x720"))
-            self.main_window.camera_resolution.blockSignals(False)
-        
-        if hasattr(self.main_window, 'camera_framerate'):
-            self.main_window.camera_framerate.blockSignals(True)
-            self.main_window.camera_framerate.setCurrentText(str(self.camera_configs[idx].get("fps", 30)))
-            self.main_window.camera_framerate.blockSignals(False)
+            if hasattr(self.main_window, 'camera_resolution'):
+                self.main_window.camera_resolution.blockSignals(True)
+                self.main_window.camera_resolution.setCurrentText(self.camera_configs[idx].get("resolution", "1280x720"))
+                self.main_window.camera_resolution.blockSignals(False)
             
-        # Update focus/exposure sliders for this slot
-        if hasattr(self.main_window, 'camera_tab_manual_focus'):
-            self.main_window.camera_tab_manual_focus.blockSignals(True)
-            self.main_window.camera_tab_manual_focus.setChecked(self.camera_configs[idx].get("manual_focus", False))
-            self.main_window.camera_tab_manual_focus.blockSignals(False)
-        if hasattr(self.main_window, 'camera_tab_focus_slider'):
-            self.main_window.camera_tab_focus_slider.blockSignals(True)
-            self.main_window.camera_tab_focus_slider.setValue(self.camera_configs[idx].get("focus_value", 0))
-            self.main_window.camera_tab_focus_slider.setEnabled(self.camera_configs[idx].get("manual_focus", False))
-            self.main_window.camera_tab_focus_slider.blockSignals(False)
-            
-        if hasattr(self.main_window, 'camera_tab_manual_exposure'):
-            self.main_window.camera_tab_manual_exposure.blockSignals(True)
-            self.main_window.camera_tab_manual_exposure.setChecked(self.camera_configs[idx].get("manual_exposure", False))
-            self.main_window.camera_tab_manual_exposure.blockSignals(False)
-        if hasattr(self.main_window, 'camera_tab_exposure_slider'):
-            self.main_window.camera_tab_exposure_slider.blockSignals(True)
-            self.main_window.camera_tab_exposure_slider.setValue(self.camera_configs[idx].get("exposure_value", 0))
-            self.main_window.camera_tab_exposure_slider.setEnabled(self.camera_configs[idx].get("manual_exposure", False))
-            self.main_window.camera_tab_exposure_slider.blockSignals(False)
+            if hasattr(self.main_window, 'camera_framerate'):
+                self.main_window.camera_framerate.blockSignals(True)
+                self.main_window.camera_framerate.setCurrentText(str(self.camera_configs[idx].get("fps", 30)))
+                self.main_window.camera_framerate.blockSignals(False)
+                
+            # Update focus/exposure sliders for this slot
+            if hasattr(self.main_window, 'camera_tab_manual_focus'):
+                self.main_window.camera_tab_manual_focus.blockSignals(True)
+                self.main_window.camera_tab_manual_focus.setChecked(self.camera_configs[idx].get("manual_focus", False))
+                self.main_window.camera_tab_manual_focus.blockSignals(False)
+            if hasattr(self.main_window, 'camera_tab_focus_slider'):
+                self.main_window.camera_tab_focus_slider.blockSignals(True)
+                self.main_window.camera_tab_focus_slider.setValue(self.camera_configs[idx].get("focus_value", 0))
+                self.main_window.camera_tab_focus_slider.setEnabled(self.camera_configs[idx].get("manual_focus", False))
+                self.main_window.camera_tab_focus_slider.blockSignals(False)
+                
+            if hasattr(self.main_window, 'camera_tab_manual_exposure'):
+                self.main_window.camera_tab_manual_exposure.blockSignals(True)
+                self.main_window.camera_tab_manual_exposure.setChecked(self.camera_configs[idx].get("manual_exposure", False))
+                self.main_window.camera_tab_manual_exposure.blockSignals(False)
+            if hasattr(self.main_window, 'camera_tab_exposure_slider'):
+                self.main_window.camera_tab_exposure_slider.blockSignals(True)
+                self.main_window.camera_tab_exposure_slider.setValue(self.camera_configs[idx].get("exposure_value", 0))
+                self.main_window.camera_tab_exposure_slider.setEnabled(self.camera_configs[idx].get("manual_exposure", False))
+                self.main_window.camera_tab_exposure_slider.blockSignals(False)
 
-        # Update motion detection settings
-        if hasattr(self.main_window, 'motion_detection_enabled'):
-            self.main_window.motion_detection_enabled.setChecked(self.camera_configs[idx].get("motion_enabled", False))
-        if hasattr(self.main_window, 'motion_detection_sensitivity'):
-            self.main_window.motion_detection_sensitivity.setValue(self.camera_configs[idx].get("motion_sensitivity", 20))
-        if hasattr(self.main_window, 'motion_detection_min_area'):
-            self.main_window.motion_detection_min_area.setValue(self.camera_configs[idx].get("motion_min_area", 500))
-            
-        self.update_overlay_selector()
+            # Update motion detection settings
+            if hasattr(self.main_window, 'motion_detection_enabled'):
+                self.main_window.motion_detection_enabled.setChecked(self.camera_configs[idx].get("motion_enabled", False))
+            if hasattr(self.main_window, 'motion_detection_sensitivity'):
+                self.main_window.motion_detection_sensitivity.setValue(self.camera_configs[idx].get("motion_sensitivity", 20))
+            if hasattr(self.main_window, 'motion_detection_min_area'):
+                self.main_window.motion_detection_min_area.setValue(self.camera_configs[idx].get("motion_min_area", 500))
+                
+            self.update_overlay_selector()
+        finally:
+            self._refreshing_ui = False
 
     def update_camera_display(self):
         if not self.camera_label: return

@@ -946,6 +946,16 @@ def setup_ui(self):
     
     self.replay_play_btn = QPushButton("Play")
     self.replay_play_btn.setCheckable(True)
+    self.replay_play_btn.setFixedWidth(60)
+    
+    self.replay_step_back_btn = QPushButton("◀")
+    self.replay_step_back_btn.setFixedWidth(30)
+    self.replay_step_back_btn.setToolTip("Step 1 Frame Back")
+    
+    self.replay_step_forward_btn = QPushButton("▶")
+    self.replay_step_forward_btn.setFixedWidth(30)
+    self.replay_step_forward_btn.setToolTip("Step 1 Frame Forward")
+    
     self.replay_speed = QComboBox()
     self.replay_speed.addItems(["0.25x", "0.5x", "1x", "2x", "4x"])
     self.replay_speed.setCurrentText("1x")
@@ -954,7 +964,9 @@ def setup_ui(self):
     self.replay_coarse.setRange(0, 1000)
     
     replay_controls_layout.addWidget(QLabel("Replay:"))
+    replay_controls_layout.addWidget(self.replay_step_back_btn)
     replay_controls_layout.addWidget(self.replay_play_btn)
+    replay_controls_layout.addWidget(self.replay_step_forward_btn)
     replay_controls_layout.addWidget(QLabel("Speed"))
     replay_controls_layout.addWidget(self.replay_speed)
     replay_controls_layout.addWidget(self.replay_time_label)
@@ -2027,7 +2039,7 @@ def setup_ui(self):
     devices_cards_layout.setContentsMargins(0, 0, 0, 0)
     devices_cards_layout.setSpacing(8)
     devices_cards_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-    
+
     # Custom Interfaces Info - Now moved outside the group box later
     custom_interface_info = QLabel("💡 Create custom interfaces with small Python scripts. See Help for info.")
     custom_interface_info.setWordWrap(True)
@@ -2060,9 +2072,12 @@ def setup_ui(self):
     }
 
     # Helper to create an interface card
-    def create_card(name, icon_resource, popup_func, is_plugin=False, is_outbound=False):
+    def create_card(name, icon_resource, popup_func, is_plugin=False, is_outbound=False, description=""):
         container = QFrame()
         container.setFixedSize(card_width, card_height)
+        
+        if description:
+            container.setToolTip(description)
         
         # Use specific style based on interface type
         if is_outbound:
@@ -2197,7 +2212,8 @@ def setup_ui(self):
             # We use a captured 'name' variable in the lambda to ensure it calls with the right one
             popup = lambda n=name: self.sensor_controller.add_sensor(preselected_type=n)
             
-        card, status_label = create_card(name, icon, popup, is_plugin=is_plugin)
+        description = getattr(interface_class, "DESCRIPTION", "")
+        card, status_label = create_card(name, icon, popup, is_plugin=is_plugin, description=description)
         card.setProperty("is_plugin", is_plugin)
         # Ensure name is stored on card for status lookups
         card.setProperty("interface_name", name)
@@ -2234,6 +2250,7 @@ def setup_ui(self):
             # Outbound interfaces are always plugins
             is_plugin = True
             is_outbound = True
+            description = getattr(interface_class, "DESCRIPTION", "")
             
             # Handle icons for plugins (reusing logic)
             if icon and (icon.endswith(".png") or icon.endswith(".svg")):
@@ -2246,12 +2263,6 @@ def setup_ui(self):
                         icon = potential_path
                 except Exception: pass
 
-            # Use create_card with is_outbound flag (we'll need to update create_card too)
-            card, status_label = create_card(name, icon, None, is_plugin=True, is_outbound=True)
-            card.setProperty("is_plugin", True)
-            card.setProperty("is_outbound", True)
-            card.setProperty("interface_name", name)
-            
             # Connect outbound plugin toggle/configure
             def handle_outbound_click(n=name):
                 if not hasattr(self, 'data_collection_controller'):
@@ -2302,7 +2313,11 @@ def setup_ui(self):
                     
                     self.update_status_indicators()
 
-            card.mousePressEvent = lambda event, n=name: handle_outbound_click(n)
+            # Use create_card with the handler as popup_func
+            card, status_label = create_card(name, icon, handle_outbound_click, is_plugin=True, is_outbound=True, description=description)
+            card.setProperty("is_plugin", True)
+            card.setProperty("is_outbound", True)
+            card.setProperty("interface_name", name)
 
             row = idx // 2
             col = idx % 2

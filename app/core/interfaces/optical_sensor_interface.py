@@ -796,6 +796,7 @@ class OpticalSensorInterface(BaseInterface):
         self.mode = mode
         self.sensor_thread = None
         self.current_data = {}
+        self.last_frame = None
         self._data_lock = Lock()
         
         # Resolution settings
@@ -866,6 +867,7 @@ class OpticalSensorInterface(BaseInterface):
             # Connect signals
             self.sensor_thread.data_ready.connect(self._on_data_ready)
             self.sensor_thread.event_detected.connect(self._on_event_detected)
+            self.sensor_thread.frame_for_display.connect(self._on_frame_ready)
             
             if self.sensor_thread.connect(self.camera_id, self.width, self.height, self.fps):
                 self.connected = True
@@ -931,6 +933,11 @@ class OpticalSensorInterface(BaseInterface):
         with self._data_lock:
             self.current_data = data
     
+    def _on_frame_ready(self, frame_data):
+        """Handle new frame for display/AI preview"""
+        with self._data_lock:
+            self.last_frame = frame_data.get('frame')
+    
     def _on_event_detected(self, event):
         """Handle event detection"""
         print(f"Optical Sensor Event: {event}")
@@ -946,8 +953,9 @@ class OpticalSensorInterface(BaseInterface):
         if self.sensor_thread:
             self.sensor_thread.update_settings(settings)
     
-    def get_output_keys(self):
-        """Get list of output keys for current mode"""
+    @classmethod
+    def get_output_keys(cls, mode=None):
+        """Get list of possible output keys for a mode (or all modes if None)"""
         mode_outputs = {
             "light_events": ["event_count", "max_brightness", "mean_brightness", "bright_pixel_count"],
             "brightness": ["brightness_mean", "brightness_max", "brightness_min", "brightness_std"],
@@ -957,7 +965,17 @@ class OpticalSensorInterface(BaseInterface):
             "fill_level": ["fill_level"],
             "rpm": ["rpm", "rpm_freq_hz", "rpm_confidence", "rpm_signal_mean", "rpm_signal_std"],
         }
-        return mode_outputs.get(self.mode, [])
+        if mode:
+            return mode_outputs.get(mode, [])
+        # Return all unique keys across all modes
+        all_keys = set()
+        for keys in mode_outputs.values():
+            all_keys.update(keys)
+        return sorted(list(all_keys))
+
+    def get_instance_output_keys(self):
+        """Get list of output keys for current mode"""
+        return self.get_output_keys(self.mode)
 
 
 # Availability flag

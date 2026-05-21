@@ -1081,15 +1081,13 @@ class CardStyles:
                         stop:0 {base_top},
                         stop:1 {base_bottom});
                     border-radius: 8px;
-                    border: 1px solid {border_color};
-                    border-style: dashed;
+                    border: 2px solid {border_color};
                 }}
                 QFrame:hover {{
                     background: qlineargradient(x1:0, y1:0, x2:0.5, y2:1,
                         stop:0 rgba(70, 60, 100, 0.95),
                         stop:1 rgba(45, 45, 75, 0.9));
-                    border: 1px solid {hover_color};
-                    border-style: solid;
+                    border: 2px solid {hover_color};
                 }}
                 QLabel {{
                     background: transparent;
@@ -2138,6 +2136,7 @@ class DialogStyles:
             QDialog {{
                 background-color: {COLORS.BG_DARK};
                 color: {COLORS.TEXT_PRIMARY};
+                border: 1px solid rgba(255, 255, 255, 0.2);
             }}
             QLabel {{
                 color: {COLORS.TEXT_PRIMARY};

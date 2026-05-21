@@ -37,8 +37,25 @@ class SendCommandStep(SerialStep):
         """Send the command to the serial device"""
         # Process any variable substitutions in the command
         command = self.command
-        for var_name, var_value in variables.items():
-            command = command.replace(f"{{{var_name}}}", str(var_value))
+        
+        # Support case-insensitive variable substitution
+        # First, find all {var} patterns
+        placeholders = re.findall(r'\{([^{}]+)\}', command)
+        for ph in placeholders:
+            # Try exact match
+            val = None
+            if ph in variables:
+                val = variables[ph]
+            else:
+                # Try case-insensitive
+                ph_lower = ph.lower()
+                for k, v in variables.items():
+                    if k.lower() == ph_lower:
+                        val = v
+                        break
+            
+            if val is not None:
+                command = command.replace(f"{{{ph}}}", str(val))
             
         # Add line ending (handle both escaped and unescaped forms)
         le = self.line_ending.lower() if self.line_ending else ""
@@ -170,7 +187,7 @@ class ParseValueStep(SerialStep):
     """Step to parse a value from a previous response"""
     
     def __init__(self, source_var="response", parse_method="Entire Response", 
-                 start_marker="", end_marker="", result_type="Number (Float)", result_var="value"):
+                 start_marker="", end_marker="", result_type="Number (Float)", result_var="value", multiplier=1.0):
         super().__init__("ParseValue")
         self.source_var = source_var
         self.parse_method = parse_method
@@ -178,13 +195,25 @@ class ParseValueStep(SerialStep):
         self.end_marker = end_marker
         self.result_type = result_type
         self.result_var = result_var
+        self.multiplier = multiplier
         
     def execute(self, interface, variables):
         """Parse a value from a response"""
-        if self.source_var not in variables:
+        source_text = None
+        # Support case-insensitive source lookup
+        if self.source_var in variables:
+            source_text = variables[self.source_var]
+        else:
+            sv_lower = self.source_var.lower()
+            for k, v in variables.items():
+                if k.lower() == sv_lower:
+                    source_text = v
+                    break
+        
+        if source_text is None:
+            print(f"DEBUG ParseValueStep: Source variable '{self.source_var}' not found in {list(variables.keys())}")
             return False
             
-        source_text = variables[self.source_var]
         result = None
         
         # Parse based on method
@@ -226,14 +255,14 @@ class ParseValueStep(SerialStep):
                     # Find the first floating point number in the string
                     number_match = re.search(r'[-+]?\d*\.\d+|\d+', result)
                     if number_match:
-                        result = float(number_match.group(0))
+                        result = float(number_match.group(0)) * self.multiplier
                     else:
                         result = 0.0
                 elif self.result_type == "Number (Integer)":
                     # Find the first integer in the string
                     number_match = re.search(r'[-+]?\d+', result)
                     if number_match:
-                        result = int(number_match.group(0))
+                        result = int(int(number_match.group(0)) * self.multiplier)
                     else:
                         result = 0
                 # Text type just stays as is
@@ -260,31 +289,46 @@ class PublishValueStep(SerialStep):
         """Publish a value from variables"""
         print(f"DEBUG PublishValueStep.execute: Looking for source_var='{self.source_var}' in variables: {variables}")
         
-        # More permissive version - try to be smart about finding the value
+        # Support case-insensitive lookup
+        source_val = None
         if self.source_var in variables:
-            # Direct match - use it
-            variables[self.target] = variables[self.source_var]
+            source_val = variables[self.source_var]
+        else:
+            sv_lower = self.source_var.lower()
+            for k, v in variables.items():
+                if k.lower() == sv_lower:
+                    source_val = v
+                    break
+        
+        if source_val is not None:
+            # Match found (exact or case-insensitive)
+            variables[self.target] = source_val
             print(f"DEBUG PublishValueStep: Published '{self.source_var}' as '{self.target}': {variables[self.target]}")
             return True
         elif "value" in variables:
             # If source_var not found but 'value' exists, use that as a fallback
             variables[self.target] = variables["value"]
-            print(f"DEBUG PublishValueStep: Published fallback 'value' as '{self.target}': {variables[self.target]}")
+            if self.source_var != "value":
+                print(f"DEBUG PublishValueStep: WARNING: Source '{self.source_var}' not found, falling back to 'value' for '{self.target}': {variables[self.target]}")
+            else:
+                print(f"DEBUG PublishValueStep: Published 'value' as '{self.target}': {variables[self.target]}")
             return True
         else:
-            # Look for any numeric variable if all else fails
-            for var_name, var_value in variables.items():
+            # Look for any numeric variable if all else fails (as a last resort)
+            # Sort keys to ensure deterministic behavior if multiple numeric variables exist
+            for var_name in sorted(variables.keys()):
+                var_value = variables[var_name]
                 try:
                     if isinstance(var_value, (int, float)) or (isinstance(var_value, str) and var_value.replace('.', '', 1).isdigit()):
                         # Found a numeric value, use it
                         value = float(var_value) if not isinstance(var_value, (int, float)) else var_value
                         variables[self.target] = value
-                        print(f"DEBUG PublishValueStep: Published numeric var '{var_name}' as '{self.target}': {value}")
+                        print(f"DEBUG PublishValueStep: WARNING: Source '{self.source_var}' not found, falling back to numeric var '{var_name}' for '{self.target}': {value}")
                         return True
                 except (ValueError, TypeError):
                     continue
                     
-            print(f"DEBUG PublishValueStep: Source variable '{self.source_var}' not found in variables: {variables}")
+            print(f"DEBUG PublishValueStep: ERROR: Source variable '{self.source_var}' not found (case-insensitive) in variables: {list(variables.keys())}")
             return False
 
 
@@ -372,7 +416,8 @@ class SerialSequence:
                     "start_marker": step.start_marker,
                     "end_marker": step.end_marker,
                     "result_type": step.result_type,
-                    "result_var": step.result_var
+                    "result_var": step.result_var,
+                    "multiplier": getattr(step, 'multiplier', 1.0)
                 })
             elif isinstance(step, PublishValueStep):
                 steps_dict.append({
@@ -393,39 +438,64 @@ class SerialSequence:
         
         # Load steps
         for step_data in data.get("steps", []):
-            step_type = step_data.get("type", "")
+            step_type_raw = str(step_data.get("type", ""))
+            step_type = step_type_raw.strip().lower()
             
-            if step_type == "SendCommand":
+            if step_type == "sendcommand":
                 step = SendCommandStep(
                     command=step_data.get("command", ""),
                     line_ending=step_data.get("line_ending", "None")
                 )
-            elif step_type == "Wait":
+            elif step_type == "wait":
                 step = WaitStep(
                     wait_time=step_data.get("wait_time", 1000)
                 )
-            elif step_type == "ReadResponse":
+            elif step_type == "readresponse":
                 step = ReadResponseStep(
                     read_type=step_data.get("read_type", "Read Line"),
                     timeout=step_data.get("timeout", 1000),
-                    result_var=step_data.get("result_var", "response")
+                    result_var=step_data.get("result_var") or step_data.get("target", "response")
                 )
-            elif step_type == "ParseValue":
+            elif step_type == "parsevalue":
                 step = ParseValueStep(
-                    source_var=step_data.get("source_var", "response"),
+                    source_var=step_data.get("source_var") or step_data.get("source", "response"),
                     parse_method=step_data.get("parse_method", "Entire Response"),
-                    start_marker=step_data.get("start_marker", ""),
-                    end_marker=step_data.get("end_marker", ""),
+                    start_marker=step_data.get("start_marker") or step_data.get("start", ""),
+                    end_marker=step_data.get("end_marker") or step_data.get("end", ""),
                     result_type=step_data.get("result_type", "Number (Float)"),
-                    result_var=step_data.get("result_var", "value")
+                    result_var=step_data.get("result_var") or step_data.get("target", "value"),
+                    multiplier=float(step_data.get("multiplier", 1.0))
                 )
             elif step_type == "publish":
                 step = PublishValueStep(
-                    source_var=step_data.get("source_var", "value"),
+                    source_var=step_data.get("source_var") or step_data.get("source") or "value",
                     target=step_data.get("target", "value")
                 )
             else:
-                continue
+                # Compatibility for UI action types (which are lowercase)
+                if step_type == "send":
+                    step = SendCommandStep(
+                        command=step_data.get("command", ""),
+                        line_ending=step_data.get("line_ending", "None")
+                    )
+                elif step_type == "read":
+                    step = ReadResponseStep(
+                        read_type=step_data.get("read_type", "Read Line"),
+                        timeout=step_data.get("timeout", 1000),
+                        result_var=step_data.get("target", "response")
+                    )
+                elif step_type == "parse":
+                    # UI uses 'source' and 'target' instead of 'source_var' and 'result_var'
+                    step = ParseValueStep(
+                        source_var=step_data.get("source", "response"),
+                        parse_method=step_data.get("parse_mode", "Entire Response"), # UI uses 'parse_mode'
+                        start_marker=step_data.get("start", ""), # UI uses 'start'
+                        end_marker=step_data.get("end", ""), # UI uses 'end'
+                        result_var=step_data.get("target", "value"),
+                        multiplier=float(step_data.get("multiplier", 1.0))
+                    )
+                else:
+                    continue
                 
             sequence.steps.append(step)
             
@@ -436,18 +506,22 @@ class OtherSerialInterface(BaseInterface):
     """Interface for other serial devices with custom sequences"""
     
     DISPLAY_NAME = "Serial"
-    DESCRIPTION = "Custom serial device with communication sequences"
+    DESCRIPTION = "Generic Serial Interface (OtherSerial) for custom protocols"
     ICON = "Other.png"
     
     HELP_TEXT = """
-    <h3>Custom Serial Interface</h3>
+    <h3>Custom Serial Interface (OtherSerial)</h3>
     <p>Connects to any serial device and executes a sequence of commands to read data.</p>
-    <p><b>How to use:</b></p>
-    <ol>
-        <li>Select the COM port and baud rate.</li>
-        <li>Configure the communication sequence (Send Command, Wait, Read, Parse).</li>
-        <li>The sequence will be executed periodically based on the poll interval.</li>
-    </ol>
+    <p><b>AI Assistant Workflow:</b></p>
+        <ol>
+            <li>Use <b>list_serial_ports</b> to find available hardware.</li>
+            <li>Use <b>test_serial_command</b> with empty or common commands (?, AT) to probe the device protocol.</li>
+            <li>Use <b>configure_serial_sequence</b> to define the (Wait -> Read -> Parse -> publish) pipeline.</li>
+            <li><b>CRITICAL:</b> Ensure <b>SendCommand</b> steps have the correct <b>line_ending</b> (usually <b>LF</b> or <b>CRLF</b>) if the device expects it.</li>
+            <li><b>CRITICAL:</b> Ensure you include a <b>publish</b> step at the end of the sequence for each sensor.</li>
+            <li>Use <b>add_sensor</b> with interface "Serial" and mapping "SequenceName:VariableName" (where VariableName is the 'target' from your publish step) to show data.</li>
+        </ol>
+    <p><b>Critical:</b> Always include Wait steps (300ms+) in sequences for hardware reliability.</p>
     """
     
     CONFIG_SCHEMA = {
@@ -522,24 +596,39 @@ class OtherSerialInterface(BaseInterface):
             parity_value = parity_map.get(self.parity, serial.PARITY_NONE)
             stop_bits_value = stop_bits_map.get(str(self.stop_bits), serial.STOPBITS_ONE)
             
-            # Use timeout=2 to match the Test dialog behavior
+            # Use timeout=0.1 for non-blocking internal reads
             self.serial = serial.Serial(
                 port=self.port,
                 baudrate=self.baud_rate,
                 bytesize=self.data_bits,
                 parity=parity_value,
                 stopbits=stop_bits_value,
-                timeout=2.0  # Match Test dialog's timeout=2
+                timeout=0.1
             )
+            
+            # For Arduinos and some USB-Serial converters, 
+            # DTR and RTS must be explicitly set to True to enable data flow.
+            try:
+                self.serial.dtr = True
+                self.serial.rts = True
+            except Exception as e:
+                print(f"DEBUG OtherSerialInterface: Could not set DTR/RTS: {e}")
             
             # No sleep - just check if the port is actually open
             if not self.serial.is_open:
                 self.serial.open()
             
             # Wait for Arduino to reset after DTR toggle (opening port resets Arduino)
-            # This matches what happens in the Test dialog when user clicks through steps
-            print("DEBUG OtherSerialInterface: Waiting 2s for Arduino to boot after reset...")
+            # Most Arduinos need 1.5-2.0 seconds to finish bootloader and start sketch.
+            print(f"DEBUG OtherSerialInterface: Waiting 2.0s for device on {self.port} to boot...")
             time.sleep(2.0)
+            
+            # Clear any garbage in the buffer from reset
+            try:
+                self.serial.reset_input_buffer()
+                self.serial.reset_output_buffer()
+            except Exception:
+                pass
                 
             # Quick test to see if the port is responding
             try:
@@ -624,17 +713,10 @@ class OtherSerialInterface(BaseInterface):
                 print("DEBUG OtherSerialInterface.read_data: No sequence steps defined, returning None")
             return None
         
-        # Check if it's time to poll
-        current_time = time.time()
-        if current_time - self.last_poll_time < self.poll_interval:
-            # Not time to poll yet
-            return None
-            
-        self.last_poll_time = current_time
-        
         # Execute the sequence(s)
         try:
             merged = {}
+            current_time = time.time()
 
             for seq in sequences_to_run:
                 if not seq or not _has_steps(seq):
@@ -708,6 +790,29 @@ class OtherSerialInterface(BaseInterface):
         except Exception as e:
             self.error_message = f"Error writing data: {e}"
             return False
+
+    def update_settings(self, settings):
+        """Update interface settings"""
+        if "poll_interval" in settings:
+            try:
+                self.poll_interval = float(settings["poll_interval"])
+            except (ValueError, TypeError):
+                pass
+        
+        if "sequences" in settings:
+            new_sequences = []
+            for seq_data in settings["sequences"]:
+                if isinstance(seq_data, dict):
+                    seq = SerialSequence.from_dict(seq_data)
+                    if seq:
+                        new_sequences.append(seq)
+            if new_sequences:
+                self.sequences = new_sequences
+        
+        if "sequence" in settings and isinstance(settings["sequence"], dict):
+            seq = SerialSequence.from_dict(settings["sequence"])
+            if seq:
+                self.sequence = seq
             
     @staticmethod
     def list_ports():
@@ -730,6 +835,7 @@ class OtherSerialThread(QThread):
     data_received_signal = pyqtSignal(dict)  # Signal emitted when new data is received
     connection_status_signal = pyqtSignal(bool, str)  # For connection status updates
     error_signal = pyqtSignal(str)  # For error messages
+    manual_response_signal = pyqtSignal(str) # For response to manual commands
     
     def __init__(self):
         """Initialize the thread"""
@@ -750,12 +856,17 @@ class OtherSerialThread(QThread):
         self._last_reconnect_attempt = 0
         self._reconnect_interval = 5.0  # seconds
         
+        # Manual command queue
+        self.manual_command_queue = []
+        self._manual_command_lock = QMutex()
+        
     def run(self):
         """Main thread method"""
         print(f"DEBUG OtherSerialThread: Started with running={self.running}")
         
         while self.running:
             try:
+                current_time = time.time()
                 # Handle reconnection if needed
                 if not self.paused and self.interface and not self.interface.is_connected():
                     if self._was_connected:
@@ -764,7 +875,6 @@ class OtherSerialThread(QThread):
                         self._was_connected = False
 
                     if self.auto_reconnect:
-                        current_time = time.time()
                         if current_time - self._last_reconnect_attempt >= self._reconnect_interval:
                             self._last_reconnect_attempt = current_time
                             print(f"OtherSerialThread: Connection lost, attempting reconnect to {self.interface.port}...")
@@ -781,8 +891,34 @@ class OtherSerialThread(QThread):
                         # We don't break here to allow the interface to be set again or paused/unpaused
                 
                 if not self.paused and self.interface and self.interface.is_connected():
+                    # Check for pending manual commands
+                    command_info = None
+                    self._manual_command_lock.lock()
+                    if self.manual_command_queue:
+                        command_info = self.manual_command_queue.pop(0)
+                    self._manual_command_lock.unlock()
+
+                    if command_info:
+                        cmd = command_info['command']
+                        to = command_info['timeout']
+                        print(f"DEBUG OtherSerialThread: Executing manual command: {cmd}")
+                        try:
+                            # Flush input buffer before sending to clear any stale data
+                            if hasattr(self.interface, 'serial') and self.interface.serial:
+                                try:
+                                    self.interface.serial.reset_input_buffer()
+                                except Exception:
+                                    pass
+                            
+                            self.interface.write_data(cmd)
+                            time.sleep(0.1)
+                            resp = self.read_response(to)
+                            self.manual_response_signal.emit(resp)
+                        except Exception as e:
+                            self.manual_response_signal.emit(f"Error: {str(e)}")
+                        continue
+
                     # Check if it's time to poll based on the poll interval
-                    current_time = time.time()
                     if current_time - self.last_poll_time >= self.poll_interval:
                         self.last_poll_time = current_time
                         
@@ -1017,7 +1153,8 @@ class OtherSerialThread(QThread):
             True if successful, False otherwise
         """
         if not self.interface or not self.interface.is_connected():
-            return "Error: Device not connected"
+            print(f"DEBUG OtherSerialThread.send_command: Error: Device not connected")
+            return False
         
         # Add line ending
         if line_ending == "CR (\\r)":
@@ -1029,20 +1166,15 @@ class OtherSerialThread(QThread):
         
         # Send command
         try:
-            result = self.interface.write_data(command)
-            return f"Command sent: {command}"
+            return self.interface.write_data(command)
         except Exception as e:
-            return f"Error sending command: {str(e)}"
+            print(f"DEBUG OtherSerialThread.send_command: Error sending command: {str(e)}")
+            return False
         
     def read_response(self, timeout=1.0):
         """
-        Read a response from the serial device
-        
-        Args:
-            timeout: Timeout in seconds
-            
-        Returns:
-            Response string
+        Read a response from the serial device.
+        Attempts to read all available data until the timeout is reached.
         """
         if not self.interface or not self.interface.is_connected():
             return "Error: Device not connected"
@@ -1052,10 +1184,35 @@ class OtherSerialThread(QThread):
             original_timeout = None
             if hasattr(self.interface, 'serial'):
                 original_timeout = self.interface.serial.timeout
-                self.interface.serial.timeout = timeout
+                self.interface.serial.timeout = 0.1 # Short timeout for individual reads
             
-            # Read response
-            response = self.interface.serial.readline().decode('utf-8', errors='replace').strip()
+            response_data = []
+            start_time = time.time()
+            last_data_time = start_time
+            
+            print(f"DEBUG OtherSerialThread.read_response: Starting read with timeout={timeout}s")
+            
+            # Keep reading until we have something OR timeout reached
+            while time.time() - start_time < timeout:
+                if self.interface.serial.in_waiting > 0:
+                    # Read all available bytes
+                    chars = self.interface.serial.read(self.interface.serial.in_waiting)
+                    if chars:
+                        decoded = chars.decode('utf-8', errors='replace')
+                        response_data.append(decoded)
+                        last_data_time = time.time()
+                        print(f"DEBUG OtherSerialThread.read_response: Read chunk: {repr(decoded)}")
+                else:
+                    if response_data:
+                        # We have data. Wait up to 300ms for more data if the buffer is empty
+                        # to handle slow devices or multi-line responses.
+                        if time.time() - last_data_time > 0.3:
+                            print("DEBUG OtherSerialThread.read_response: No more data for 300ms, breaking.")
+                            break
+                    time.sleep(0.05)
+            
+            response = "".join(response_data).strip()
+            print(f"DEBUG OtherSerialThread.read_response: Final response: {repr(response)}")
             
             # Store response for later use
             self.last_response = response
@@ -1066,4 +1223,11 @@ class OtherSerialThread(QThread):
             
             return response
         except Exception as e:
+            print(f"ERROR OtherSerialThread.read_response: {e}")
             return f"Error reading response: {str(e)}" 
+
+    def queue_manual_command(self, command, timeout=2.0):
+        """Queue a manual command to be executed by the thread"""
+        self._manual_command_lock.lock()
+        self.manual_command_queue.append({'command': command, 'timeout': timeout})
+        self._manual_command_lock.unlock() 

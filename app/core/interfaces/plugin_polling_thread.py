@@ -17,16 +17,18 @@ class PluginPollingThread(QThread):
         super().__init__()
         self.interface = interface_instance
         self.interface_name = name
+        self.poll_rate_hz = poll_rate_hz
         self.poll_interval = 1.0 / max(0.1, poll_rate_hz)
         self.running = False
-        self._is_connected = False
+        self._is_connected = self.interface.is_connected()
 
     def set_poll_rate(self, hz):
+        self.poll_rate_hz = hz
         self.poll_interval = 1.0 / max(0.1, hz)
 
     def run(self):
         self.running = True
-        logger.info(f"Starting polling thread for plugin: {self.interface_name}")
+        logger.info(f"Starting polling thread for plugin: {self.interface_name} (initial state: {'connected' if self._is_connected else 'not connected'})")
         
         while self.running:
             try:
@@ -37,6 +39,12 @@ class PluginPollingThread(QThread):
                     else:
                         time.sleep(2.0) # Wait before retry
                         continue
+                
+                # Double-check interface still thinks it's connected
+                if not self.interface.is_connected():
+                    self._is_connected = False
+                    self.connection_status_signal.emit(self.interface_name, False)
+                    continue
 
                 data = self.interface.read_data()
                 if data:
