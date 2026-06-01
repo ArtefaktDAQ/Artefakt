@@ -903,9 +903,22 @@ class ArduinoCommandAction(BaseAction):
         super().__init__(name, ActionType.ARDUINO_COMMAND)
         self.command = str(command)
         self.description = f"Send Arduino: '{self.command}'"
+
+    def _get_arduino_interface(self, context):
+        """Return the active Arduino command interface from the automation context."""
+        arduino_interface = context.get('interfaces', {}).get('arduino')
+        if arduino_interface and hasattr(arduino_interface, 'is_connected') and hasattr(arduino_interface, 'send_command'):
+            return arduino_interface
+
+        main_window = context.get('main_window')
+        data_controller = getattr(main_window, 'data_collection_controller', None) if main_window else None
+        if data_controller and hasattr(data_controller, 'arduino_thread'):
+            return data_controller.arduino_thread
+
+        return None
         
     def execute(self, context):
-        arduino_interface = context.get('interfaces', {}).get('arduino')
+        arduino_interface = self._get_arduino_interface(context)
         if arduino_interface and arduino_interface.is_connected():
             try:
                 # Substitute variables if present
@@ -925,12 +938,19 @@ class ArduinoCommandAction(BaseAction):
                         )
                     
                     self.action_completed.emit(self)
+                    return True
                 else:
-                    self.action_failed.emit(self, f"Arduino failed to execute command: {resolved_command}")
+                    self.last_error = f"Arduino failed to execute command: {resolved_command}"
+                    self.action_failed.emit(self, self.last_error)
+                    return False
             except Exception as e:
-                self.action_failed.emit(self, f"Failed to send Arduino command: {e}")
+                self.last_error = f"Failed to send Arduino command: {e}"
+                self.action_failed.emit(self, self.last_error)
+                return False
         else:
-            self.action_failed.emit(self, "Arduino not connected or available")
+            self.last_error = "Arduino not connected or available"
+            self.action_failed.emit(self, self.last_error)
+            return False
             
     def to_dict(self):
         data = super().to_dict()
@@ -1540,6 +1560,11 @@ class AutomationStep(QObject):
                 # BUT if execute() didn't result in a signal emission (e.g. error caught but not emitted), 
                 # we need a safety check here.
                 if self.is_running and not getattr(self.action, 'is_async', False):
+                    if result is True:
+                        self.is_running = False
+                        self._log_action_event(context, timestamp=self.last_execution_timestamp)
+                        self.step_completed.emit(self)
+                        return
                     if result is False:
                         self.is_running = False
                         failure_reason = getattr(self.action, 'last_error', '') or "Action reported failure"
@@ -1581,6 +1606,8 @@ class AutomationStep(QObject):
         
     def _on_action_completed(self, action_obj):
         if action_obj == self.action:
+            if not self.is_running:
+                return
             print(f"[Automation] Step action completed: {self.action.name}")
             # For synchronous actions, log now so we include any result data (like last_image_path)
             if not getattr(self.action, 'is_async', False):
@@ -1597,6 +1624,8 @@ class AutomationStep(QObject):
             
     def _on_action_failed(self, action_obj, reason):
         if action_obj == self.action:
+            if not self.is_running:
+                return
             print(f"[Automation] Step action FAILED: {self.action.name} - Reason: {reason}")
             self.is_running = False
             self.step_failed.emit(self, reason)

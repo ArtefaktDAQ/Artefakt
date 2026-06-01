@@ -43,7 +43,7 @@ class AutomationController(QObject):
         initial_context = {
             'main_window': self.main_window,
             'interfaces': {
-                'arduino': getattr(self.main_window, 'interfaces', {}).get('arduino'),
+                'arduino': getattr(getattr(self.main_window, 'data_collection_controller', None), 'arduino_thread', None),
                 'labjack': getattr(self.main_window, 'interfaces', {}).get('labjack'),
                 'serial_manager': getattr(self.main_window, 'data_collection_controller', None)
             },
