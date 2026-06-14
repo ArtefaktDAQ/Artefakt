@@ -1518,7 +1518,19 @@ class AutomationStep(QObject):
         self.enabled = bool(enabled)
         self.is_running = False # Tracks if action is currently executing
         
-        # Connect signals
+        self._connect_action_signals()
+
+    def _connect_action_signals(self):
+        """Ensure action completion/failure signals are connected exactly once."""
+        try:
+            self.action.action_completed.disconnect(self._on_action_completed)
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            self.action.action_failed.disconnect(self._on_action_failed)
+        except (TypeError, RuntimeError):
+            pass
+
         self.action.action_completed.connect(self._on_action_completed)
         self.action.action_failed.connect(self._on_action_failed)
         
@@ -1698,6 +1710,12 @@ class AutomationSequence(QObject):
     def _connect_step_signals(self):
         """Connect completion/failure signals for all steps in the sequence."""
         for step in self.steps:
+            # A sequence cleanup disconnects both sequence-step and step-action
+            # signals. Reconnect the step internals here so edited sequences can
+            # be safely re-used without recreating every AutomationStep.
+            if hasattr(step, '_connect_action_signals'):
+                step._connect_action_signals()
+
             # Safely disconnect first to avoid multiple connections
             try:
                 step.step_completed.disconnect(self._handle_step_completed)
@@ -1721,6 +1739,14 @@ class AutomationSequence(QObject):
         self.steps = steps
         self._connect_step_signals()
 
+    def _prepare_current_step(self):
+        """Prepare per-step trigger state when a step becomes active."""
+        if 0 <= self.current_step_index < len(self.steps):
+            current_step = self.steps[self.current_step_index]
+            current_step.is_running = False
+            if isinstance(current_step.trigger, TimeDurationTrigger):
+                current_step.trigger.reset()
+
     def set_context(self, context):
         self._context = context
         
@@ -1742,6 +1768,8 @@ class AutomationSequence(QObject):
         for step in self.steps:
              step.trigger.reset()
              step.is_running = False
+
+        self._prepare_current_step()
 
         self.sequence_started.emit(self)
         self.sequence_step_changed.emit(self, self.current_step_index)
@@ -1836,12 +1864,12 @@ class AutomationSequence(QObject):
             if self.loop:
                 # Loop back to the beginning
                 self.current_step_index = 0
+                self._prepare_current_step()
                 print(f"Sequence '{self.name}' looping back to step 1.")
                 self.sequence_step_changed.emit(self, self.current_step_index)
                 
-                # We don't call trigger.reset() here because we want to maintain 
-                # state like cooldowns and hysteresis across loops.
-                # reset() is only called when the sequence is explicitly (re)started.
+                # Duration triggers must be re-armed each time their step becomes
+                # active. Other trigger state, such as hysteresis, is preserved.
                     
                 # Use singleShot to break recursion and allow event loop processing
                 # This prevents UI hangs in tight loops
@@ -1853,6 +1881,7 @@ class AutomationSequence(QObject):
                 self.sequence_completed.emit(self)
         else:
             # Proceed to the next step
+            self._prepare_current_step()
             print(f"[Automation] Sequence '{self.name}' moving to Step {self.current_step_index + 1}.")
             self.sequence_step_changed.emit(self, self.current_step_index)
             # Use singleShot to break recursion
@@ -2368,6 +2397,19 @@ class AutomationManager(QObject):
 
     # --- Signal Handling ---
     def _connect_sequence_signals(self, sequence):
+         if hasattr(sequence, '_connect_step_signals'):
+             sequence._connect_step_signals()
+         try: sequence.sequence_started.disconnect(self.sequence_started)
+         except (TypeError, RuntimeError): pass
+         try: sequence.sequence_stopped.disconnect(self._handle_sequence_stopped)
+         except (TypeError, RuntimeError): pass
+         try: sequence.sequence_completed.disconnect(self.sequence_completed)
+         except (TypeError, RuntimeError): pass
+         try: sequence.sequence_step_changed.disconnect(self.sequence_step_changed)
+         except (TypeError, RuntimeError): pass
+         try: sequence.sequence_error.disconnect(self.sequence_error)
+         except (TypeError, RuntimeError): pass
+
          sequence.sequence_started.connect(self.sequence_started)
          sequence.sequence_stopped.connect(self._handle_sequence_stopped)
          sequence.sequence_completed.connect(self.sequence_completed)
