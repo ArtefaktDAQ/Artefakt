@@ -107,6 +107,7 @@ REMEMBER: If you are unsure of a technical detail (like camera indexing or seria
             "ai_allow_automation": "true",
             "ai_allow_vision": "true",
             "ai_allow_projects": "true",
+            "ai_allow_config": "true",
             "ai_timeout": "300",
             "ai_max_image_width": "768",
             "ai_image_quality": "50",

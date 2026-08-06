@@ -6,7 +6,10 @@ Handles communication with MQTT brokers.
 
 import time
 import json
+import logging
 import threading
+
+logger = logging.getLogger(__name__)
 from PyQt6.QtCore import QObject, pyqtSignal
 try:
     import paho.mqtt.client as mqtt
@@ -97,6 +100,9 @@ class MQTTInterface(BaseInterface):
         if not MQTT_AVAILABLE:
             self.error_message = "paho-mqtt library not installed"
             return False
+
+        if self.client:
+            self.disconnect()
             
         try:
             # Create MQTT client
@@ -162,7 +168,8 @@ class MQTTInterface(BaseInterface):
         """Subscribe to a topic"""
         if self.client and self.connected:
             self.client.subscribe(topic)
-            self.subscribed_topics.add(topic)
+            with self._buffer_lock:
+                self.subscribed_topics.add(topic)
             return True
         return False
         
@@ -170,8 +177,8 @@ class MQTTInterface(BaseInterface):
         """Unsubscribe from a topic"""
         if self.client and self.connected:
             self.client.unsubscribe(topic)
-            if topic in self.subscribed_topics:
-                self.subscribed_topics.remove(topic)
+            with self._buffer_lock:
+                self.subscribed_topics.discard(topic)
             return True
         return False
         
@@ -181,7 +188,9 @@ class MQTTInterface(BaseInterface):
             self.connected = True
             self.error_message = ""
             # Resubscribe to topics if reconnecting
-            for topic in self.subscribed_topics:
+            with self._buffer_lock:
+                topics = list(self.subscribed_topics)
+            for topic in topics:
                 self.client.subscribe(topic)
         else:
             self.connected = False
@@ -195,6 +204,23 @@ class MQTTInterface(BaseInterface):
             if self.on_connection_lost:
                 self.on_connection_lost(self.error_message)
                 
+    def _store_message_value(self, topic, value):
+        """Store a parsed payload, flattening JSON dicts into topic/key scalars."""
+        if isinstance(value, dict):
+            stored = False
+            for k, v in value.items():
+                if isinstance(v, (int, float, str, bool)):
+                    self.data_buffer[f"{topic}/{k}"] = v
+                    stored = True
+                elif isinstance(v, list):
+                    self.data_buffer[f"{topic}/{k}"] = json.dumps(v)
+                    stored = True
+            if not stored:
+                logger.debug("MQTT: skipped non-scalar JSON dict on topic %s", topic)
+            return
+
+        self.data_buffer[topic] = value
+
     def _on_message(self, client, userdata, msg):
         """Callback for when a message is received"""
         topic = msg.topic
@@ -216,7 +242,7 @@ class MQTTInterface(BaseInterface):
             value = payload
             
         with self._buffer_lock:
-            self.data_buffer[topic] = value
+            self._store_message_value(topic, value)
             
     def read_data(self):
         """

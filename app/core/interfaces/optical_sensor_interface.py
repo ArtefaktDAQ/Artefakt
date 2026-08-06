@@ -206,7 +206,11 @@ class OpticalSensorThread(QObject):
             "save_event_images": True,
             "output_dir": "optical_events",
             "cooldown_ms": 100,  # Minimum time between events
+            "sample_rate": 10,
         }
+        
+        self.last_sample_time = 0.0
+        self.sample_rate = self.settings["sample_rate"]
         
         # Baseline tracking - use deque for O(1) append/pop operations
         self.baseline_buffer = deque(maxlen=30)
@@ -228,6 +232,9 @@ class OpticalSensorThread(QObject):
         """Connect to camera"""
         try:
             self.camera_id = int(camera_id)
+            self.width = width
+            self.height = height
+            self.fps = fps
             
             # Try different backends on Windows
             import platform
@@ -264,8 +271,8 @@ class OpticalSensorThread(QObject):
             # Start processing thread
             self._stop_event.clear()
             self._thread = Thread(target=self._processing_loop, daemon=True)
-            self._thread.start()
             self.running = True
+            self._thread.start()
             
             return True
             
@@ -312,6 +319,8 @@ class OpticalSensorThread(QObject):
             for key, value in settings_dict.items():
                 if key in self.settings:
                     self.settings[key] = value
+                if key == "sample_rate":
+                    self.sample_rate = float(value)
     
     def _processing_loop(self):
         """Main processing loop running in thread"""
@@ -641,12 +650,19 @@ class OpticalSensorThread(QObject):
     
     def _detect_fill_level(self, frame, gray, settings):
         """Detect fill level in a region of interest"""
-        roi_x = settings.get("roi_x", 0)
-        roi_y = settings.get("roi_y", 0)
-        roi_w = settings.get("roi_width", gray.shape[1])
-        roi_h = settings.get("roi_height", gray.shape[0])
+        h_frame, w_frame = gray.shape
+        roi_x = int(settings.get("roi_x", 0))
+        roi_y = int(settings.get("roi_y", 0))
+        roi_w = int(settings.get("roi_width", w_frame))
+        roi_h = int(settings.get("roi_height", h_frame))
         threshold = settings.get("fill_threshold", 128)
         direction = settings.get("fill_direction", "horizontal")
+        
+        # Clamp ROI to frame bounds
+        roi_x = max(0, min(roi_x, w_frame - 1))
+        roi_y = max(0, min(roi_y, h_frame - 1))
+        roi_w = max(1, min(roi_w, w_frame - roi_x))
+        roi_h = max(1, min(roi_h, h_frame - roi_y))
         
         # Extract ROI
         roi = gray[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
@@ -659,7 +675,7 @@ class OpticalSensorThread(QObject):
             # Sum each row, find where it changes
             row_sums = np.sum(binary, axis=1)
             total = np.sum(row_sums > 0)
-            fill_level = (1.0 - total / roi_h) * 100  # 0% = empty at bottom, 100% = full
+            fill_level = total / roi_h * 100  # 0% = empty, 100% = full
         else:
             # Sum each column
             col_sums = np.sum(binary, axis=0)
@@ -833,7 +849,6 @@ class OpticalSensorInterface(BaseInterface):
             # If this camera is already known to be in use by us (main camera), 
             # don't probe it as it will cause a disconnect.
             if i in skip_indices:
-                available.append(i)
                 continue
                 
             if cls.is_camera_available(i):

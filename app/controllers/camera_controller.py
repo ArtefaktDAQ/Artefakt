@@ -23,6 +23,7 @@ from app.core.interfaces.ndi_interface import NDI_AVAILABLE, NDISourceFinder
 from app.settings.settings_manager import SettingsManager
 from app.core.logger import Logger
 from app.utils.common_types import StatusState
+from app.utils.directory_setup import get_app_config_dir
 
 class CameraController(QObject):
     """Controller for managing camera operations"""
@@ -159,6 +160,8 @@ class CameraController(QObject):
         self.last_error_messages = [""] * 4
         self._frame_skips = [0] * 4
         self.should_reconnect = [False] * 4
+        self._motion_states = [False] * 4  # Per-slot motion for automation OR-logic
+        self.record_with_overlays = self.settings.get_value("record_with_overlays", "true") == "true"
         
         # Mouse interaction state
         self.drag_start_pos = None
@@ -242,6 +245,33 @@ class CameraController(QObject):
         self.connect_signals()
         
         self.logger.log("Camera controller initialized")
+
+    def any_connected(self):
+        """True if at least one camera slot is connected (safe bool check for list)."""
+        return any(self.is_connected)
+
+    def any_recording(self):
+        """True if at least one camera slot is recording."""
+        return any(self.is_recording)
+
+    def get_in_use_local_camera_ids(self):
+        """Return local OpenCV camera device IDs currently used by connected slots."""
+        ids = []
+        for i, connected in enumerate(self.is_connected):
+            if not connected or not self.camera_threads[i]:
+                continue
+            thread = self.camera_threads[i]
+            if getattr(thread, 'is_ndi', False):
+                continue
+            cid = getattr(thread, 'camera_id', None)
+            if isinstance(cid, int):
+                ids.append(cid)
+            elif cid is not None:
+                try:
+                    ids.append(int(cid))
+                except (TypeError, ValueError):
+                    pass
+        return ids
         
     def _update_fps_display(self):
         """Update the actual vs target FPS label in the UI"""
@@ -347,17 +377,26 @@ class CameraController(QObject):
                 self.logger.log(f"Error removing automation event '{event_name}': {e}", "ERROR")
     
     def _clear_automation_events(self):
-        """Clear automation events from the context after they've been processed"""
+        """Clear transient automation events, preserving motion-detected flags."""
         if not hasattr(self.main_window, 'automation_controller'):
             return
         
         try:
             if 'events' in self.main_window.automation_controller.manager.app_context:
                 events = self.main_window.automation_controller.manager.app_context['events']
+
+                def _is_motion_event(name):
+                    return name == 'motion_detected' or str(name).startswith('motion_detected_cam')
+
                 if isinstance(events, set):
+                    # Motion events are managed manually via _remove_automation_event
+                    preserved = {e for e in events if _is_motion_event(e)}
                     events.clear()
+                    events.update(preserved)
                 elif isinstance(events, dict):
-                    events.clear()
+                    for key in list(events.keys()):
+                        if not _is_motion_event(key):
+                            events.pop(key, None)
                 # Update context to notify sequences
                 self.main_window.automation_controller.update_context({})
         except Exception as e:
@@ -868,10 +907,47 @@ class CameraController(QObject):
                 thread.frame_captured.connect(self.update_frame_display)
                 thread.status_update.connect(self.handle_connection_status)
                 thread.recording_status_signal.connect(self.handle_recording_status)
+                thread.recording_finalized_signal.connect(self._handle_recording_finalized)
                 if hasattr(thread, 'motion_detected_signal'):
                     thread.motion_detected_signal.connect(self._update_motion_indicator)
                 if hasattr(thread, 'framerate_warning_signal'):
                     thread.framerate_warning_signal.connect(self.handle_framerate_warning)
+
+            # Shared NDI finder for name lookup (CAM-06 / CAM-12)
+            if hasattr(self, '_ndi_finder') and self._ndi_finder is not None:
+                self.camera_threads[index].ndi_finder = self._ndi_finder
+
+            mode = self.camera_configs[index].get("mode", 0)
+            is_ndi = mode == 1
+
+            # Refuse duplicate local camera IDs (CAM-08)
+            if not is_ndi:
+                cid_str = str(camera_id)
+                if cid_str.startswith("NDI:"):
+                    cid_str = cid_str[4:]
+                try:
+                    local_cid = int(cid_str)
+                except (ValueError, TypeError):
+                    self.handle_connection_status(index, False, f"Invalid camera source: {camera_id}")
+                    return False
+                for other_i in range(4):
+                    if other_i == index or not self.is_connected[other_i]:
+                        continue
+                    other_thread = self.camera_threads[other_i]
+                    if not other_thread or getattr(other_thread, 'is_ndi', False):
+                        continue
+                    other_cid = getattr(other_thread, 'camera_id', None)
+                    try:
+                        other_cid = int(other_cid)
+                    except (TypeError, ValueError):
+                        continue
+                    if other_cid == local_cid:
+                        msg = f"Camera index {local_cid} is already in use by Camera {other_i + 1}"
+                        self.logger.log(msg, "ERROR")
+                        self.handle_connection_status(index, False, msg)
+                        if hasattr(self.main_window, 'statusBar'):
+                            self.main_window.statusBar().showMessage(msg, 5000)
+                        return False
 
             # Restore automatic timestamp overlay if no overlays exist for this slot
             if not self.overlays[index]:
@@ -881,8 +957,7 @@ class CameraController(QObject):
                 self.update_overlay_selector()
 
             self.camera_threads[index].set_overlays(self.overlays[index])
-            mode = self.camera_configs[index].get("mode", 0)
-            self.camera_threads[index].connect(camera_id, res, fps, is_ndi=(mode == 1))
+            self.camera_threads[index].connect(camera_id, res, fps, is_ndi=is_ndi)
             
             # Apply initial settings once connected
             if self.camera_configs[index].get("motion_enabled"):
@@ -910,7 +985,14 @@ class CameraController(QObject):
         if self.camera_threads[index]:
             self.camera_threads[index].disconnect()
             self.is_connected[index] = False
+            self.is_recording[index] = False
+            self._motion_states[index] = False
             self.handle_connection_status(index, False, "Disconnected")
+            # Refresh global motion OR after clearing this slot
+            if not any(self._motion_states):
+                self._remove_automation_event('motion_detected')
+            self._remove_automation_event(f'motion_detected_cam{index+1}')
+            self.update_visibility()
 
     def disconnect_all_cameras(self):
         """Disconnect all connected cameras"""
@@ -968,11 +1050,15 @@ class CameraController(QObject):
                     is_visible = True
                     p_mode = "dashboard" # Dashboard cams
             
-            # Other tabs: nothing is visible unless we are running and it's a dashboard cam
+            # Other tabs: keep a low-rate cache feed while connected so
+            # snapshots, MCP, and notes still get fresh frames.
             else:
                 if is_running and i in self.dashboard_slots and self.show_on_dashboard:
                     is_visible = True
                     p_mode = "dashboard"
+                elif self.is_connected[i]:
+                    is_visible = True
+                    p_mode = "cache"
                 else:
                     is_visible = False
                     p_mode = "none"
@@ -1007,35 +1093,43 @@ class CameraController(QObject):
                     
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     quality = int(self.settings.get_value("video_quality", "70"))
-                    use_direct = self.settings.get_bool("use_direct_streaming", True)
                     use_hw = self.settings.get_bool("use_hw_accel", True)
                     fname = f"recording_cam{index+1}_{timestamp}.mp4"
                     
                     if self.camera_threads[index]:
                         self.camera_threads[index].set_video_quality(quality)
                         self.camera_threads[index].set_overlays(self.overlays[index])
+                        wants_audio = self.camera_configs[index].get("record_audio", False)
+                        any_other_recording_audio = any(
+                            self.is_recording[i] and self.camera_configs[i].get("record_audio", False)
+                            for i in range(4) if i != index
+                        )
+                        record_audio = wants_audio and not any_other_recording_audio
+                        if wants_audio and not record_audio:
+                            self.logger.log(
+                                f"Cam {index + 1}: record_audio disabled — only one audio stream allowed",
+                                "WARN",
+                            )
                         success = self.camera_threads[index].start_recording(
                             output_dir=output_dir, filename=fname, codec="H264",
-                            use_direct_streaming=use_direct,
                             use_hw_accel=use_hw,
-                            record_audio=self.camera_configs[index].get("record_audio", False),
-                            audio_device_index=self.camera_configs[index].get("audio_device", -1)
+                            record_audio=record_audio,
+                            audio_device_index=self.camera_configs[index].get("audio_device", -1),
+                            record_with_overlays=self.settings.get_value("record_with_overlays", "true") == "true",
                         )
                         if success:
                             self.is_recording[index] = True
+                            self.update_visibility()
                             self._append_video_segment_metadata({
                                 "path": os.path.join(output_dir, fname), 
                                 "start_epoch": time.time(), 
                                 "camera_index": index
                             })
             
-            # If camera just disconnected, ensure metadata is finalized
+            # If camera just disconnected, ensure metadata is finalized when FFmpeg completes
             if not connected and old_connected and self.is_recording[index]:
-                self.logger.log(f"Camera {index+1} disconnected during recording, finalizing metadata...")
-                path = getattr(self.camera_threads[index], "output_file", "")
-                start_time = getattr(self.camera_threads[index], "recording_start_time", None)
+                self.logger.log(f"Camera {index+1} disconnected during recording, waiting for finalize...")
                 self.is_recording[index] = False
-                self._finalize_video_segment_metadata(path, time.time(), start_time)
         
         # If disconnected, clear the frames for this camera
         if not connected:
@@ -1117,18 +1211,16 @@ class CameraController(QObject):
         """Update the camera display with the captured frame"""
         if index >= 4: return
         
-        # Performance: Skip everything if no relevant tab is active
-        # We now include "Automation" so previews are ready when switching to Dashboard
-        if self._current_tab not in ["Camera", "Dashboard", "Automation"]:
-            return
-
-        # Convert QImage to QPixmap in the GUI thread
-        # This is expensive, but we are now sending fewer/smaller images from the threads
+        # Always cache the latest frame for snapshots / MCP / remote streaming,
+        # even when the Camera tab is not active.
         pixmap = QPixmap.fromImage(image)
-        
-        # We always keep the last frame reference for snapshots
         self.current_frames[index] = pixmap
         self._frame_skips[index] += 1
+
+        # Skip heavy UI work when no relevant tab needs it
+        is_running = hasattr(self.main_window, 'running') and self.main_window.running
+        if self._current_tab not in ["Camera", "Dashboard", "Automation"] and not is_running:
+            return
         
         # 1. Camera Tab View
         if self._current_tab == "Camera":
@@ -1151,7 +1243,6 @@ class CameraController(QObject):
 
         # 2. Dashboard View - if on Dashboard/Automation Tab OR if a run is active
         # We update dashboard cams in the background during a run so they are ready
-        is_running = hasattr(self.main_window, 'running') and self.main_window.running
         if (self._current_tab in ["Dashboard", "Automation"] or is_running) and self.show_on_dashboard:
             # Check if this index is actually one of the dashboard slots
             if index in self.dashboard_slots:
@@ -1182,6 +1273,17 @@ class CameraController(QObject):
             self.main_window.record_btn.setText("Stop Recording" if any_rec else "Start Recording")
             self.main_window.record_btn.setStyleSheet(self.recording_button_style if any_rec else self.original_button_style)
 
+    @pyqtSlot(int, str)
+    def _handle_recording_finalized(self, index, path):
+        """Finalize video segment metadata after FFmpeg encoding completes."""
+        if index < 0 or index >= 4:
+            return
+        if not path or not os.path.exists(path) or os.path.getsize(path) <= 0:
+            return
+        thread = self.camera_threads[index] if index < len(self.camera_threads) else None
+        start_time = getattr(thread, "recording_start_time", None) if thread else None
+        self._finalize_video_segment_metadata(path, time.time(), start_time)
+
     def handle_framerate_warning(self, index, exp, act):
         self.logger.log(f"Cam {index+1} low FPS: {act}/{exp}", "WARN")
     
@@ -1205,10 +1307,12 @@ class CameraController(QObject):
             
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             quality = int(self.settings.get_value("video_quality", "70"))
-            use_direct = self.settings.get_bool("use_direct_streaming", True)
             use_hw = self.settings.get_bool("use_hw_accel", True)
             
             count = 0
+            record_overlays = self.settings.get_value("record_with_overlays", "true") == "true"
+            self.record_with_overlays = record_overlays
+            audio_slot_claimed = False
             for i in range(4):
                 if not self.is_connected[i] or not self.camera_threads[i]: continue
                 if not self.camera_configs[i].get("record_video", True): continue
@@ -1216,13 +1320,23 @@ class CameraController(QObject):
                 self.camera_threads[i].set_video_quality(quality)
                 self.camera_threads[i].set_overlays(self.overlays[i])
                 
+                wants_audio = self.camera_configs[i].get("record_audio", False)
+                record_audio = wants_audio and not audio_slot_claimed
+                if wants_audio and not record_audio:
+                    self.logger.log(
+                        f"Cam {i + 1}: record_audio disabled — only one audio stream allowed",
+                        "WARN",
+                    )
+                if record_audio:
+                    audio_slot_claimed = True
+                
                 fname = f"recording_cam{i+1}_{timestamp}.mp4"
                 success = self.camera_threads[i].start_recording(
                     output_dir=output_dir, filename=fname, codec="H264",
-                    use_direct_streaming=use_direct,
                     use_hw_accel=use_hw,
-                    record_audio=self.camera_configs[i].get("record_audio", False),
-                    audio_device_index=self.camera_configs[i].get("audio_device", -1)
+                    record_audio=record_audio,
+                    audio_device_index=self.camera_configs[i].get("audio_device", -1),
+                    record_with_overlays=record_overlays,
                 )
                 if success:
                     count += 1
@@ -1236,6 +1350,7 @@ class CameraController(QObject):
                     })
             
             if count > 0:
+                self.update_visibility()
                 self.logger.log(f"Started {count} recordings")
                 self._add_automation_event('recording_started')
         except Exception as e:
@@ -1246,12 +1361,11 @@ class CameraController(QObject):
         count = 0
         for i in range(4):
             if self.is_recording[i] and self.camera_threads[i]:
-                path = getattr(self.camera_threads[i], "output_file", "")
                 self.camera_threads[i].stop_recording()
                 self.is_recording[i] = False
                 count += 1
-                self._finalize_video_segment_metadata(path, time.time(), getattr(self.camera_threads[i], "recording_start_time", None))
         if count > 0:
+            self.update_visibility()
             self.logger.log(f"Stopped {count} recordings")
             self._add_automation_event('recording_stopped')
     
@@ -1261,10 +1375,20 @@ class CameraController(QObject):
             self.stop_recording()
             for i in range(4):
                 if self.camera_threads[i]:
+                    # stop() already waits for finalize + capture thread
                     self.camera_threads[i].stop()
-                    self.camera_threads[i].wait(1000)
-            if hasattr(self, 'ndi_interface'): self.ndi_interface.stop()
-        except Exception as e: print(f"Error shutdown: {e}")
+                    self.camera_threads[i].wait(3000)
+                    self.camera_threads[i] = None
+                    self.is_connected[i] = False
+                    self.is_recording[i] = False
+                    self._motion_states[i] = False
+            if hasattr(self, 'ndi_interface'):
+                try:
+                    self.ndi_interface.stop()
+                except Exception:
+                    pass
+        except Exception as e:
+            self.logger.log(f"Error during camera shutdown: {e}", "ERROR")
 
     def connect_signals(self):
         """Connect UI signals to controller methods"""
@@ -1393,7 +1517,7 @@ class CameraController(QObject):
         if index == -1 or index == "all":
             paths = []
             for i in range(4):
-                if self.is_connected[i] and self.current_frames[i]:
+                if self.is_connected[i]:
                     path = self._perform_snapshot(i)
                     if path: paths.append(path)
             return "; ".join(paths) if paths else None
@@ -1403,14 +1527,28 @@ class CameraController(QObject):
     def _perform_snapshot(self, index):
         """Internal helper to capture a single snapshot"""
         try:
-            if not self.camera_threads[index] or not self.is_connected[index] or not self.current_frames[index]:
+            if not self.camera_threads[index] or not self.is_connected[index]:
                 return None
+            
+            pixmap = self.current_frames[index]
+            if pixmap is None or pixmap.isNull():
+                frame = self.camera_threads[index].get_latest_frame()
+                if frame is not None:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    h, w = rgb.shape[:2]
+                    qimg = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888).copy()
+                    pixmap = QPixmap.fromImage(qimg)
+            
+            if pixmap is None or pixmap.isNull():
+                self.logger.log(f"No frame available for snapshot cam{index + 1}", "WARN")
+                return None
+            
             run_dir = self.project_controller.get_current_run_directory() if self.project_controller else None
             path = os.path.join(run_dir, "Snapshots") if run_dir else os.path.join(".", "Snapshots")
             os.makedirs(path, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
             fname = os.path.join(path, f"snapshot_cam{index+1}_{ts}.png")
-            self.current_frames[index].toImage().save(fname, "PNG")
+            pixmap.toImage().save(fname, "PNG")
             self.snapshot_taken.emit(fname)
             return fname
         except Exception as e: self.logger.log(f"Error snapshot: {e}", "ERROR"); return None
@@ -1626,7 +1764,7 @@ class CameraController(QObject):
             return
         try:
             run_dir = self.project_controller.current_run_folder if self.project_controller else None
-            path = run_dir if run_dir and os.path.isdir(run_dir) else os.path.join(os.path.expanduser("~"), ".evolabs_daq")
+            path = run_dir if run_dir and os.path.isdir(run_dir) else get_app_config_dir()
             os.makedirs(path, exist_ok=True)
             import json
             with open(os.path.join(path, f"overlays_cam{index+1}.json"), 'w') as f:
@@ -1637,7 +1775,7 @@ class CameraController(QObject):
         try:
             import json
             for i in range(4):
-                fpath = os.path.join(run_dir, f"overlays_cam{i+1}.json") if run_dir else os.path.join(os.path.expanduser("~"), ".evolabs_daq", f"overlays_cam{i+1}.json")
+                fpath = os.path.join(run_dir, f"overlays_cam{i+1}.json") if run_dir else os.path.join(get_app_config_dir(), f"overlays_cam{i+1}.json")
                 if os.path.exists(fpath):
                     with open(fpath, 'r') as f:
                         data = json.load(f)
@@ -1741,6 +1879,33 @@ class CameraController(QObject):
         except Exception as e:
             print(f"Error in _do_apply_camera_settings: {e}")
 
+    def _overlay_position_from_bounds_top_left(self, overlay, x1, y1, frame_w, frame_h):
+        """Convert normalized bounds top-left back to overlay anchor position."""
+        if hasattr(overlay, '_get_smooth_text_params'):
+            text = ""
+            if hasattr(overlay, '_get_time_text'):
+                text = overlay._get_time_text()
+            elif hasattr(overlay, '_get_sensor_text'):
+                text = overlay._get_sensor_text()
+            elif hasattr(overlay, 'text'):
+                text = overlay.text
+            _, _, full_width, full_height, _, text_height = overlay._get_smooth_text_params(
+                text, frame_w, frame_h
+            )
+            padding_x = 8
+            padding_y = 8
+            x = x1 * frame_w + padding_x
+            y = y1 * frame_h + (full_height - 8)
+            denom_x = frame_w - full_width
+            denom_y = frame_h - full_height
+            new_x = (x - padding_x) / denom_x if denom_x > 0 else x1
+            new_y = (y - padding_y - text_height) / denom_y if denom_y > 0 else y1
+            return (
+                max(0.0, min(1.0, new_x)),
+                max(0.0, min(1.0, new_y)),
+            )
+        return (max(0.0, min(1.0, x1)), max(0.0, min(1.0, y1)))
+
     def _get_rel_image_pos(self, event_pos):
         """Calculate relative position (0.0-1.0) within the actual image area of the label"""
         idx = self.main_view_index
@@ -1794,8 +1959,8 @@ class CameraController(QObject):
                 if (x1 - 0.02 <= rel_x <= x2 + 0.02) and (y1 - 0.02 <= rel_y <= y2 + 0.02):
                     self.selected_overlay = o
                     self.is_dragging = True
-                    self.drag_offset_x = rel_x - o.position[0]
-                    self.drag_offset_y = rel_y - o.position[1]
+                    self.drag_offset_x = rel_x - x1
+                    self.drag_offset_y = rel_y - y1
                     self.update_overlay_selector()
                     break
             else:
@@ -1816,10 +1981,19 @@ class CameraController(QObject):
         if self.is_dragging and self.selected_overlay:
             rel_x, rel_y = self._get_rel_image_pos(event.position())
             if rel_x is not None:
-                # Clamp coordinates to [0, 1] range
-                new_x = max(0.0, min(1.0, rel_x - self.drag_offset_x))
-                new_y = max(0.0, min(1.0, rel_y - self.drag_offset_y))
-                self.selected_overlay.position = (new_x, new_y)
+                img_w = self.current_frames[idx].width() if self.current_frames[idx] else 1
+                img_h = self.current_frames[idx].height() if self.current_frames[idx] else 1
+                if hasattr(self.selected_overlay, 'get_bounds'):
+                    target_x1 = max(0.0, min(1.0, rel_x - self.drag_offset_x))
+                    target_y1 = max(0.0, min(1.0, rel_y - self.drag_offset_y))
+                    new_pos = self._overlay_position_from_bounds_top_left(
+                        self.selected_overlay, target_x1, target_y1, img_w, img_h
+                    )
+                    self.selected_overlay.position = new_pos
+                else:
+                    new_x = max(0.0, min(1.0, rel_x - self.drag_offset_x))
+                    new_y = max(0.0, min(1.0, rel_y - self.drag_offset_y))
+                    self.selected_overlay.position = (new_x, new_y)
                 if self.camera_threads[idx]: 
                     self.camera_threads[idx].set_overlays(self.overlays[idx])
     
@@ -1832,7 +2006,12 @@ class CameraController(QObject):
         if index is None:
             for i in range(4): self.close_camera(i)
             return
-        if self.camera_threads[index]: self.camera_threads[index].stop(); self.is_connected[index] = False
+        if self.camera_threads[index]:
+            self.camera_threads[index].stop()
+            self.camera_threads[index].wait(3000)
+            self.is_connected[index] = False
+            self.is_recording[index] = False
+            self._motion_states[index] = False
     
     def init_ndi(self):
         from app.core.interfaces.ndi_interface import NDIInterface
@@ -1852,8 +2031,67 @@ class CameraController(QObject):
         return (StatusState.READY, f"{connected_count} Cam(s) OK")
 
     def get_current_frame(self, index=None):
+        """Return the latest QPixmap for a camera slot (or None)."""
         if index is None: index = self.main_view_index
+        if index < 0 or index >= 4:
+            return None
         return self.current_frames[index]
+
+    def get_streaming_numpy_frame(self, index=None):
+        """Thread-safe BGR frame for gRPC streaming (camera thread buffers only)."""
+        if index is None:
+            index = self.main_view_index
+        if index < 0 or index >= 4:
+            return None
+        thread = self.camera_threads[index] if index < len(self.camera_threads) else None
+        if thread and hasattr(thread, 'get_latest_frame'):
+            return thread.get_latest_frame()
+        return None
+
+    def get_numpy_frame(self, index=None):
+        """Return the latest frame as a BGR numpy array for streaming/export."""
+        pixmap = self.get_current_frame(index)
+        if pixmap is not None and not pixmap.isNull():
+            try:
+                qimg = pixmap.toImage().convertToFormat(QImage.Format.Format_RGB888)
+                w, h = qimg.width(), qimg.height()
+                bytes_per_line = qimg.bytesPerLine()
+                ptr = qimg.bits()
+                if hasattr(ptr, 'setsize'):
+                    ptr.setsize(qimg.sizeInBytes())
+                    arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, bytes_per_line))
+                else:
+                    arr = np.frombuffer(ptr, dtype=np.uint8, count=qimg.sizeInBytes()).reshape((h, bytes_per_line))
+                arr = arr[:, :w * 3].reshape((h, w, 3)).copy()
+                return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            except Exception as e:
+                self.logger.log(f"Error converting frame to numpy: {e}", "ERROR")
+        
+        if index is None:
+            index = self.main_view_index
+        thread = self.camera_threads[index] if 0 <= index < 4 else None
+        if thread and hasattr(thread, 'get_latest_frame'):
+            return thread.get_latest_frame()
+        return None
+
+    def display_remote_frame(self, frame):
+        """Display a remote BGR/RGB numpy frame on the main camera view."""
+        if frame is None:
+            return
+        try:
+            if len(frame.shape) == 2:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+            elif frame.shape[2] == 4:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
+            else:
+                # Assume BGR from remote stream reshape
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb.shape
+            qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
+            # Show on main view without requiring a local camera connection
+            self.update_frame_display(self.main_view_index, qimg)
+        except Exception as e:
+            self.logger.log(f"Error displaying remote frame: {e}", "ERROR")
 
     def set_main_view(self, index):
         if 0 <= index < 4: 
@@ -2054,10 +2292,12 @@ class CameraController(QObject):
                     success = self.camera_threads[index].start_recording(
                         output_dir=output_dir, filename=fname, codec="H264",
                         record_audio=self.camera_configs[index].get("record_audio", False),
-                        audio_device_index=self.camera_configs[index].get("audio_device", -1)
+                        audio_device_index=self.camera_configs[index].get("audio_device", -1),
+                        record_with_overlays=self.settings.get_value("record_with_overlays", "true") == "true",
                     )
                     if success:
                         self.is_recording[index] = True
+                        self.update_visibility()
                         self._append_video_segment_metadata({
                             "path": os.path.join(output_dir, fname), 
                             "start_epoch": time.time(), 
@@ -2065,11 +2305,8 @@ class CameraController(QObject):
                         })
             elif not checked and self.is_recording[index]:
                 self.logger.log(f"Recording disabled for Camera {index+1} during run, stopping...")
-                path = getattr(self.camera_threads[index], "output_file", "")
-                start_time = getattr(self.camera_threads[index], "recording_start_time", None)
                 self.camera_threads[index].stop_recording()
                 self.is_recording[index] = False
-                self._finalize_video_segment_metadata(path, time.time(), start_time)
 
     @pyqtSlot(int, bool)
     def _handle_motion_enabled_changed(self, index, state):
@@ -2090,20 +2327,26 @@ class CameraController(QObject):
 
     @pyqtSlot(int, bool)
     def _update_motion_indicator(self, index, detected):
+        if index < 0 or index >= 4:
+            return
         if index == self.main_view_index and self.motion_indicator:
             self.motion_indicator.setStyleSheet(f"background-color: {'red' if detected else 'green'}; border-radius: 5px;")
             
-        # Add to automation context for triggers
+        # Rising/falling edge per camera; global event is OR across all slots
+        prev = self._motion_states[index]
+        self._motion_states[index] = bool(detected)
         cam_event = f'motion_detected_cam{index+1}'
-        if detected:
-            self._add_automation_event('motion_detected')
+
+        if detected and not prev:
             self._add_automation_event(cam_event)
-        else:
-            # We don't remove it immediately to allow sequences to catch it, 
-            # but for motion we usually want edge detection.
-            # Actually, _add_automation_event handles the set/dict logic.
-            self._remove_automation_event('motion_detected')
+        elif not detected and prev:
             self._remove_automation_event(cam_event)
+
+        any_motion = any(self._motion_states)
+        if any_motion:
+            self._add_automation_event('motion_detected')
+        else:
+            self._remove_automation_event('motion_detected')
     
     def get_audio_devices(self):
         from app.core.direct_camera import DirectCameraThread

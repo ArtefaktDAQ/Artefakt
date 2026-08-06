@@ -1,6 +1,6 @@
 # AI Graph Analysis & Configuration Guide
 
-This guide describes the available graph types, styling options, and control functions available in the EvoLabs DAQ system.
+This guide describes the available graph types, styling options, and control functions available in the Artefakt DAQ system.
 
 ## AI Interaction Protocol
 1. **MANDATORY**: You MUST NOT ask the user to perform any actions (e.g., "Please select a sensor"). You have tools to do this yourself.

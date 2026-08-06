@@ -196,6 +196,7 @@ class AudioSensorConfigDialog(QDialog):
         self._setup_ui()
         self._load_settings()
         self._populate_devices()
+        self._restore_device_selection()
     
     def _setup_ui(self):
         """Setup the dialog UI"""
@@ -446,6 +447,14 @@ class AudioSensorConfigDialog(QDialog):
                     f"🎤 {device['name']}", 
                     device['id']
                 )
+        self._restore_device_selection()
+
+    def _restore_device_selection(self):
+        """Select combo item matching saved device_id."""
+        device_id = self.settings.get("device_id")
+        idx = self.device_combo.findData(device_id)
+        if idx >= 0:
+            self.device_combo.setCurrentIndex(idx)
     
     def _on_mode_changed(self):
         """Handle mode selection change"""
@@ -559,8 +568,9 @@ class AudioSensorConfigDialog(QDialog):
         self.band_high_spin.setValue(self.settings.get("band_high", 4000))
     
     def _collect_settings(self):
-        """Collect settings from UI"""
-        return {
+        """Collect settings from UI, preserving hidden fields (sample_rate, chunk_size, etc.)."""
+        settings = dict(self.settings)
+        settings.update({
             "mode": self.mode_combo.currentData(),
             "device_id": self.device_combo.currentData(),
             "output_rate": self.output_rate_spin.value(),
@@ -571,7 +581,8 @@ class AudioSensorConfigDialog(QDialog):
             "rpm_pulses_per_rev": self.rpm_ppr_spin.value(),
             "min_frequency_hz": self.rpm_min_freq_spin.value(),
             "auto_connect": self.auto_connect_cb.isChecked(),
-        }
+        })
+        return settings
     
     def _apply_settings(self):
         """Apply settings"""

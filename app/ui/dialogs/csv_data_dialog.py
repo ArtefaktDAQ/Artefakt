@@ -224,6 +224,39 @@ class AddEditCSVConfigDialog(QDialog):
         self.preview_timer.timeout.connect(self._update_preview)
         self.preview_timer.start(1000)
 
+    def closeEvent(self, event):
+        if hasattr(self, 'preview_timer') and self.preview_timer:
+            self.preview_timer.stop()
+        super().closeEvent(event)
+
+    def reject(self):
+        if hasattr(self, 'preview_timer') and self.preview_timer:
+            self.preview_timer.stop()
+        super().reject()
+
+    def _validate_config(self):
+        file_path = self.file_edit.text().strip()
+        if not file_path:
+            QMessageBox.warning(self, "Validation Error", "Please select a CSV file.")
+            return False
+        for mapping in self.config.get("mappings", []):
+            if not mapping.get("sensor_name", "").strip():
+                QMessageBox.warning(self, "Validation Error", "Each mapping must have a sensor name.")
+                return False
+            rule = mapping.get("extract_rule", "").strip()
+            if rule:
+                try:
+                    re.compile(rule)
+                except re.error as e:
+                    QMessageBox.warning(self, "Validation Error", f"Invalid extraction regex: {e}")
+                    return False
+        return True
+
+    def accept(self):
+        if not self._validate_config():
+            return
+        super().accept()
+
     def _update_preview(self):
         file_path = self.file_edit.text()
         if not file_path or not os.path.exists(file_path):
@@ -385,6 +418,16 @@ class AddEditCSVConfigDialog(QDialog):
         self._update_mappings_table()
 
     def get_config(self):
+        file_path = self.file_edit.text().strip()
+        if not file_path:
+            raise ValueError("Please select a CSV file.")
+        for mapping in self.config.get("mappings", []):
+            if not mapping.get("sensor_name", "").strip():
+                raise ValueError("Each mapping must have a sensor name.")
+            rule = mapping.get("extract_rule", "").strip()
+            if rule:
+                re.compile(rule)
+
         # Convert Hz to interval (seconds) for internal storage
         hz = self.poll_spin.value()
         interval = 1.0 / hz if hz > 0 else 1.0
@@ -396,7 +439,7 @@ class AddEditCSVConfigDialog(QDialog):
         dec_sep = "," if self.decimal_combo.currentIndex() == 1 else "."
 
         return {
-            "file": self.file_edit.text(),
+            "file": file_path,
             "poll": interval,
             "enabled": self.enabled_check.isChecked(),
             "mappings": self.config["mappings"],
@@ -459,6 +502,31 @@ class CSVDataDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def accept(self):
+        for i, cfg in enumerate(self.configs):
+            file_path = cfg.get("file", "").strip()
+            if not file_path:
+                QMessageBox.warning(self, "Validation Error", f"Configuration #{i + 1} is missing a CSV file path.")
+                return
+            for mapping in cfg.get("mappings", []):
+                if not mapping.get("sensor_name", "").strip():
+                    QMessageBox.warning(
+                        self, "Validation Error",
+                        f"Configuration #{i + 1} has a mapping without a sensor name."
+                    )
+                    return
+                rule = mapping.get("extract_rule", "").strip()
+                if rule:
+                    try:
+                        re.compile(rule)
+                    except re.error as e:
+                        QMessageBox.warning(
+                            self, "Validation Error",
+                            f"Configuration #{i + 1} has an invalid regex: {e}"
+                        )
+                        return
+        super().accept()
 
     def _update_table(self):
         self.table.setRowCount(0)

@@ -1,6 +1,6 @@
 # Remote DAQ (gRPC) Interface
 
-Remote DAQ allows distributed data acquisition by streaming live sensor data, video feeds, and audio between different EvoLabs DAQ instances over a network. It uses the high-performance gRPC protocol for efficient, bidirectional communication.
+Remote DAQ allows distributed data acquisition by streaming live sensor data, video feeds, and audio between different Artefakt DAQ instances over a network. It uses the high-performance gRPC protocol for efficient, bidirectional communication.
 
 ## Core Concepts
 

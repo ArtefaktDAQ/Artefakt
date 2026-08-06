@@ -5,6 +5,7 @@ import time
 import os
 import uuid
 import re
+import html
 from datetime import datetime
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTextEdit, 
                              QLineEdit, QPushButton, QTabWidget, QWidget, 
@@ -374,6 +375,7 @@ class AIChatDialog(QDialog):
             self.system_prompt = current_prompt
 
         self.messages = [{"role": "system", "content": self.system_prompt}]
+        self._worker_active = False
         
         self.setup_ui()
         self.load_latest_session_or_new()
@@ -555,8 +557,10 @@ class AIChatDialog(QDialog):
         control_layout = QVBoxLayout()
         self.allow_automation_cb = self._create_perm_cb("Allow Automation Control", "ai_allow_automation")
         self.allow_projects_cb = self._create_perm_cb("Allow Project Management", "ai_allow_projects")
+        self.allow_config_cb = self._create_perm_cb("Allow Config/Plugin Changes", "ai_allow_config")
         control_layout.addWidget(self.allow_automation_cb)
         control_layout.addWidget(self.allow_projects_cb)
+        control_layout.addWidget(self.allow_config_cb)
         control_box.setContentLayout(control_layout)
         tools_layout.addWidget(control_box)
         
@@ -785,7 +789,7 @@ class AIChatDialog(QDialog):
                 else:
                     text = content
                 
-                cursor.insertHtml(f"<div style='color: {COLORS.PRIMARY_LIGHT}; margin-bottom: 10px;'><b>You:</b> {text}</div>")
+                cursor.insertHtml(f"<div style='color: {COLORS.PRIMARY_LIGHT}; margin-bottom: 10px;'><b>You:</b> {html.escape(text)}</div>")
                 for img_url in images:
                     # Scale images for UI display
                     cursor.insertHtml(f"<br><img src='{img_url}' width='450'><br>")
@@ -821,25 +825,32 @@ class AIChatDialog(QDialog):
         else: self.send_message()
 
     def stop_query(self):
-        if hasattr(self, 'worker_thread') and self.worker_thread.isRunning():
-            self.status_label.setText("Stopping AI Assistant...")
-            
-            if hasattr(self, 'worker'):
-                # Disconnect signals to prevent UI updates after we've stopped
-                try:
-                    self.worker.finished.disconnect()
-                    self.worker.error.disconnect()
-                    self.worker.tool_call_started.disconnect()
-                    self.worker.tool_call_finished.disconnect()
-                except:
-                    pass
-                self.worker.cancel()
-            
-            self.worker_thread.quit()
-            # Wait with a timeout to prevent deadlocks
-            if not self.worker_thread.wait(500):
-                print("[AIChat] Worker thread did not stop gracefully, letting it finish in background.")
+        if not getattr(self, '_worker_active', False):
+            self.status_label.setText("")
+            self.set_ui_enabled(True)
+            return
+
+        self.status_label.setText("Stopping AI Assistant...")
         
+        if hasattr(self, 'worker') and self.worker:
+            try:
+                self.worker.finished.disconnect()
+                self.worker.error.disconnect()
+                self.worker.partial_response.disconnect()
+                self.worker.tool_call_started.disconnect()
+                self.worker.tool_call_finished.disconnect()
+            except Exception:
+                pass
+            self.worker.cancel()
+        
+        if hasattr(self, 'worker_thread') and self.worker_thread and self.worker_thread.isRunning():
+            self.worker_thread.quit()
+            if not self.worker_thread.wait(5000):
+                print("[AIChat] Worker thread did not stop gracefully, terminating.")
+                self.worker_thread.terminate()
+                self.worker_thread.wait(1000)
+        
+        self._worker_active = False
         self.status_label.setText("")
         self.set_ui_enabled(True)
 
@@ -891,7 +902,8 @@ class AIChatDialog(QDialog):
             "ai_allow_notes": self.allow_notes_cb.isChecked(),
             "ai_allow_automation": self.allow_automation_cb.isChecked(),
             "ai_allow_vision": self.allow_vision_cb.isChecked(),
-            "ai_allow_projects": self.allow_projects_cb.isChecked()
+            "ai_allow_projects": self.allow_projects_cb.isChecked(),
+            "ai_allow_config": self.allow_config_cb.isChecked()
         }
         for key, val in perm_map.items():
             self.main_window.settings.setValue(key, "true" if val else "false")
@@ -899,12 +911,15 @@ class AIChatDialog(QDialog):
         self.chat_history.append("<i>Settings saved.</i>")
 
     def send_message(self):
+        if getattr(self, '_worker_active', False):
+            return
+
         text = self.input_field.text().strip()
         if not text: return
         cursor = self.chat_history.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         if not self.chat_history.toPlainText().strip() == "": cursor.insertHtml("<hr>")
-        cursor.insertHtml(f"<div style='color: {COLORS.PRIMARY_LIGHT}; margin-bottom: 10px;'><b>You:</b> {text}</div><br>")
+        cursor.insertHtml(f"<div style='color: {COLORS.PRIMARY_LIGHT}; margin-bottom: 10px;'><b>You:</b> {html.escape(text)}</div><br>")
         
         content = text
         if self.attach_graph_cb.isChecked():
@@ -913,16 +928,16 @@ class AIChatDialog(QDialog):
             if "base64" in shot:
                 img_url = f"data:image/jpeg;base64,{shot['base64']}"
                 content = [{"type": "text", "text": f"[Attached: {source}] {text}"}, {"type": "image_url", "image_url": {"url": img_url}}]
-                cursor.insertHtml(f"<div style='color: {COLORS.SUCCESS}; font-size: 11px;'><i>[{source} Attached]</i></div>")
+                cursor.insertHtml(f"<div style='color: {COLORS.SUCCESS}; font-size: 11px;'><i>[{html.escape(source)} Attached]</i></div>")
                 cursor.insertHtml(f"<br><img src='{img_url}' width='450'><br>")
         
-        if self.messages and self.messages[-1]["role"] == "user": self.messages[-1]["content"] = content
-        else: self.messages.append({"role": "user", "content": content})
+        self.messages.append({"role": "user", "content": content})
         
         self.update_history_json()
         self.save_current_session_state()
         self.input_field.clear()
         self.attach_graph_cb.setChecked(False)
+        self._worker_active = True
         self.set_ui_enabled(False)
         self.status_label.setText("AI is thinking...")
         
@@ -967,6 +982,7 @@ class AIChatDialog(QDialog):
 
     @pyqtSlot(str)
     def on_llm_finished(self, text):
+        self._worker_active = False
         self.status_label.setText("")
         
         # Scrub <think>, <thinking>, <thought> tags
@@ -1000,10 +1016,11 @@ class AIChatDialog(QDialog):
 
     @pyqtSlot(str)
     def on_llm_error(self, err):
+        self._worker_active = False
         self.status_label.setText("")
         cursor = self.chat_history.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertHtml(f"<div style='color: {COLORS.ERROR}; margin-top: 10px;'><b>Error:</b> {err}</div><br>")
+        cursor.insertHtml(f"<div style='color: {COLORS.ERROR}; margin-top: 10px;'><b>Error:</b> {html.escape(err)}</div><br>")
         self.set_ui_enabled(True)
 
     @pyqtSlot(str)

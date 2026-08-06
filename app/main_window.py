@@ -439,7 +439,16 @@ class DAQApp(QMainWindow):
         self.blink_timer.timeout.connect(self.update_running_text)
 
     def connect_signals(self):
-        """Connect signals for UI elements to event handlers"""
+        """Connect signals for UI elements to event handlers (idempotent).
+
+        UI-01–04: nav / tab-change / apply-settings live only here (not in ui_setup).
+        Controller status_changed wiring lives only in connect_controller_signals().
+        Controller.connect_signals() is invoked from init_controllers() only.
+        """
+        if getattr(self, "_ui_signals_connected", False):
+            return
+        self._ui_signals_connected = True
+
         # Connect main buttons
         # NOTE: toggle_btn.clicked is already connected in ui_setup.py, don't duplicate!
         # self.toggle_btn.clicked.connect(self.on_toggle_clicked)
@@ -462,7 +471,7 @@ class DAQApp(QMainWindow):
             # Disconnect any existing connections first to avoid duplicates
             try:
                 self.browse_base_dir_btn.clicked.disconnect()
-            except:
+            except Exception:
                 pass
             # Connect to the correct method in project_controller
             self.browse_base_dir_btn.clicked.connect(self.project_controller.on_load_dir_clicked)
@@ -470,15 +479,17 @@ class DAQApp(QMainWindow):
 
         # Dashboard Header Action buttons
         if hasattr(self, 'dash_snapshot_btn'):
-            self.dash_snapshot_btn.clicked.connect(self.take_snapshot)
+            self.dash_snapshot_btn.clicked.connect(lambda _checked=False: self.take_snapshot())
         if hasattr(self, 'dash_note_btn'):
-            self.dash_note_btn.clicked.connect(self.add_quick_note)
+            self.dash_note_btn.clicked.connect(lambda _checked=False: self.add_quick_note())
         if hasattr(self, 'dash_settings_btn'):
             self.dash_settings_btn.clicked.connect(self.show_dashboard_settings)
             
         # Replay controls
         if hasattr(self, 'replay_play_btn'):
             self.replay_play_btn.clicked.connect(self.on_replay_play_toggle)
+        if hasattr(self, 'replay_live_monitor_btn'):
+            self.replay_live_monitor_btn.clicked.connect(self.on_replay_live_monitor_toggle)
         if hasattr(self, 'replay_step_back_btn'):
             self.replay_step_back_btn.clicked.connect(self.step_replay_backward)
         if hasattr(self, 'replay_step_forward_btn'):
@@ -508,46 +519,24 @@ class DAQApp(QMainWindow):
         if hasattr(self, 'snapshot_next_btn'):
             self.snapshot_next_btn.clicked.connect(self.next_snapshot)
         
-        # NOTE: The controller signals (data flow, graphs, metrics) are now connected 
-        # exclusively in connect_controller_signals() to avoid redundant updates.
-        
-        # Connect sensor controller signals
-        if hasattr(self, 'sensor_controller'):
-            # Connect status change signal
-            self.sensor_controller.status_changed.connect(self.update_status_indicators)
-            self.sensor_controller.connect_signals()
-            
-            # DO NOT connect buttons directly here - this creates conflicts
-            # Buttons are connected properly in setup_sensor_tab_signals() 
-            # These direct connections can cause conflicts
-            # Instead, setup_sensor_tab_signals connects the buttons to main window methods
-            # which then call the controller methods
-
+        # Camera one-shot UI hooks (status_changed is in connect_controller_signals)
         if hasattr(self, 'camera_controller'):
-            self.camera_controller.status_changed.connect(self.update_status_indicators)
-            self.camera_controller.status_changed.connect(self.refresh_dashboard_camera_sources) # Auto-refresh dashboard sources
             self.camera_controller.snapshot_taken.connect(self.on_snapshot_taken)
-            self.camera_controller.connect_signals()
             
-        if hasattr(self, 'automation_controller'):
-            self.automation_controller.status_changed.connect(self.update_status_indicators)
-            # Connect UI buttons to controller methods
-
-        
         # Connect dashboard camera sources
         self.refresh_dashboard_camera_sources()
         
         # Force initial hide of rows and labels
         self._update_row_visibilities()
         
-        # Connect navigation buttons
+        # UI-02: navigation buttons — single connection point (not in ui_setup)
         for i, btn in enumerate(self.nav_buttons):
             btn.clicked.connect(lambda checked, index=i: self.stacked_widget.setCurrentIndex(index))
         
-        # Connect tab change signal to handle tab-specific initialization
+        # UI-01: tab change — single connection point (not in ui_setup)
         self.stacked_widget.currentChanged.connect(self.on_tab_changed)
         
-        # Connect settings-related signals
+        # UI-03: apply settings — single connection point (not in ui_setup)
         self.apply_settings_btn.clicked.connect(self.apply_settings)
         
         # Connect project browser tree view
@@ -557,27 +546,12 @@ class DAQApp(QMainWindow):
         # Connect interface status signal to update device status display
         if hasattr(self, 'data_collection_controller'):
             self.data_collection_controller.interface_status_signal.connect(self.handle_interface_status)
-            # Connect data received signal to graph controller ONLY if live plotting is NOT active for the main graph
-            # Live plotting is handled separately by plot_new_data connected to combined_data_signal
-            # if hasattr(self, 'graph_controller'):
-            #      self.data_collection_controller.data_received_signal.connect(self.graph_controller.plot_new_data) # Use correct signal name
 
         # Connect graph live update checkbox
         if hasattr(self, 'graph_live_update_checkbox'):
             self.graph_live_update_checkbox.stateChanged.connect(self.handle_graph_live_update_toggle)
 
-        # Connect graph controls
-        if hasattr(self, 'graph_type_combo') and hasattr(self, 'graph_controller'):
-            self.graph_type_combo.currentIndexChanged.connect(self.graph_controller.on_graph_type_changed)
-            self.graph_primary_sensor.currentIndexChanged.connect(self.graph_controller.update_graph)
-            self.graph_secondary_sensor.currentIndexChanged.connect(self.graph_controller.update_graph)
-            self.graph_timespan.currentIndexChanged.connect(self.graph_controller.on_timespan_changed)
-            self.dashboard_timespan.currentIndexChanged.connect(self.graph_controller.on_dashboard_timespan_changed)
-            # Connect graph controller signals (including context menu setup)
-            self.graph_controller.connect_signals()
-            # Connect multi-sensor list changes to update the graph immediately
-            if hasattr(self, 'multi_sensor_list'):
-                self.multi_sensor_list.itemChanged.connect(self.graph_controller.update_graph)
+        # Graph controls are wired once in GraphController.connect_signals() (init_controllers)
         
         # Connect control run controls
         if hasattr(self, 'control_run_selector') and hasattr(self, 'control_run_controller'):
@@ -912,6 +886,7 @@ class DAQApp(QMainWindow):
                 
                 # Add to cards dictionary and rearrange
                 self.dashboard_metric_cards[sensor_key] = card
+                self._metrics_last_num_cols = None
                 self.rearrange_dashboard_metrics()
                 
             # Update card value
@@ -984,6 +959,7 @@ class DAQApp(QMainWindow):
             card.deleteLater()
             
         if keys_to_remove:
+            self._metrics_last_num_cols = None
             self.rearrange_dashboard_metrics()
                 
     def rearrange_dashboard_metrics(self):
@@ -994,26 +970,28 @@ class DAQApp(QMainWindow):
         if not self.dashboard_metric_cards:
             return
             
-        # Determine number of columns based on width
-        # The container width tells us how much space we have in the splitter
-        container_width = self.metrics_container.width()
-        
-        # Calculate number of columns based on width
-        # Each card is now fixed at 130px wide + 8px spacing = 138px
-        if container_width > 966:
-            num_cols = 7
-        elif container_width > 828:
-            num_cols = 6
-        elif container_width > 690:
-            num_cols = 5
-        elif container_width > 552:
-            num_cols = 4
-        elif container_width > 414:
-            num_cols = 3
-        elif container_width > 276:
-            num_cols = 2
+        # Prefer the scroll viewport width – that is the real usable space after
+        # GroupBox padding/borders. Falling back to the container is only for init.
+        if hasattr(self, 'metrics_scroll') and self.metrics_scroll.viewport().width() > 0:
+            available_width = self.metrics_scroll.viewport().width()
         else:
-            num_cols = 1
+            available_width = self.metrics_container.width()
+        
+        # Cards are fixed at 130px with 8px grid spacing.
+        # Small slack keeps 2-column layout a bit longer so GroupBox chrome does
+        # not force a premature drop to a single column.
+        CARD_WIDTH = 130
+        SPACING = 8
+        SLACK = 16
+        cell = CARD_WIDTH + SPACING
+        num_cols = max(1, (available_width + SPACING + SLACK) // cell)
+        num_cols = min(num_cols, len(self.dashboard_metric_cards), 7)
+        
+        # Skip work when nothing would change
+        if getattr(self, '_metrics_last_num_cols', None) == num_cols \
+                and self.metrics_grid.count() == len(self.dashboard_metric_cards):
+            return
+        self._metrics_last_num_cols = num_cols
         
         # Get sorted list of keys to maintain consistent order
         # We sort by the sensor name for a logical display
@@ -1905,16 +1883,26 @@ class DAQApp(QMainWindow):
 
             QTimer.singleShot(1500, perform_auto_connects)
 
-        # Load plot formatting settings
+        # Load plot formatting settings (block signals to avoid thrashing updates during startup)
         if hasattr(self, 'plot_style_preset'):
             style_preset = self.settings_model.get_value("plot_style_preset", "High Contrast")
             preset_items = ["Standard", "Solarized", "Dark", "High Contrast", "Pastel", "Colorful"]
             if style_preset in preset_items:
+                self.plot_style_preset.blockSignals(True)
                 self.plot_style_preset.setCurrentIndex(preset_items.index(style_preset))
+                self.plot_style_preset.blockSignals(False)
+
+        if hasattr(self, 'plot_font_size'):
+            font_size = self.settings_model.get_int("plot_font_size", 10)
+            self.plot_font_size.blockSignals(True)
+            self.plot_font_size.setValue(font_size)
+            self.plot_font_size.blockSignals(False)
 
         if hasattr(self, 'plot_line_width'):
             line_width = self.settings_model.get_int("plot_line_width", 2)
+            self.plot_line_width.blockSignals(True)
             self.plot_line_width.setValue(line_width)
+            self.plot_line_width.blockSignals(False)
             # Also update the cached value used by graph controller
             self.plot_line_width_value = line_width
 
@@ -2075,6 +2063,13 @@ class DAQApp(QMainWindow):
         """Handle window close event"""
         # Cleanup and shutdown operations
         self.logger.log("Application shutting down...")
+
+        if hasattr(self, '_tools_window') and self._tools_window:
+            self._tools_window.close()
+
+        if hasattr(self, '_ai_chat_dialog') and self._ai_chat_dialog:
+            self._ai_chat_dialog.stop_query()
+            self._ai_chat_dialog.close()
         
         # Save notes if the notes controller is available
         if hasattr(self, 'notes_controller'):
@@ -2132,6 +2127,17 @@ class DAQApp(QMainWindow):
         if hasattr(self, 'automation_controller'):
             self.automation_controller.stop_all_automation(is_exiting=True)
             self.logger.log("Automation controller shut down")
+
+        if hasattr(self, 'stream_controller') and self.stream_controller:
+            sc = self.stream_controller
+            if sc.is_master:
+                sc.stop_master_streaming()
+            elif sc.is_client:
+                stream_name = sc.current_stream_name
+                if not stream_name and sc.connected_streams:
+                    stream_name = next(iter(sc.connected_streams))
+                if stream_name:
+                    sc.disconnect_from_stream(stream_name)
 
         if hasattr(self, 'data_collection_controller'):
             self.data_collection_controller.shutdown()
@@ -2641,9 +2647,10 @@ class DAQApp(QMainWindow):
                         self.logger.error(f"Error retrieving control run data: {e}")
                     control_run_data = None
 
-        # Get specific parameters based on graph type
-        window_size = self.window_size_spinbox.value() if self.window_size_spinbox.isVisible() else None
-        histogram_bins = self.histogram_bins_spinbox.value() if self.histogram_bins_spinbox.isVisible() else None
+        # Get specific parameters based on graph type (use type, not isVisible —
+        # widgets can report not-visible briefly during layout / off-tab updates)
+        window_size = self.window_size_spinbox.value() if graph_type == "Moving Average" else None
+        histogram_bins = self.histogram_bins_spinbox.value() if graph_type == "Histogram" else None
         
         # Log the keys being sent
         if hasattr(self, 'logger'):
@@ -2754,8 +2761,8 @@ class DAQApp(QMainWindow):
                 # Update the snapshot scaling when its container label resizes
                 # (e.g. via splitter movement or window resize)
                 self._update_snapshot_display()
-            elif hasattr(self, 'metrics_container') and source == self.metrics_container:
-                # Update the metrics grid layout (1 or 2 columns) when its container resizes
+            elif hasattr(self, 'metrics_scroll') and source == self.metrics_scroll.viewport():
+                # Update the metrics grid layout when the usable viewport width changes
                 self.rearrange_dashboard_metrics()
         
         return super().eventFilter(source, event)
@@ -2868,9 +2875,8 @@ class DAQApp(QMainWindow):
         self.graph_controller = GraphController(self, self.sensor_controller, self.settings_model)
         self.graph_controller.connect_signals()
 
-        # Initialize Automation Controller
+        # Initialize Automation Controller (connect_signals runs in __init__)
         self.automation_controller = AutomationController(self, self.config)
-        self.automation_controller.connect_signals()
 
         # Initialize Export Controller
         self.export_controller = ExportController(self, self.settings_model)
@@ -2948,13 +2954,30 @@ class DAQApp(QMainWindow):
     
     @property
     def is_replay_mode(self):
-        """Return True if we are viewing a completed run (not currently acquiring data)"""
+        """True when a run is selected but acquisition is not running.
+
+        IMPORTANT — naming vs. intent:
+        This is NOT the same as ``replay_mode_enabled`` (CSV/video playback UI).
+        It is True in the common idle state after loading any run for review/configure.
+
+        Intended use of this flag in save paths:
+        - Sensors / automation sequences: while True, prefer the GLOBAL config
+          (template for the *next* run), and do not overwrite the historical
+          run's sensors.json / automation_sequences.json.
+        - Notes: intentionally NOT gated — scientific notes may be edited on a
+          loaded run during post-analysis and must save into that run folder.
+        - New-run snapshot: prepare_run_directory must bypass these guards
+          (force/target_dir) because current_run is set before ``running=True``.
+        """
         return (hasattr(self, 'project_controller') and 
                 self.project_controller.current_run is not None and 
                 not self.running)
 
     def connect_controller_signals(self):
-        """Connect controller-specific signals"""
+        """Connect controller-specific signals (idempotent via _controller_signals_connected).
+
+        UI-04: status_changed → update_status_indicators only here (not in connect_signals).
+        """
         # Connect data collection signals if available
         if hasattr(self, 'data_collection_controller'):
             # Connect data received signal to update sensor values
@@ -2971,8 +2994,7 @@ class DAQApp(QMainWindow):
                 try:
                     self.data_collection_controller.data_received_signal.disconnect(
                         self.graph_controller.plot_new_data)
-                except:
-                    # If it wasn't connected, just proceed
+                except Exception:
                     pass
                     
                 # Connect the combined data signal for synchronized graph updates
@@ -2984,22 +3006,19 @@ class DAQApp(QMainWindow):
                     self.sensor_controller.update_from_combined_data)
                 self.logger.log("Connected combined data signal to graph controller, dashboard metrics, and sensor controller", "INFO")
         
-        # Connect sensor controller signals
+        # UI-04: status indicators — single wiring point for all controllers
         if hasattr(self, 'sensor_controller'):
-            # Connect status change signal
             self.sensor_controller.status_changed.connect(self.update_status_indicators)
-            
-            # DO NOT connect buttons directly here - this creates conflicts
-            # Buttons are connected properly in setup_sensor_tab_signals() 
-            # These direct connections can cause conflicts
-            # Instead, setup_sensor_tab_signals connects the buttons to main window methods
-            # which then call the controller methods
 
-        # Connect automation controller signals
+        if hasattr(self, 'camera_controller'):
+            self.camera_controller.status_changed.connect(self.update_status_indicators)
+            self.camera_controller.status_changed.connect(self.refresh_dashboard_camera_sources)
+
         if hasattr(self, 'automation_controller'):
-            # Connect status change signal
             self.automation_controller.status_changed.connect(self.update_status_indicators)
-            # Connect UI buttons to controller methods
+
+        if hasattr(self, 'stream_controller') and self.stream_controller:
+            self.stream_controller.status_changed.connect(self.update_status_indicators)
 
 
     def handle_interface_status(self, interface_type, is_connected):
@@ -3670,6 +3689,7 @@ class DAQApp(QMainWindow):
             
         # Apply settings to camera controller if connected
         if hasattr(self, 'camera_controller'):
+            self.camera_controller.record_with_overlays = bool(record_with_overlays)
             # Trigger refresh of NDI if it changed
             if enable_ndi:
                 self.camera_controller.init_ndi()
@@ -5875,6 +5895,8 @@ class DAQApp(QMainWindow):
         # Prepare automation replay data for the dashboard status table
         self.automation_replay_active = True
         self.replay_mode_enabled = True
+        if hasattr(self, "replay_live_monitor_btn"):
+            self.replay_live_monitor_btn.setChecked(False)
         self._prepare_replay_automation_events()
 
         # Load snapshots for the run (after automation events prepped, in case we need start_ts)
@@ -6063,6 +6085,47 @@ class DAQApp(QMainWindow):
 
         # Activate the correct segment for the current replay time
         self._select_replay_segment_for_time(self.replay_current_time, force_load=True)
+
+    def on_replay_live_monitor_toggle(self):
+        """Switch between replay review and live hardware monitoring.
+
+        Replay mode (default after loading a run): graphs only accept replay-tagged
+        data so historical curves stay intact. Live Monitor clears replay_mode_enabled
+        so connected hardware can update graphs again without starting a new run.
+        Re-enter replay via Play (reloads the selected run's dataset).
+        """
+        want_live = True
+        if hasattr(self, "replay_live_monitor_btn"):
+            want_live = self.replay_live_monitor_btn.isChecked()
+
+        if want_live:
+            # Stop replay playback UI without clearing the selected run / notes context
+            self.replay_is_playing = False
+            if hasattr(self, "replay_timer"):
+                self.replay_timer.stop()
+            if hasattr(self, "replay_play_btn"):
+                self.replay_play_btn.setChecked(False)
+                self.replay_play_btn.setText("Play")
+            self.replay_mode_enabled = False
+            self.automation_replay_active = False
+            if hasattr(self, "graph_controller") and hasattr(self.graph_controller, "ensure_main_graph_live_update"):
+                try:
+                    self.graph_controller.ensure_main_graph_live_update()
+                    if getattr(self, "start_time", None):
+                        self.graph_controller.start_live_dashboard_update(self.start_time)
+                    else:
+                        import time as _time
+                        self.graph_controller.start_live_dashboard_update(_time.time())
+                except Exception as e:
+                    self.logger.log(f"Live monitor graph start failed: {e}", "WARN")
+            self.statusBar().showMessage("Live monitor: showing hardware data (replay paused)", 4000)
+            self.logger.log("Switched dashboard to Live Monitor (replay_mode_enabled=False)", "INFO")
+        else:
+            # Return to replay for the currently selected run
+            self.on_replay_load_clicked()
+            if hasattr(self, "replay_live_monitor_btn"):
+                self.replay_live_monitor_btn.setChecked(False)
+            self.statusBar().showMessage("Replay mode: historical run data", 4000)
 
     def on_replay_play_toggle(self):
         """Toggle play/pause for all synchronized replay slots."""
@@ -6932,6 +6995,24 @@ class DAQApp(QMainWindow):
         # Update the current index to show this snapshot and refresh display
         self.current_snapshot_index = self.snapshot_paths.index(path)
         self._update_snapshot_display()
+
+        if hasattr(self, 'notes_controller') and os.path.exists(path):
+            try:
+                if not getattr(self.notes_controller, 'document_loaded', False):
+                    self.notes_controller.load_note()
+
+                timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+                file_name = os.path.basename(path)
+                self.notes_controller.append_to_note(
+                    f'<br/><p><b>[{timestamp}] Snapshot:</b> {file_name}</p>'
+                )
+                self.notes_controller.insert_image_from_file(path)
+                self.notes_controller.append_to_note("<br/>")
+                self.notes_controller.trigger_autosave()
+                self.add_dashboard_event(f"Snapshot added to notes: {file_name}", "INFO")
+            except Exception as e:
+                if hasattr(self, 'logger'):
+                    self.logger.log(f"Error adding snapshot to notes: {e}", "ERROR")
             
         if hasattr(self, 'logger'):
             self.logger.log(f"Dashboard updated with snapshot: {os.path.basename(path)}", "DEBUG")

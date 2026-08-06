@@ -36,8 +36,9 @@ from app.ui.dialogs.optical_sensor_dialog import PreviewThread
 class OpticalSensorTool(QWidget):
     """Quick tester for webcam-based RPM detection."""
     
-    # Signal for thread-safe camera list updates
+    # Signals for thread-safe camera list updates
     cameras_scanned = pyqtSignal(list)
+    cameras_scan_finished = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -51,8 +52,9 @@ class OpticalSensorTool(QWidget):
 
         self._setup_ui()
         
-        # Connect signal for thread-safe updates
+        # Connect signals for thread-safe updates
         self.cameras_scanned.connect(self._do_update_camera_combo)
+        self.cameras_scan_finished.connect(self._on_cameras_scan_finished)
         
     def set_main_window(self, main_window):
         """Set reference to main window and trigger initial camera scan."""
@@ -241,10 +243,15 @@ class OpticalSensorTool(QWidget):
                 skip_indices = []
                 if self.main_window and hasattr(self.main_window, 'camera_controller'):
                     cc = self.main_window.camera_controller
-                    # Use is_connected attribute which is managed by CameraController
-                    is_main_connected = getattr(cc, 'is_connected', False)
-                    if is_main_connected and hasattr(cc, 'camera_thread') and cc.camera_thread:
-                        skip_indices.append(cc.camera_thread.camera_id)
+                    if hasattr(cc, 'get_in_use_local_camera_ids'):
+                        skip_indices.extend(cc.get_in_use_local_camera_ids())
+                    elif hasattr(cc, 'any_connected') and cc.any_connected():
+                        # Fallback for older controller shape
+                        for thread in getattr(cc, 'camera_threads', []) or []:
+                            if thread and not getattr(thread, 'is_ndi', False):
+                                cid = getattr(thread, 'camera_id', None)
+                                if isinstance(cid, int):
+                                    skip_indices.append(cid)
                 
                 available = OpticalSensorInterface.list_available_cameras(skip_indices=skip_indices)
                 self.cameras_scanned.emit(available)
@@ -252,9 +259,14 @@ class OpticalSensorTool(QWidget):
                 print(f"Error scanning cameras: {e}")
                 self.cameras_scanned.emit([])
             finally:
-                self._is_scanning = False
+                self.cameras_scan_finished.emit()
 
         Thread(target=scan_task, daemon=True).start()
+
+    @pyqtSlot()
+    def _on_cameras_scan_finished(self):
+        """Clear scan flag on the UI thread after worker completes."""
+        self._is_scanning = False
 
     @pyqtSlot(list)
     def _do_update_camera_combo(self, available):
@@ -318,8 +330,19 @@ class OpticalSensorTool(QWidget):
             QMessageBox.critical(self, "Preview Error", str(exc))
 
     def _stop_preview(self):
-        if self.preview_thread:
-            self.preview_thread.stop()
+        thread = self.preview_thread
+        if thread:
+            try:
+                thread.frame_ready.disconnect(self._on_frame)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                thread.error_occurred.disconnect(self._on_preview_error)
+            except (TypeError, RuntimeError):
+                pass
+            thread.stop()
+            if thread.isRunning():
+                thread.wait(3000)
             self.preview_thread = None
 
         self.preview_running = False
@@ -357,12 +380,12 @@ class OpticalSensorTool(QWidget):
             bytes_per_line = 3 * width
             rgb_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
             q_img = QImage(
-                rgb_frame.data,
+                rgb_frame.copy().data,
                 width,
                 height,
                 bytes_per_line,
                 QImage.Format.Format_RGB888,
-            )
+            ).copy()
             pixmap = QPixmap.fromImage(q_img).scaled(
                 self.preview_label.size(),
                 Qt.AspectRatioMode.KeepAspectRatio,

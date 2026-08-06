@@ -9,6 +9,7 @@ from PyQt6.QtGui import QColor
 from PyQt6.QtCore import Qt
 from app.models.sensor_model import SensorModel
 from app.utils.common_types import StatusState
+from app.utils.directory_setup import get_app_config_dir
 from app.models.settings_model import SettingsModel
 from app.ui.theme import COLORS
 
@@ -1897,7 +1898,8 @@ class SensorController(QObject):
             if hasattr(self.main_window, 'update_status_indicators'):
                 self.main_window.update_status_indicators()
             
-            # If it's a virtual/plugin sensor, remove from main_window.other_sensors too
+            # Remove matching unified/virtual sensor configs as well. These configs
+            # can recreate rows on startup even after sensors.json was updated.
             if hasattr(self.main_window, 'other_sensors'):
                 # Identify if this was a plugin sensor or OtherSerial
                 is_plugin = False
@@ -1907,25 +1909,49 @@ class SensorController(QObject):
                 if interface_type == 'OtherSerial':
                     is_plugin = True
                 else:
-                    # Check in registry
+                    # Check in registry. Filesystem plugins are imported as
+                    # "love_controls_16b" (not "plugins.love_controls_16b"), so
+                    # detect them the same way as auto-connect / UI setup.
                     iface_class = InterfaceRegistry.get_interface_class(interface_type)
                     if iface_class:
                         module_name = getattr(iface_class, "__module__", "")
-                        if "plugins." in module_name:
+                        if not module_name.startswith("app.core.interfaces"):
                             is_plugin = True
-                
-                if is_plugin:
-                    original_len = len(self.main_window.other_sensors)
-                    self.main_window.other_sensors = [
-                        vs for vs in self.main_window.other_sensors 
-                        if not ((isinstance(vs, dict) and vs.get('name') == removed_sensor.name) or 
-                                (hasattr(vs, 'name') and vs.name == removed_sensor.name))
-                    ]
-                    
-                    if len(self.main_window.other_sensors) != original_len:
-                        print(f"DEBUG: Removed '{removed_sensor.name}' from main_window.other_sensors")
-                        if hasattr(self.main_window, 'save_virtual_sensors'):
-                            self.main_window.save_virtual_sensors()
+
+                def _sensor_config_matches_removed(config):
+                    if isinstance(config, dict):
+                        config_name = config.get('name')
+                        config_type = config.get('type') or config.get('interface_type')
+                    else:
+                        config_name = getattr(config, 'name', None)
+                        config_type = getattr(config, 'type', None) or getattr(config, 'interface_type', None)
+
+                    if config_name != removed_sensor.name:
+                        return False
+
+                    removed_type = getattr(removed_sensor, 'interface_type', None)
+                    if not config_type or not removed_type:
+                        return True
+
+                    type_aliases = {
+                        "AudioSensor": {"AudioSensor", "Audio"},
+                        "OpticalSensor": {"OpticalSensor", "Optical"},
+                        "OtherSerial": {"OtherSerial", "Serial"},
+                        "Serial": {"Serial", "OtherSerial"},
+                    }
+                    valid_types = type_aliases.get(removed_type, {removed_type})
+                    return config_type in valid_types
+
+                original_len = len(self.main_window.other_sensors)
+                self.main_window.other_sensors = [
+                    vs for vs in self.main_window.other_sensors
+                    if not _sensor_config_matches_removed(vs)
+                ]
+
+                if len(self.main_window.other_sensors) != original_len:
+                    print(f"DEBUG: Removed '{removed_sensor.name}' from main_window.other_sensors")
+                    if hasattr(self.main_window, 'save_virtual_sensors'):
+                        self.main_window.save_virtual_sensors()
                 
                 # If no more sensors for this plugin interface, disconnect it
                 if is_plugin and interface_type != 'OtherSerial':
@@ -2004,11 +2030,10 @@ class SensorController(QObject):
                             else:
                                 self.main_window.logger.log(f"No sensors file found in run directory", "INFO")
             
-            # If no run directory available/exists or no sensors file found there, fall back to default location
-            # EXCEPT when we are explicitly loading a past run (is_startup_load=False and we have a run dir)
-            # CHANGE: We now allow fallback to default config even if a run dir exists, provided that 
-            # run dir doesn't have its own sensors.json. This ensures global sensors (LabJack, etc.) 
-            # are not lost on startup.
+            # If no run directory available/exists or no sensors file found there, fall back to default location.
+            # INTENTIONAL: when loading a past run that has no sensors.json (legacy runs), fall back to the
+            # global config so the user still has a working sensor template to tweak for the next run.
+            # When sensors.json EXISTS in the run, it is loaded above and we return early.
             if not is_startup_load and run_dir:
                 sensors_file = os.path.join(run_dir, "sensors.json")
                 if not os.path.exists(sensors_file):
@@ -2017,9 +2042,7 @@ class SensorController(QObject):
                     # If it exists, it should have been loaded above. If we are here, something else happened.
                     pass
 
-            config_dir = os.path.join(os.path.expanduser("~"), ".evolabs_daq")
-            if not os.path.exists(config_dir):
-                os.makedirs(config_dir)
+            config_dir = get_app_config_dir()
                 
             # Check for sensors file in the default config location
             sensors_file = os.path.join(config_dir, "sensors.json")
@@ -2172,50 +2195,64 @@ class SensorController(QObject):
             if debug_response == QMessageBox.StandardButton.Yes:
                 self.debug_show_sensor_data()
     
-    def save_sensors(self):
-        """Save current sensors"""
+    def save_sensors(self, target_dir=None):
+        """Save current sensors to JSON.
+
+        Workflow (do not "fix" without reading this):
+        - ``target_dir`` set: always write ``sensors.json`` there. Used when
+          snapshotting a NEW run from prepare_run_directory / save_sensors_to_run.
+        - Reviewing a loaded run (``is_replay_mode``): intentionally write to the
+          GLOBAL app config (~/.artefakt_daq), NOT the historical run folder.
+          Users load a comparable run, adjust sensors for the next experiment,
+          and those edits become the template for the next acquisition. The
+          loaded run's own sensors.json must stay immutable.
+        - Otherwise (acquiring / live with current_run and not in review idle):
+          write into the current run directory when it exists.
+        """
         import json
         import os
         
         try:
-            # First try to save to the current run directory if available
             run_dir = None
-            
-            # CHECK FOR REPLAY MODE: If we are just viewing an old run, don't save to its directory
-            is_replay = getattr(self.main_window, 'is_replay_mode', False)
-            
-            if not is_replay and hasattr(self.main_window, 'project_controller') and self.main_window.project_controller:
-                if (hasattr(self.main_window.project_controller, 'current_project') and 
-                    hasattr(self.main_window.project_controller, 'current_test_series') and
-                    hasattr(self.main_window.project_controller, 'current_run') and
-                    self.main_window.project_controller.current_project and
-                    self.main_window.project_controller.current_test_series and
-                    self.main_window.project_controller.current_run):
-                    
-                    # Get the base directory from project controller
-                    base_dir = self.main_window.project_base_dir.text()
-                    project_name = self.main_window.project_controller.current_project
-                    series_name = self.main_window.project_controller.current_test_series
-                    run_name = self.main_window.project_controller.current_run
-                    
-                    if base_dir and os.path.exists(base_dir):
-                        run_dir = os.path.join(base_dir, project_name, series_name, run_name)
-                        if os.path.exists(run_dir):
-                            self.main_window.logger.log(f"Saving sensors to current run directory: {run_dir}")
-            
-            # If no run directory available or exists, fall back to default location
-            if not run_dir or not os.path.exists(run_dir):
-                # Get the config directory
-                config_dir = os.path.join(os.path.expanduser("~"), ".evolabs_daq")
-                if not os.path.exists(config_dir):
-                    os.makedirs(config_dir)
-                
-                # Use the config directory as the save location
-                save_dir = config_dir
-                self.main_window.logger.log(f"Saving sensors to config directory: {save_dir}")
+            save_dir = None
+
+            # Explicit snapshot path (new run) — never redirect to global config.
+            if target_dir:
+                if not os.path.isdir(target_dir):
+                    self.main_window.logger.log(
+                        f"Cannot save sensors - target_dir missing: {target_dir}", "WARN"
+                    )
+                    return
+                save_dir = target_dir
+                self.main_window.logger.log(f"Saving sensors snapshot to run directory: {save_dir}")
             else:
-                # Use the run directory as the save location
-                save_dir = run_dir
+                # is_replay_mode: idle with a loaded run — save GLOBAL template only.
+                is_replay = getattr(self.main_window, 'is_replay_mode', False)
+                
+                if not is_replay and hasattr(self.main_window, 'project_controller') and self.main_window.project_controller:
+                    if (hasattr(self.main_window.project_controller, 'current_project') and 
+                        hasattr(self.main_window.project_controller, 'current_test_series') and
+                        hasattr(self.main_window.project_controller, 'current_run') and
+                        self.main_window.project_controller.current_project and
+                        self.main_window.project_controller.current_test_series and
+                        self.main_window.project_controller.current_run):
+                        
+                        base_dir = self.main_window.project_base_dir.text()
+                        project_name = self.main_window.project_controller.current_project
+                        series_name = self.main_window.project_controller.current_test_series
+                        run_name = self.main_window.project_controller.current_run
+                        
+                        if base_dir and os.path.exists(base_dir):
+                            run_dir = os.path.join(base_dir, project_name, series_name, run_name)
+                            if os.path.exists(run_dir):
+                                self.main_window.logger.log(f"Saving sensors to current run directory: {run_dir}")
+                
+                if not run_dir or not os.path.exists(run_dir):
+                    # Global template (also the intentional path while reviewing a run).
+                    save_dir = get_app_config_dir()
+                    self.main_window.logger.log(f"Saving sensors to config directory: {save_dir}")
+                else:
+                    save_dir = run_dir
                 
             # Get the sensors file path
             sensors_file = os.path.join(save_dir, "sensors.json")
@@ -2224,6 +2261,9 @@ class SensorController(QObject):
             sensors_data = []
             
             for sensor in self.sensors:
+                if getattr(sensor, 'is_remote', False):
+                    continue
+
                 # Sanitize LabJack sensors before saving to ensure they save correctly
                 if sensor.interface_type == "LabJack":
                     self._sanitize_labjack_sensor(sensor)
@@ -2253,7 +2293,7 @@ class SensorController(QObject):
             self.main_window.logger.log(f"Saved {len(self.sensors)} sensors to {sensors_file}")
             
             # Save a backup copy with timestamp (only for default location)
-            if save_dir == os.path.join(os.path.expanduser("~"), ".evolabs_daq"):
+            if save_dir == get_app_config_dir(create=False):
                 try:
                     import datetime
                     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2502,24 +2542,20 @@ class SensorController(QObject):
                     if sensor.port != sensor.name:
                         sensor_values[sensor.port] = sensor.current_value
         
-        # Skip if no sensor values
-        if not sensor_values:
-            return
-            
-        # Update the automation context with the sensor values
         try:
-            # Create context update with sensors dictionary
             context_update = {
-                'sensors': sensor_values
+                'sensors': sensor_values,
+                'optical_sensors': (
+                    self._optical_sensor_data.copy()
+                    if hasattr(self, '_optical_sensor_data') and self._optical_sensor_data
+                    else {}
+                ),
+                'audio_sensors': (
+                    self._audio_sensor_data.copy()
+                    if hasattr(self, '_audio_sensor_data') and self._audio_sensor_data
+                    else {}
+                ),
             }
-            
-            # Add optical sensor data for advanced triggers
-            if hasattr(self, '_optical_sensor_data') and self._optical_sensor_data:
-                context_update['optical_sensors'] = self._optical_sensor_data.copy()
-            
-            # Add audio sensor data for advanced triggers
-            if hasattr(self, '_audio_sensor_data') and self._audio_sensor_data:
-                context_update['audio_sensors'] = self._audio_sensor_data.copy()
             
             # Update the automation context
             self.main_window.automation_controller.update_context(context_update)
@@ -2685,7 +2721,7 @@ class SensorController(QObject):
                         # Arduino/LabJack/etc. are also corrected in DCC, but they use update_sensor_data
                         # which calls set_value() directly. However, update_from_combined_data (this method)
                         # is called via combined_data_signal and MUST not re-apply calibration.
-                        if itype in ('arduino', 'labjack', 'otherserial', 'serial', 'audio', 'audiosensor', 'optical', 'opticalsensor'):
+                        if itype in ('arduino', 'labjack', 'otherserial', 'serial', 'audio', 'audiosensor', 'optical', 'opticalsensor', 'remote_stream', 'remotestream'):
                             sensor.set_value(raw_value)
                         else:
                             sensor.set_value((raw_value * conversion_factor) + offset)
@@ -2734,6 +2770,8 @@ class SensorController(QObject):
             return f"audio_{sensor.name}"
         elif itype_lower == "optical" or itype_lower == "opticalsensor":
             return f"optical_{sensor.name}"
+        elif itype_lower == "remote_stream" or itype_lower == "remotestream":
+            return f"remote_stream_{sensor.name}"
         else:
             # For dynamic plugins and others
             # measurement_name is often stored in the 'mapping' field for plugins
@@ -4533,25 +4571,10 @@ class SensorController(QObject):
                     print(f"DEBUG SensorController: Error updating sensor {matched_sensor.name}: {e}")
                     matched_sensor.set_value(None)
             else:
-                print(f"DEBUG SensorController: No matching sensor found for key '{key}'")
-                if isinstance(data[key], (int, float)) or (isinstance(data[key], str) and data[key].replace('.', '', 1).isdigit()):
-                    print(f"DEBUG SensorController: Creating new sensor for key '{key}' with value {data[key]}")
-                    from app.models.sensor_model import SensorModel
-                    new_sensor = SensorModel()
-                    new_sensor.name = key
-                    new_sensor.interface_type = 'OtherSerial'
-                    new_sensor.unit = ""
-                    new_sensor.offset = 0.0
-                    new_sensor.conversion_factor = 1.0
-                    new_sensor.set_value(data[key])
-                    import random
-                    r, g, b = random.randint(50, 200), random.randint(50, 200), random.randint(50, 200)
-                    new_sensor.color = f"#{r:02x}{g:02x}{b:02x}"
-                    self.add_sensor_to_list(new_sensor)
-                    sensors_matched.append(new_sensor.name)
-                    updates_made += 1
-                    self.update_sensor_table()
-                    print(f"DEBUG SensorController: Created new sensor '{key}' with value {new_sensor.current_value}")
+                # Do NOT auto-create sensors from unmatched serial keys.
+                # Noise/unknown fields would otherwise pollute the sensor table and
+                # the global sensors.json template used for the next run.
+                print(f"DEBUG SensorController: No matching sensor found for key '{key}' (ignored, not auto-created)")
         print(f"DEBUG SensorController: update_other_serial_data matched sensors: {sensors_matched}, updated values for {updates_made} sensors.")
         if updates_made > 0:
             # self.update_sensor_values()
@@ -4744,10 +4767,8 @@ class SensorController(QObject):
             skip_indices = []
             if hasattr(self.main_window, 'camera_controller') and self.main_window.camera_controller:
                 cam_ctrl = self.main_window.camera_controller
-                if getattr(cam_ctrl, 'is_connected', False) and hasattr(cam_ctrl, 'camera_thread') and cam_ctrl.camera_thread:
-                    current_camera = getattr(cam_ctrl.camera_thread, 'camera_id', None)
-                    if current_camera is not None:
-                        skip_indices.append(current_camera)
+                if hasattr(cam_ctrl, 'get_in_use_local_camera_ids'):
+                    skip_indices.extend(cam_ctrl.get_in_use_local_camera_ids())
             
             # Get list of available cameras (not already in use as optical sensors)
             # Pass skip_indices to avoid probing active cameras
@@ -4800,21 +4821,25 @@ class SensorController(QObject):
             # Check if camera is used by camera controller
             if hasattr(self.main_window, 'camera_controller') and self.main_window.camera_controller:
                 cam_ctrl = self.main_window.camera_controller
-                if cam_ctrl.is_connected and hasattr(cam_ctrl, 'camera_thread') and cam_ctrl.camera_thread:
-                    current_camera = getattr(cam_ctrl.camera_thread, 'camera_id', None)
-                    if current_camera == camera_id:
-                        result = QMessageBox.warning(
-                            self.main_window,
-                            "Camera in Use",
-                            f"Camera {camera_id} is currently used for video.\n\n"
-                            "The camera will be disconnected from video mode if you proceed.\n\n"
-                            "Continue?",
-                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                        )
-                        if result != QMessageBox.StandardButton.Yes:
-                            return False
-                        # Disconnect from camera controller
-                        cam_ctrl.disconnect()
+                in_use = []
+                if hasattr(cam_ctrl, 'get_in_use_local_camera_ids'):
+                    in_use = cam_ctrl.get_in_use_local_camera_ids()
+                if camera_id in in_use:
+                    result = QMessageBox.warning(
+                        self.main_window,
+                        "Camera in Use",
+                        f"Camera {camera_id} is currently used for video.\n\n"
+                        "The camera will be disconnected from video mode if you proceed.\n\n"
+                        "Continue?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    if result != QMessageBox.StandardButton.Yes:
+                        return False
+                    # Disconnect the slot that owns this local camera ID
+                    for i, thread in enumerate(getattr(cam_ctrl, 'camera_threads', []) or []):
+                        if thread and getattr(thread, 'camera_id', None) == camera_id and not getattr(thread, 'is_ndi', False):
+                            cam_ctrl.disconnect_camera(i)
+                            break
             
             # Create the optical sensor interface
             interface = OpticalSensorInterface(
@@ -4907,8 +4932,13 @@ class SensorController(QObject):
             else:
                 interface = self.optical_sensor_interfaces[sensor.name]
             
+            interface.width = config.get("width", interface.width)
+            interface.height = config.get("height", interface.height)
+            interface.fps = config.get("fps", interface.fps)
+            
             # Connect
             if interface.connect():
+                interface.update_settings(config)
                 # Connect data signal with QueuedConnection for thread safety
                 if interface.sensor_thread:
                     interface.sensor_thread.data_ready.connect(

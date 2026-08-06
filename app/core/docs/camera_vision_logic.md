@@ -1,6 +1,6 @@
 # AI Camera & Vision System Manual
 
-This document explains how the AI Assistant can manage cameras, video recordings, and overlays in the EvoLabs DAQ system.
+This document explains how the AI Assistant can manage cameras, video recordings, and overlays in the Artefakt DAQ system.
 
 ## Camera Management
 

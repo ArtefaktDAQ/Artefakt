@@ -308,9 +308,8 @@ class ToolsWindow(QWidget):
         if not self.help_visible:
             self._toggle_help()
     
-    def closeEvent(self, event):
-        """Handle window close"""
-        # Stop any live analysis
+    def pause_tools(self):
+        """Stop live timers, previews, and capture streams without destroying window state."""
         if hasattr(self.fft_analyzer, 'stop'):
             self.fft_analyzer.stop()
         if hasattr(self.sensor_calibration, 'stop'):
@@ -323,7 +322,15 @@ class ToolsWindow(QWidget):
             self.calculator_tool.stop()
         if hasattr(self.optical_sensor_tool, 'stop'):
             self.optical_sensor_tool.stop()
-        
+
+    def hideEvent(self, event):
+        """Pause active tools when the window is hidden."""
+        self.pause_tools()
+        super().hideEvent(event)
+
+    def closeEvent(self, event):
+        """Handle window close"""
+        self.pause_tools()
         self.closed.emit()
         event.accept()
     

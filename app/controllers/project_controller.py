@@ -248,16 +248,109 @@ class ProjectController(QObject):
         except:
             return str(seconds)
 
-    def _count_sensors(self, run_dir):
-        """Count active sensors from sensors.json in run directory"""
+    def _read_virtual_sensor_configs(self, run_dir):
+        """Read run-specific virtual sensor configuration."""
+        virtual_sensors_file = os.path.join(run_dir, "virtual_sensors.json")
+        if not os.path.exists(virtual_sensors_file):
+            return {}, []
+        
+        try:
+            with open(virtual_sensors_file, 'r', encoding='utf-8') as f:
+                data = json.load(f) or {}
+            sensors = data.get("sensors", []) or []
+            csv_configs = data.get("csv_configs", []) or []
+            return data, sensors + self._sensor_snapshots_from_csv_configs(csv_configs)
+        except Exception as e:
+            self.main_window.logger.log(f"Error reading virtual sensor configuration: {str(e)}", "WARN")
+            return {}, []
+
+    def _sensor_snapshots_from_csv_configs(self, csv_configs):
+        """Create sensor snapshots for CSV mappings stored in virtual_sensors.json."""
+        snapshots = []
+        for cfg in csv_configs or []:
+            for mapping in cfg.get("mappings", []) or []:
+                sensor_name = mapping.get("sensor_name")
+                if not sensor_name:
+                    continue
+                snapshots.append({
+                    "name": sensor_name,
+                    "interface_type": "Read CSV",
+                    "type": "Read CSV",
+                    "port": cfg.get("file", ""),
+                    "unit": mapping.get("unit", ""),
+                    "mapping": mapping.get("column", ""),
+                    "enabled": cfg.get("enabled", True),
+                    "show_in_graph": True,
+                    "auto_connect": False,
+                    "csv_config": cfg,
+                    "csv_mapping": mapping
+                })
+        return snapshots
+
+    def _normalize_sensor_snapshot(self, config):
+        """Convert a unified virtual sensor config into sensors.json schema."""
+        sensor = dict(config)
+        interface_type = sensor.get("interface_type") or sensor.get("type") or ""
+        sensor["interface_type"] = interface_type
+        sensor.setdefault("type", interface_type)
+        sensor.setdefault("name", "")
+        sensor.setdefault("port", "")
+        sensor.setdefault("unit", "")
+        sensor.setdefault("offset", 0.0)
+        sensor.setdefault("conversion_factor", 1.0)
+        sensor.setdefault("color", "#FFFFFF")
+        sensor.setdefault("enabled", True)
+        sensor.setdefault("show_in_graph", True)
+        sensor.setdefault("auto_connect", False)
+        sensor.setdefault("averaging_enabled", False)
+        sensor.setdefault("use_secondary_axis", False)
+        if "measurement" in sensor and "mapping" not in sensor:
+            sensor["mapping"] = sensor.get("measurement")
+        return sensor
+
+    def _ensure_run_sensor_snapshot_for_export(self, run_dir):
+        """Ensure exported runs include sensors.json for replay/import compatibility."""
         sensors_file = os.path.join(run_dir, "sensors.json")
         if os.path.exists(sensors_file):
             try:
-                with open(sensors_file, 'r') as f:
+                with open(sensors_file, 'r', encoding='utf-8') as f:
+                    existing_sensors = json.load(f) or []
+                if existing_sensors:
+                    return
+            except Exception:
+                pass
+
+        _, virtual_sensors = self._read_virtual_sensor_configs(run_dir)
+        if not virtual_sensors:
+            return
+
+        try:
+            snapshots = [self._normalize_sensor_snapshot(sensor) for sensor in virtual_sensors]
+            with open(sensors_file, 'w', encoding='utf-8') as f:
+                json.dump(snapshots, f, indent=2)
+            self.main_window.logger.log(
+                f"Created sensors.json export snapshot with {len(snapshots)} sensors: {sensors_file}",
+                "INFO"
+            )
+        except Exception as e:
+            self.main_window.logger.log(f"Error creating sensors export snapshot: {str(e)}", "WARN")
+
+    def _count_sensors(self, run_dir):
+        """Count active sensors from run-specific sensor configuration."""
+        sensors_file = os.path.join(run_dir, "sensors.json")
+        if os.path.exists(sensors_file):
+            try:
+                with open(sensors_file, 'r', encoding='utf-8') as f:
                     sensors = json.load(f)
-                    return len(sensors)
+                    if sensors:
+                        return len(sensors)
             except:
                 pass
+        
+        _, virtual_sensors = self._read_virtual_sensor_configs(run_dir)
+        if virtual_sensors:
+            return len(virtual_sensors)
+        
         return 0
 
     def _has_video(self, metadata, run_dir):
@@ -845,7 +938,7 @@ class ProjectController(QObject):
         self.last_selected_series = None
         self.last_selected_run = None
         
-        # If the deleted run was loaded, clear current run references
+        # If the deleted run was loaded, clear current run references and review UI
         if (self.current_project == project_name and
             self.current_test_series == series_name and
             self.current_run == run_name):
@@ -855,6 +948,29 @@ class ProjectController(QObject):
                 self.main_window.run_description.clear()
             if hasattr(self.main_window, "run_testers"):
                 self.main_window.run_testers.clear()
+
+            # Drop replay/review state so graphs/video are not left on deleted data
+            if hasattr(self.main_window, "_init_replay_ui"):
+                self.main_window._init_replay_ui()
+
+            if hasattr(self.main_window, "notes_controller") and self.main_window.notes_controller:
+                nc = self.main_window.notes_controller
+                nc.document_loaded = False
+                nc.template_populated = False
+                if hasattr(nc, "notes_editor") and nc.notes_editor:
+                    nc.notes_editor.clear()
+                    try:
+                        from PyQt6.QtCore import QUrl
+                        nc.notes_editor.document().setBaseUrl(QUrl())
+                    except Exception:
+                        pass
+
+            if hasattr(self.main_window, "graph_controller") and self.main_window.graph_controller:
+                self.main_window.graph_controller.clear_graphs()
+
+            # Reload global sensor template (not the deleted run's sensors.json)
+            if hasattr(self.main_window, "sensor_controller") and self.main_window.sensor_controller:
+                self.main_window.sensor_controller.load_sensors(is_startup_load=True)
         
         self.update_project_tree()
         self.status_changed.emit()
@@ -1195,9 +1311,21 @@ class ProjectController(QObject):
                 self.main_window.logger.log("Selection is not a run. Please select a run.", "WARN")
                 self.update_status_text("Error: Selected item is not a run", "red")
                 return
+
+        for name in (project_name, series_name, run_name):
+            if not name or not str(name).strip() or '..' in str(name) or '/' in str(name) or '\\' in str(name):
+                self.main_window.logger.log("Invalid project/series/run name (path traversal rejected).", "ERROR")
+                self.update_status_text("Error: Invalid run name", "red")
+                return
             
         # Build run directory path
         run_dir = os.path.join(base_dir, project_name, series_name, run_name)
+        base_abs = os.path.normpath(os.path.abspath(base_dir))
+        run_abs = os.path.normpath(os.path.abspath(run_dir))
+        if run_abs != base_abs and not run_abs.startswith(base_abs + os.sep):
+            self.main_window.logger.log("Run path escapes project base directory.", "ERROR")
+            self.update_status_text("Error: Invalid run path", "red")
+            return
         if not os.path.exists(run_dir):
             self.main_window.logger.log(f"Run directory does not exist: {run_dir}", "ERROR")
             self.update_status_text("Error: Run directory not found", "red")
@@ -1416,12 +1544,10 @@ class ProjectController(QObject):
     
     def save_project(self):
         """Save the current project and test series details"""
-        # If in replay mode, don't overwrite metadata in the run/project folders.
-        # This keeps the history of that specific experiment secure.
+        # While reviewing a loaded run (is_replay_mode), skip writing project/series
+        # metadata so browse-time edits do not rewrite the project hierarchy.
+        # New-run creation writes metadata directly in prepare_run_directory().
         if getattr(self.main_window, 'is_replay_mode', False):
-            # We don't save project/series metadata here, but we could still 
-            # save the "last used" state to the global config if we wanted.
-            # For now, let's just return to satisfy the "impossible to change" requirement.
             return
 
         # Set flag to prevent recursion
@@ -1718,14 +1844,19 @@ class ProjectController(QObject):
             
         return (StatusState.READY, tooltip)
     
-    def save_state_to_json(self):
+    def save_state_to_json(self, force=False):
         """
         Save the current project, test series, and run details to a JSON file
         in the project directory for future retrieval.
+
+        Args:
+            force: If True, write even when is_replay_mode is set. Required from
+                prepare_run_directory(): that path sets current_run before
+                running=True, so is_replay_mode would otherwise skip the snapshot.
         """
-        # If in replay mode, don't overwrite the project_state.json in the project folder
-        # to keep the existing project hierarchy secure.
-        if getattr(self.main_window, 'is_replay_mode', False):
+        # Skip while reviewing a historical run so idle browse does not rewrite
+        # project_state.json. Forced writes are for creating a NEW run only.
+        if not force and getattr(self.main_window, 'is_replay_mode', False):
             return
 
         if not self.current_project:
@@ -2020,10 +2151,12 @@ class ProjectController(QObject):
         self.main_window.sidebar_project_name.setText(project_name)
         self.main_window.sidebar_test_series.setText(series_name)
         
-        # Save project state to JSON
-        self.save_state_to_json()
+        # Snapshot project_state for the NEW run. force=True is required because
+        # current_run is already set while running is still False (looks like replay).
+        self.save_state_to_json(force=True)
         
-        # Save current sensor configuration to the run directory
+        # Snapshot current sensor configuration into the new run directory
+        # (bypasses the global-config-while-reviewing save path).
         self.save_sensors_to_run(run_dir)
         
         # Save current CSV and virtual sensor configuration to the run directory
@@ -2140,20 +2273,20 @@ class ProjectController(QObject):
     
     def save_sensors_to_run(self, run_dir):
         """
-        Save current sensor configuration to the run directory
-        
-        Args:
-            run_dir: Path to the run directory
+        Snapshot the current sensor configuration into a specific run directory.
+
+        Always writes to ``run_dir/sensors.json`` (via target_dir), including when
+        is_replay_mode is True. That matters at new-run start: prepare_run_directory
+        sets current_run before acquisition starts, so the normal save_sensors()
+        path would otherwise write only to the global config template.
         """
         if not run_dir or not os.path.exists(run_dir):
             self.main_window.logger.log("Cannot save sensors - invalid run directory", "WARN")
             return
             
-        # Call the sensor controller's save_sensors method
-        # The updated method will detect the current run and save to that location
         if hasattr(self.main_window, 'sensor_controller'):
             self.main_window.logger.log(f"Saving sensor configuration to run directory: {run_dir}")
-            self.main_window.sensor_controller.save_sensors()
+            self.main_window.sensor_controller.save_sensors(target_dir=run_dir)
         else:
             self.main_window.logger.log("Cannot save sensors - sensor controller not available", "WARN")
             
@@ -2487,6 +2620,12 @@ class ProjectController(QObject):
             control_run_config_found = False
             control_run_data_found = False
             
+            # Ensure every exported run has a sensors.json snapshot. Some sensor
+            # types are stored in virtual_sensors.json during acquisition.
+            for root, dirs, files in os.walk(source_dir):
+                if "run_metadata.json" in files or "virtual_sensors.json" in files:
+                    self._ensure_run_sensor_snapshot_for_export(root)
+            
             # Now add all files from the source directory
             for root, dirs, files in os.walk(source_dir):
                 # Ensure this directory's structure is preserved
@@ -2639,8 +2778,13 @@ class ProjectController(QObject):
                 
                 # Identify project folders (they should be top-level directories or containing project_metadata.json)
                 project_folders = set()
+                imported_runs = set()
                 for file_path in file_list:
-                    parts = file_path.strip('/').split('/')
+                    normalized_path = file_path.replace("\\", "/").strip("/")
+                    if not normalized_path:
+                        continue
+
+                    parts = normalized_path.split("/")
                     if len(parts) >= 1:
                         # If we see project_metadata.json, the parent is definitely a project folder
                         if "project_metadata.json" in parts:
@@ -2654,6 +2798,9 @@ class ProjectController(QObject):
                         else:
                             # Otherwise assume the first part is the project name
                             project_folders.add(parts[0])
+
+                        if len(parts) >= 4 and parts[-1] == "run_metadata.json":
+                            imported_runs.add((parts[-4], parts[-3], parts[-2]))
 
                 if not project_folders:
                     QMessageBox.warning(
@@ -2702,16 +2849,25 @@ class ProjectController(QObject):
                 progress.close()
 
                 if not progress.wasCanceled():
+                    # Refresh immediately so the imported project is visible without restarting.
+                    self.update_project_selector()
+                    self.update_project_tree(expand_all=True)
+
+                    if imported_runs:
+                        project_name, series_name, run_name = sorted(imported_runs)[0]
+                        self.select_tree_item(project_name, series_name, run_name)
+                    elif project_folders:
+                        self.select_tree_item(sorted(project_folders)[0])
+
+                    QApplication.processEvents()
+
                     self.main_window.logger.log(f"Successfully imported project data from {zip_path}", "INFO")
                     QMessageBox.information(
                         self.main_window,
                         "Import Successful",
-                        f"Successfully imported {len(project_folders)} project(s) to:\n{base_dir}"
+                        f"Successfully imported {len(project_folders)} project(s) to:\n{base_dir}\n\n"
+                        "The Project Browser has been refreshed."
                     )
-                    
-                    # Refresh the project tree and selector
-                    self.update_project_list()
-                    self.update_project_tree()
                     
         except Exception as e:
             QMessageBox.critical(

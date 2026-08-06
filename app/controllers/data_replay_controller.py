@@ -46,23 +46,25 @@ class DataReplayController(QObject):
             run_dir: optional explicit run directory. If None, uses the
                      current run from ProjectController (if available).
         """
-        # If no explicit run_dir, try the current run. If missing, fall back to newest.
+        # If no explicit run_dir, use the current run only — do not silently load
+        # the newest run (that mutates project selection without user intent).
         if not run_dir and self.main_window and hasattr(self.main_window, "project_controller"):
             project_controller = self.main_window.project_controller
             run_dir = project_controller.get_current_run_directory()
             if not run_dir:
-                # Attempt to load the newest run and retry
-                project_controller.load_newest_run()
-                run_dir = project_controller.get_current_run_directory()
-                # As a final fallback, scan the series directory for the newest run
-                if not run_dir and project_controller.current_project and project_controller.current_test_series:
-                    base_dir = self.main_window.project_base_dir.text() if hasattr(self.main_window, "project_base_dir") else ""
-                    series_dir = os.path.join(base_dir, project_controller.current_project, project_controller.current_test_series)
-                    if os.path.isdir(series_dir):
-                        run_dirs = [os.path.join(series_dir, d) for d in os.listdir(series_dir) if os.path.isdir(os.path.join(series_dir, d))]
-                        run_dirs = [d for d in run_dirs if os.path.basename(d).lower().startswith("run_")]
-                        if run_dirs:
-                            run_dir = max(run_dirs, key=os.path.getmtime)
+                self._log(
+                    "Replay load failed - no run selected. Select a run in the project tree first.",
+                    "WARN",
+                )
+                if hasattr(self.main_window, "statusBar"):
+                    try:
+                        self.main_window.statusBar().showMessage(
+                            "Select a run before starting replay.", 5000
+                        )
+                    except Exception:
+                        pass
+                self._reset()
+                return False
 
         if not run_dir or not os.path.isdir(run_dir):
             self._log(f"Replay load failed - invalid run dir: {run_dir}", "ERROR")

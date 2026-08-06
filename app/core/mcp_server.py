@@ -48,11 +48,8 @@ class MCPServer(QObject):
         "get_live_interface_data",
         "check_server_status",
         "list_serial_ports",
-        "export_run",
-        "list_camera_sources",
-        "save_plugin_code",
-        "list_plugins",
-        "read_plugin_code"
+        "get_serial_sequence",
+        "list_serial_sequences",
     ]
 
     def __init__(self, main_window):
@@ -73,6 +70,52 @@ class MCPServer(QObject):
             val = self.main_window.settings.value(setting_key, "true")
             return str(val).lower() == "true"
         return True
+
+    def _app_root(self):
+        import sys
+        if getattr(sys, 'frozen', False):
+            return os.path.dirname(sys.executable)
+        return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+
+    def _validate_path_component(self, name: str, label: str) -> Optional[str]:
+        """Reject empty names and path traversal in project path components."""
+        if not name or not str(name).strip():
+            return f"{label} must not be empty."
+        if '..' in name or '/' in name or '\\' in name:
+            return f"Invalid {label}: path separators and '..' are not allowed."
+        return None
+
+    def _get_allowed_path_roots(self) -> List[str]:
+        """Return normalized absolute roots permitted for file-path MCP tools."""
+        roots = []
+        if hasattr(self.main_window, 'project_base_dir'):
+            base = self.main_window.project_base_dir.text().strip()
+            if base:
+                roots.append(os.path.normpath(os.path.realpath(os.path.abspath(base))))
+        app_root = os.path.normpath(os.path.realpath(self._app_root()))
+        roots.append(app_root)
+        plugins_dir = os.path.join(app_root, "plugins")
+        if os.path.isdir(plugins_dir):
+            roots.append(os.path.normpath(os.path.realpath(plugins_dir)))
+        if hasattr(self.main_window, 'project_controller'):
+            run_dir = self.main_window.project_controller.get_current_run_directory()
+            if run_dir:
+                roots.append(os.path.normpath(os.path.realpath(os.path.abspath(run_dir))))
+        return roots
+
+    def _is_path_allowed(self, file_path: str) -> bool:
+        """Return True if file_path resolves under an allowed application directory."""
+        if not file_path or not str(file_path).strip():
+            return False
+        try:
+            resolved = os.path.normpath(os.path.realpath(os.path.abspath(file_path)))
+        except (OSError, ValueError):
+            return False
+        for root in self._get_allowed_path_roots():
+            root_prefix = root if root.endswith(os.sep) else root + os.sep
+            if resolved == root or resolved.startswith(root_prefix):
+                return True
+        return False
 
     @pyqtSlot(object)
     def _get_device_names_internal(self, names_dict: dict):
@@ -291,6 +334,9 @@ class MCPServer(QObject):
         Update application settings.
         - settings: dictionary of key-value pairs to update in SettingsManager.
         """
+        if not self._check_permission("ai_allow_config"):
+            return {"error": "Configuration changes are disabled by the user."}
+
         if not hasattr(self.main_window, 'settings_manager'):
             return {"error": "Settings manager not available"}
             
@@ -306,12 +352,15 @@ class MCPServer(QObject):
         """
         Create or update a plugin file in the 'plugins/' directory.
         """
+        if not self._check_permission("ai_allow_config"):
+            return {"error": "Plugin and config changes are disabled by the user."}
+
         if not filename.endswith(".py"):
             return {"error": "Filename must end with .py"}
             
         # Clean filename to prevent path traversal
         clean_filename = os.path.basename(filename)
-        plugin_dir = os.path.join(os.getcwd(), "plugins")
+        plugin_dir = os.path.join(self._app_root(), "plugins")
         
         if not os.path.exists(plugin_dir):
             try:
@@ -345,7 +394,10 @@ class MCPServer(QObject):
 
     def list_plugins(self) -> Dict[str, Any]:
         """List all Python files in the plugins directory."""
-        plugin_dir = os.path.join(os.getcwd(), "plugins")
+        if not self._check_permission("ai_allow_config"):
+            return {"error": "Plugin and config changes are disabled by the user."}
+
+        plugin_dir = os.path.join(self._app_root(), "plugins")
         if not os.path.exists(plugin_dir):
             return {"plugins": [], "message": "Plugins directory does not exist."}
             
@@ -357,11 +409,14 @@ class MCPServer(QObject):
 
     def read_plugin_code(self, filename: str) -> Dict[str, Any]:
         """Read the source code of a plugin file."""
+        if not self._check_permission("ai_allow_config"):
+            return {"error": "Plugin and config changes are disabled by the user."}
+
         if not filename.endswith(".py"):
             return {"error": "Only .py files can be read from the plugins directory."}
             
         clean_filename = os.path.basename(filename)
-        plugin_dir = os.path.join(os.getcwd(), "plugins")
+        plugin_dir = os.path.join(self._app_root(), "plugins")
         file_path = os.path.join(plugin_dir, clean_filename)
         
         if not os.path.exists(file_path):
@@ -629,8 +684,9 @@ class MCPServer(QObject):
             
             sequences = []
             for seq in manager.sequences:
+                is_running = seq in manager.active_sequences
                 status = "STOPPED (IDLE - NO TRIGGERS ARE BEING CHECKED)"
-                if seq in manager.active_sequences:
+                if is_running:
                     status = "RUNNING (ACTIVE - WATCHING TRIGGERS)"
                 elif hasattr(seq, '_current_step_failed') and seq._current_step_failed:
                     status = "FAILED"
@@ -645,23 +701,29 @@ class MCPServer(QObject):
                         "trigger": trigger_desc,
                         "action": action_desc,
                         "enabled": step.enabled,
-                        "is_active": (status == "Running" and seq.current_step_index == i)
+                        "is_active": (is_running and seq.current_step_index == i)
                     })
 
                 sequences.append({
                     "name": seq.name,
                     "status": status,
                     "step_count": len(seq.steps),
-                    "current_step": seq.current_step_index + 1 if status == "Running" else 0,
+                    "current_step": seq.current_step_index + 1 if is_running else 0,
                     "loop": getattr(seq, 'loop', False),
                     "steps": step_details
                 })
                 
+            serial_seq_count = len(getattr(self.main_window, 'other_sequences', None) or [])
             return {
                 "sequences": sequences,
                 "active_sequences_count": len(manager.active_sequences),
                 "shared_variables": manager.variables if hasattr(manager, 'variables') else {},
-                "note": "Shared variables can be used across sequences and by SystemActions."
+                "note": "Shared variables can be used across sequences and by SystemActions.",
+                "tip": (
+                    "This tool lists Automations only. "
+                    f"There are currently {serial_seq_count} Serial protocol sequence(s) — "
+                    "inspect those with get_serial_sequence (not get_automation_info)."
+                )
             }
         except Exception as e:
             return {"error": f"Failed to get automation info: {str(e)}"}
@@ -768,6 +830,25 @@ class MCPServer(QObject):
         if not hasattr(self.main_window, 'project_controller'):
             return {"error": "Project controller not available"}
 
+        for label, value in (
+            ("project_name", project_name),
+            ("series_name", series_name),
+            ("run_name", run_name),
+        ):
+            err = self._validate_path_component(value, label)
+            if err:
+                return {"error": err}
+
+        base_dir = self.main_window.project_base_dir.text().strip()
+        if not base_dir:
+            return {"error": "Project base directory is not configured."}
+
+        run_dir = os.path.normpath(os.path.join(base_dir, project_name, series_name, run_name))
+        base_abs = os.path.normpath(os.path.abspath(base_dir))
+        run_abs = os.path.normpath(os.path.abspath(run_dir))
+        if run_abs != base_abs and not run_abs.startswith(base_abs + os.sep):
+            return {"error": "Requested run path escapes the project base directory."}
+
         try:
             # We must use QMetaObject to call this on the main thread safely if not already there
             # but execute_tool handles the thread dispatch for us.
@@ -859,6 +940,8 @@ class MCPServer(QObject):
             "sensors_mqtt": "app/core/docs/sensors_mqtt.md",
             "sensors_csv": "app/core/docs/sensors_csv.md",
             "sensors_advanced": "app/core/docs/sensors_advanced.md",
+            "sensors_optical": "app/core/docs/sensors_optical.md",
+            "sensors_audio": "app/core/docs/sensors_audio.md",
             "automation": "app/core/docs/automation_logic.md",
             "vision": "app/core/docs/vision_guide.md",
             "camera": "app/core/docs/camera_vision_logic.md",
@@ -881,9 +964,7 @@ class MCPServer(QObject):
             return f"Error: Topic '{topic}' not found. Available: {list(doc_map.keys())}"
             
         try:
-            # Convert to absolute path based on workspace root
-            # Assuming MCPServer is in app/core/, but we use workspace relative or absolute
-            abs_path = os.path.join(os.getcwd(), path)
+            abs_path = os.path.join(self._app_root(), path)
             if not os.path.exists(abs_path):
                 return f"Error: Documentation file not found at {abs_path}."
                 
@@ -906,9 +987,13 @@ class MCPServer(QObject):
             # Check if this sensor has ANY data in live or CSV
             has_data = False
             if controller:
-                if internal_key in controller.historical_buffer and controller.historical_buffer[internal_key]:
-                    has_data = True
-                elif hasattr(controller, 'csv_historical_data') and internal_key in controller.csv_historical_data:
+                controller.historical_buffer_mutex.lock()
+                try:
+                    if internal_key in controller.historical_buffer and controller.historical_buffer[internal_key]:
+                        has_data = True
+                finally:
+                    controller.historical_buffer_mutex.unlock()
+                if not has_data and hasattr(controller, 'csv_historical_data') and internal_key in controller.csv_historical_data:
                     if controller.csv_historical_data[internal_key].get('time'):
                         has_data = True
 
@@ -1199,6 +1284,9 @@ class MCPServer(QObject):
             resolution: e.g. "1280x720".
             fps: e.g. 30.
         """
+        if not self._check_permission("ai_allow_vision"):
+            return {"error": "Camera control is disabled by the user."}
+
         if not hasattr(self.main_window, 'camera_controller'):
             return {"error": "Camera controller not available"}
             
@@ -1281,6 +1369,9 @@ class MCPServer(QObject):
 
     def disconnect_camera(self, slot_index: int) -> Dict[str, Any]:
         """Disconnect camera from a specific slot (0-3)."""
+        if not self._check_permission("ai_allow_vision"):
+            return {"error": "Camera control is disabled by the user."}
+
         if not hasattr(self.main_window, 'camera_controller'):
             return {"error": "Camera controller not available"}
             
@@ -1473,6 +1564,9 @@ class MCPServer(QObject):
 
     def write_mqtt_message(self, topic: str, payload: str) -> Dict[str, Any]:
         """Publish a message to an MQTT topic."""
+        if not self._check_permission("ai_allow_config"):
+            return {"error": "Configuration changes are disabled by the user."}
+
         dcc = getattr(self.main_window, 'data_collection_controller', None)
         if not dcc:
             return {"error": "Data collection controller not available."}
@@ -1499,6 +1593,9 @@ class MCPServer(QObject):
         """
         Manage video overlays for a camera slot.
         """
+        if not self._check_permission("ai_allow_vision"):
+            return {"error": "Camera control is disabled by the user."}
+
         if not hasattr(self.main_window, 'camera_controller'):
             return {"error": "Camera controller not available"}
             
@@ -1609,6 +1706,9 @@ class MCPServer(QObject):
         """
         Start recording video from a specific camera slot or all connected cameras.
         """
+        if not self._check_permission("ai_allow_vision"):
+            return {"error": "Camera control is disabled by the user."}
+
         if not hasattr(self.main_window, 'camera_controller'):
             return {"error": "Camera controller not available"}
             
@@ -1655,7 +1755,6 @@ class MCPServer(QObject):
                 output_dir=output_dir, 
                 filename=fname, 
                 codec="H264",
-                use_direct_streaming=controller.settings.get_bool("use_direct_streaming", True),
                 use_hw_accel=controller.settings.get_bool("use_hw_accel", True),
                 record_audio=controller.camera_configs[slot_index].get("record_audio", False),
                 audio_device_index=controller.camera_configs[slot_index].get("audio_device", -1)
@@ -1679,6 +1778,9 @@ class MCPServer(QObject):
         """
         Stop active camera recordings.
         """
+        if not self._check_permission("ai_allow_vision"):
+            return {"error": "Camera control is disabled by the user."}
+
         if not hasattr(self.main_window, 'camera_controller'):
             return {"error": "Camera controller not available"}
             
@@ -1701,10 +1803,9 @@ class MCPServer(QObject):
                 
             thread = controller.camera_threads[slot_index]
             if thread:
-                path = getattr(thread, "output_file", "")
                 thread.stop_recording()
                 controller.is_recording[slot_index] = False
-                controller._finalize_video_segment_metadata(path, time.time(), getattr(thread, "recording_start_time", None))
+                thread._wait_for_finalize(timeout_s=20.0)
                 return {"success": True, "message": f"Recording stopped for Cam {slot_index+1}."}
             else:
                 return {"error": "Camera thread not found."}
@@ -1930,6 +2031,9 @@ class MCPServer(QObject):
         """
         Permanently remove a sensor from the system.
         """
+        if not self._check_permission("ai_allow_config"):
+            return {"error": "Configuration changes are disabled by the user."}
+
         sc = getattr(self.main_window, 'sensor_controller', None)
         if not sc:
             return {"error": "Sensor controller not available."}
@@ -2107,13 +2211,31 @@ class MCPServer(QObject):
 
             # 5. Add to manager (this automatically saves to the JSON file)
             manager.add_sequence(new_sequence)
-            
+
+            # Echo a compact view of what was actually stored so the AI can verify
+            saved_steps = []
+            for i, step in enumerate(new_sequence.steps):
+                trig = getattr(step, "trigger", None)
+                act = getattr(step, "action", None)
+                saved_steps.append({
+                    "step": i + 1,
+                    "trigger": getattr(trig, "description", None) or getattr(trig, "name", "Unknown"),
+                    "trigger_type": type(trig).__name__ if trig is not None else None,
+                    "action": getattr(act, "description", None) or getattr(act, "name", "Unknown"),
+                    "action_type": type(act).__name__ if act is not None else None,
+                    "enabled": getattr(step, "enabled", True),
+                })
+
             return {
                 "success": True,
                 "message": f"Automation '{name}' saved successfully. {note}",
                 "sequence_name": name,
-                "step_count": len(steps),
-                "checked": checked
+                "step_count": len(new_sequence.steps),
+                "checked": checked,
+                "loop": loop,
+                "run_linked": run_linked,
+                "steps": saved_steps,
+                "tip": "Verify live status with get_automation_info. Call control_automation(action='start') to arm triggers."
             }
         except KeyError as e:
             return {"error": f"Missing required field in automation JSON: {str(e)}. Please check documentation for schema."}
@@ -2130,6 +2252,9 @@ class MCPServer(QObject):
         Args:
             name: The name of the sequence to remove.
         """
+        if not self._check_permission("ai_allow_automation"):
+            return {"error": "Automation control is disabled in settings."}
+
         if not hasattr(self.main_window, 'automation_controller'):
             return {"error": "Automation controller not available."}
 
@@ -2183,24 +2308,26 @@ class MCPServer(QObject):
                 if sequence in manager.active_sequences:
                     return {"success": True, "message": f"Sequence '{name}' is ALREADY RUNNING and active.", "status": "RUNNING"}
                 
-                from PyQt6.QtCore import QTimer
                 print(f"[MCP] Issuing START for sequence: {name}")
-                # Use QTimer.singleShot for reliable cross-thread execution in PyQt6
-                QTimer.singleShot(0, lambda: manager.start_sequence(sequence))
+                manager.start_sequence(sequence)
+                is_running = sequence in manager.active_sequences
                 
                 return {
-                    "success": True, 
-                    "message": f"Sequence '{name}' started. Triggers are NOW active and being checked.",
-                    "status": "RUNNING"
+                    "success": True,
+                    "message": (
+                        f"Sequence '{name}' started. Triggers are NOW active and being checked."
+                        if is_running else
+                        f"Sequence '{name}' start requested but is not yet active."
+                    ),
+                    "status": "RUNNING" if is_running else "pending"
                 }
                 
             elif action == "stop":
                 if sequence not in manager.active_sequences:
                     return {"success": True, "message": f"Sequence '{name}' is already stopped.", "status": "STOPPED"}
                 
-                from PyQt6.QtCore import QTimer
                 print(f"[MCP] Issuing STOP for sequence: {name}")
-                QTimer.singleShot(0, lambda: manager.stop_sequence(sequence))
+                manager.stop_sequence(sequence)
                 
                 return {
                     "success": True, 
@@ -2475,13 +2602,19 @@ class MCPServer(QObject):
                     live_data[sensor.name] = sensor.current_value
 
         if not live_data:
+            note = (
+                f"I checked combined_data (prefixes {prefixes}) and interface-specific discovery methods. "
+                "Ensure the interface is connected and sending data."
+            )
+            if canonical_name in ("Serial", "Other Serial", "OtherSerial"):
+                note += " For Serial: verify the pipeline with get_serial_sequence, and confirm publish targets match sensor mappings."
             return {
                 "interface": canonical_name,
                 "status": "No live data or discovered sensors found.",
-                "note": f"I checked combined_data (prefixes {prefixes}) and interface-specific discovery methods. Ensure the interface is connected and sending data."
+                "note": note
             }
-            
-        return {
+
+        result = {
             "interface": canonical_name,
             "status": "Connected",
             "configured_sensors": configured_data,
@@ -2489,6 +2622,12 @@ class MCPServer(QObject):
             "note": "Configured sensors are already in the system. Available unconfigured sensors are being received from the hardware but haven't been added as sensors yet.",
             "timestamp": dcc.combined_data.get(f"{st_lower}_timestamp") or dcc.combined_data.get('timestamp')
         }
+        if canonical_name in ("Serial", "Other Serial", "OtherSerial"):
+            result["tip"] = (
+                "Serial live keys are usually 'SequenceName:publish_target'. "
+                "Inspect pipelines with get_serial_sequence; sensors need matching mapping."
+            )
+        return result
 
     def get_csv_preview(self, file_path: str, row_count: int = 5) -> Dict[str, Any]:
         """
@@ -2496,6 +2635,9 @@ class MCPServer(QObject):
         """
         if not self._check_permission("ai_allow_sensor_data"):
             return {"error": "Access to sensor data is disabled in settings."}
+
+        if not self._is_path_allowed(file_path):
+            return {"error": f"Access denied: file path is outside allowed directories ({file_path})."}
 
         if not os.path.exists(file_path):
             return {"error": f"File not found: {file_path}"}
@@ -2536,6 +2678,9 @@ class MCPServer(QObject):
 
     def toggle_interface_connection(self, interface_name: str, action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Connect or disconnect a hardware interface."""
+        if not self._check_permission("ai_allow_config"):
+            return {"error": "Configuration changes are disabled by the user."}
+
         dcc = getattr(self.main_window, 'data_collection_controller', None)
         if not dcc:
             return {"error": "Data collection controller not available."}
@@ -2704,6 +2849,9 @@ class MCPServer(QObject):
         Add a new sensor to a hardware interface.
         If the sensor name already exists for that interface, it will update the existing configuration.
         """
+        if not self._check_permission("ai_allow_config"):
+            return {"error": "Configuration changes are disabled by the user."}
+
         dcc = getattr(self.main_window, 'data_collection_controller', None)
         if not dcc:
             return {"error": "Data collection controller not available."}
@@ -2719,6 +2867,8 @@ class MCPServer(QObject):
                 return {"error": "CSV sensor requires 'file' or 'file_path' in params."}
             if not column:
                 return {"error": "CSV sensor requires 'column' (the name or index of the CSV column) in params."}
+            if not self._is_path_allowed(file_path):
+                return {"error": f"Access denied: CSV file path is outside allowed directories ({file_path})."}
             
             # Ensure it's in MainWindow.csv_configs
             if not hasattr(self.main_window, 'csv_configs'):
@@ -2791,11 +2941,28 @@ class MCPServer(QObject):
             
         # persist=True ensures it's saved to virtual_sensors.json
         success = dcc.add_sensor_from_config(config, persist=True)
-        
-        return {
+
+        result = {
             "success": success,
-            "message": f"Sensor '{sensor_name}' {'successfully configured' if success else 'failed to configure'} on interface '{interface_name}'."
+            "message": f"Sensor '{sensor_name}' {'successfully configured' if success else 'failed to configure'} on interface '{interface_name}'.",
+            "interface": interface_name,
+            "sensor_name": sensor_name,
+            "unit": unit,
+            "params": {k: v for k, v in params.items() if k not in ("name", "type", "unit", "enabled", "auto_connect")},
         }
+        if interface_name in ("Serial", "OtherSerial"):
+            mapping = params.get("mapping") or params.get("measurement")
+            result["mapping"] = mapping
+            result["port"] = params.get("port")
+            if not mapping:
+                result["warning"] = (
+                    "No Serial mapping resolved. Set params.mapping to 'SequenceName:publish_target', "
+                    "or make publish.target match the sensor_name, then re-add. "
+                    "Inspect sequences with get_serial_sequence."
+                )
+            else:
+                result["tip"] = "Mapping links this sensor to a publish target from configure_serial_sequence."
+        return result
 
     def test_serial_command(self, port: str, command: str, baud_rate: int = 9600, timeout: float = 2.0, line_ending: str = "None") -> Dict[str, Any]:
         """
@@ -2807,6 +2974,9 @@ class MCPServer(QObject):
         line_ending options: "None", "LF (\n)", "CRLF (\r\n)", "CR (\r)".
         If the device doesn't respond, try different line endings and baud rates.
         """
+        if not self._check_permission("ai_allow_config"):
+            return {"error": "Configuration changes are disabled by the user."}
+
         dcc = getattr(self.main_window, 'data_collection_controller', None)
         if not dcc:
             return {"error": "Data collection controller not available."}
@@ -3046,80 +3216,249 @@ class MCPServer(QObject):
             "applied_params": params
         }
 
+    def _normalize_serial_steps(self, steps: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Normalize serial sequence steps for storage and AI feedback.
+
+        - Canonical PascalCase / lowercase types
+        - Accept docs shorthand (source/start/end/ms/target-on-parse)
+        - Strip irrelevant empty fields the LLM may dump onto every step
+        - Auto-add missing publish steps for ParseValue result_vars
+        """
+        TYPE_MAP = {
+            "sendcommand": "SendCommand",
+            "send": "SendCommand",
+            "wait": "Wait",
+            "readresponse": "ReadResponse",
+            "read": "ReadResponse",
+            "parsevalue": "ParseValue",
+            "parse": "ParseValue",
+            "publish": "publish",
+        }
+        ALLOWED_FIELDS = {
+            "SendCommand": {"type", "command", "line_ending"},
+            "Wait": {"type", "wait_time"},
+            "ReadResponse": {"type", "read_type", "timeout", "result_var"},
+            "ParseValue": {
+                "type", "source_var", "parse_method", "start_marker", "end_marker",
+                "result_type", "result_var", "multiplier"
+            },
+            "publish": {"type", "source_var", "target"},
+        }
+
+        def sanitize_var(v):
+            if not v or not isinstance(v, str):
+                return v
+            if ":" in v:
+                return v.split(":")[-1]
+            return v
+
+        notes = []
+        normalized = []
+
+        for i, raw in enumerate(steps or []):
+            if not isinstance(raw, dict):
+                notes.append(f"Step {i + 1}: ignored (not an object).")
+                continue
+
+            step = dict(raw)
+            raw_type = str(step.get("type", "")).strip()
+            canonical = TYPE_MAP.get(raw_type.lower())
+            if not canonical:
+                notes.append(f"Step {i + 1}: unknown type '{raw_type}' ignored.")
+                continue
+
+            # Accept documentation shorthand / legacy UI field names
+            if "wait_time" not in step and "ms" in step:
+                step["wait_time"] = step.pop("ms")
+            if "source_var" not in step and "source" in step:
+                step["source_var"] = step.pop("source")
+            if "start_marker" not in step and "start" in step:
+                step["start_marker"] = step.pop("start")
+            if "end_marker" not in step and "end" in step:
+                step["end_marker"] = step.pop("end")
+            if canonical == "ParseValue" and "result_var" not in step and step.get("target"):
+                step["result_var"] = step.pop("target")
+                notes.append(
+                    f"Step {i + 1}: moved 'target' -> 'result_var' "
+                    f"(target is only for publish steps)."
+                )
+            if canonical == "ReadResponse" and "result_var" not in step and step.get("target"):
+                step["result_var"] = step.pop("target")
+
+            # Defaults / required fields
+            if canonical == "SendCommand":
+                step.setdefault("command", "")
+                step.setdefault("line_ending", "LF")
+            elif canonical == "Wait":
+                try:
+                    step["wait_time"] = int(step.get("wait_time", 300))
+                except (TypeError, ValueError):
+                    step["wait_time"] = 300
+                if step["wait_time"] < 300:
+                    notes.append(f"Step {i + 1}: wait_time raised to 300ms (hardware needs time).")
+                    step["wait_time"] = 300
+            elif canonical == "ReadResponse":
+                step.setdefault("read_type", "Read Line")
+                step.setdefault("timeout", 1000)
+                if not step.get("result_var"):
+                    step["result_var"] = "raw_data"
+                    notes.append(f"Step {i + 1}: defaulted result_var to 'raw_data'.")
+            elif canonical == "ParseValue":
+                step.setdefault("parse_method", "Between Markers")
+                step.setdefault("result_type", "Number (Float)")
+                step.setdefault("start_marker", "")
+                step.setdefault("end_marker", "")
+                if not step.get("source_var"):
+                    step["source_var"] = "raw_data"
+                    notes.append(f"Step {i + 1}: defaulted source_var to 'raw_data'.")
+                if not step.get("result_var"):
+                    # Prefer a stable name derived from the start marker when possible
+                    marker = str(step.get("start_marker") or "").strip(" :")
+                    auto_name = re.sub(r"[^A-Za-z0-9_]+", "_", marker).strip("_").lower() or f"val_{i + 1}"
+                    if not auto_name.endswith("_val"):
+                        auto_name = f"{auto_name}_val"
+                    step["result_var"] = auto_name
+                    notes.append(
+                        f"Step {i + 1}: missing result_var — auto-set to '{auto_name}'. "
+                        "Always set result_var explicitly for ParseValue."
+                    )
+            elif canonical == "publish":
+                if not step.get("source_var"):
+                    step["source_var"] = "value"
+                    notes.append(f"Step {i + 1}: defaulted publish source_var to 'value'.")
+                if not step.get("target"):
+                    step["target"] = step["source_var"]
+                    notes.append(
+                        f"Step {i + 1}: defaulted publish target to '{step['target']}'. "
+                        "Set target to the sensor display name when possible."
+                    )
+
+            for key in ("result_var", "source_var", "target"):
+                if key in step:
+                    step[key] = sanitize_var(step[key])
+
+            # Keep only fields relevant to this step type (drops LLM schema-fill junk)
+            clean = {"type": canonical}
+            for key in ALLOWED_FIELDS[canonical]:
+                if key == "type":
+                    continue
+                if key in step and step[key] not in (None, ""):
+                    clean[key] = step[key]
+                elif key in step and key in ("end_marker", "start_marker", "command"):
+                    # Allow empty markers/command when intentionally provided
+                    if key in raw or key in step:
+                        clean[key] = step.get(key, "")
+            # Ensure required keys always present after cleanup
+            if canonical == "SendCommand":
+                clean.setdefault("command", "")
+                clean.setdefault("line_ending", "LF")
+            elif canonical == "Wait":
+                clean.setdefault("wait_time", 300)
+            elif canonical == "ReadResponse":
+                clean.setdefault("read_type", "Read Line")
+                clean.setdefault("timeout", 1000)
+                clean.setdefault("result_var", "raw_data")
+            elif canonical == "ParseValue":
+                clean.setdefault("source_var", "raw_data")
+                clean.setdefault("parse_method", "Between Markers")
+                clean.setdefault("start_marker", "")
+                clean.setdefault("end_marker", "")
+                clean.setdefault("result_type", "Number (Float)")
+                clean.setdefault("result_var", f"val_{i + 1}")
+            elif canonical == "publish":
+                clean.setdefault("source_var", "value")
+                clean.setdefault("target", clean["source_var"])
+
+            normalized.append(clean)
+
+        # Safety net: auto-publish ParseValue results that have no matching publish
+        published_sources = set()
+        for s in normalized:
+            if s.get("type") == "publish":
+                src = s.get("source_var")
+                if src:
+                    published_sources.add(src)
+
+        auto_added = []
+        for s in normalized:
+            if s.get("type") != "ParseValue":
+                continue
+            result_var = s.get("result_var")
+            if result_var and result_var not in published_sources:
+                pub = {"type": "publish", "source_var": result_var, "target": result_var}
+                auto_added.append(pub)
+                published_sources.add(result_var)
+
+        if auto_added:
+            normalized.extend(auto_added)
+            notes.append(
+                f"Auto-added {len(auto_added)} publish step(s) for ParseValue result_var(s) "
+                "that had no publish. Prefer adding publish yourself with target = sensor display name."
+            )
+
+        return {"steps": normalized, "notes": notes, "auto_added_publish_count": len(auto_added)}
+
     def configure_serial_sequence(self, port: str, sequence_name: str, steps: List[Dict[str, Any]], poll_interval: Optional[float] = None) -> Dict[str, Any]:
         """
         Configure a custom communication sequence for a serial device (OtherSerial).
         """
+        if not self._check_permission("ai_allow_config"):
+            return {"error": "Configuration changes are disabled by the user."}
+
         dcc = getattr(self.main_window, 'data_collection_controller', None)
         if not dcc:
             return {"error": "Data collection controller not available."}
-            
+
+        if not steps:
+            return {"error": "steps is required and must be a non-empty list. Call get_documentation(topic='sensors_serial') for the exact JSON format."}
+
         # 1. Update/Add to the global sequences list in MainWindow
         if not hasattr(self.main_window, 'other_sequences'):
             self.main_window.other_sequences = []
-            
+
         # Find existing or create new
         seq_config = next((s for s in self.main_window.other_sequences if s.get('name') == sequence_name and s.get('port') == port), None)
         if not seq_config:
             seq_config = {"name": sequence_name, "port": port}
             self.main_window.other_sequences.append(seq_config)
-            
-        # Harmonize steps: strip sequence names from variable names if present
-        def sanitize_var(v):
-            if not v or not isinstance(v, str): return v
-            if ":" in v:
-                return v.split(":")[-1]
-            return v
 
-        for step in steps:
-            # 1. Standardize types to lowercase
-            if 'type' in step:
-                step['type'] = step['type'].lower()
-            
-            # 2. Sanitize variables
-            for key in ["result_var", "source_var", "target", "source"]:
-                if key in step:
-                    step[key] = sanitize_var(step[key])
+        norm = self._normalize_serial_steps(steps)
+        normalized_steps = norm["steps"]
+        if not normalized_steps:
+            return {
+                "error": "No valid steps after normalization.",
+                "notes": norm["notes"],
+                "hint": "Each step needs type in [SendCommand, Wait, ReadResponse, ParseValue, publish]. See get_documentation(topic='sensors_serial')."
+            }
 
-        # Safety net: Ensure publish steps exist for variables created by ParseValue
-        # but don't add them if they already exist (even if case is different)
-        published_vars = set()
-        for s in steps:
-            if s.get('type') == 'publish':
-                source = s.get('source_var') or s.get('source')
-                if source:
-                    published_vars.add(source)
+        # Validate pipeline shape for clearer AI feedback
+        types = [s.get("type") for s in normalized_steps]
+        if "ReadResponse" not in types:
+            norm["notes"].append("WARNING: No ReadResponse step — sequence will not capture hardware output.")
+        if "ParseValue" not in types:
+            norm["notes"].append("WARNING: No ParseValue step — raw text may not become numeric sensor values.")
+        if "publish" not in types:
+            norm["notes"].append("WARNING: No publish step — sensors cannot map to sequence outputs.")
 
-        extra_steps = []
-        for step in steps:
-            st = step.get('type', '')
-            if st == 'parsevalue' or st == 'parse':
-                target = step.get('target') or step.get('result_var')
-                if target and target not in published_vars:
-                    extra_steps.append({
-                        "type": "publish",
-                        "source_var": target,
-                        "target": target
-                    })
-                    published_vars.add(target) # Prevent adding multiple for same var
-        
-        if extra_steps:
-            steps.extend(extra_steps)
-            print(f"DEBUG MCPServer: Auto-added {len(extra_steps)} missing publish steps.")
+        publish_targets = [s.get("target") for s in normalized_steps if s.get("type") == "publish"]
+        sensor_mapping_hint = [
+            f"{sequence_name}:{t}" for t in publish_targets if t
+        ]
 
-        seq_config["steps"] = steps
+        seq_config["steps"] = normalized_steps
         if poll_interval is not None:
             seq_config["poll_interval"] = poll_interval
-            
+
         # Clear legacy actions to ensure UI uses the new steps
         if "actions" in seq_config:
             del seq_config["actions"]
-            
+
+        connected = False
         # 2. If interface is active, update it live
         if hasattr(dcc, 'interfaces') and 'other_serial' in dcc.interfaces:
             interface = dcc.interfaces['other_serial'].get('instance')
             if interface and getattr(interface, 'port', None) == port:
-                # Rebuild sequences from global list
                 from app.core.interfaces.other_serial_interface import SerialSequence
                 new_seqs = []
                 for s_data in self.main_window.other_sequences:
@@ -3127,24 +3466,20 @@ class MCPServer(QObject):
                         seq_obj = SerialSequence.from_dict(s_data)
                         if seq_obj:
                             new_seqs.append(seq_obj)
-                
+
                 if new_seqs:
                     interface.sequences = new_seqs
                 if poll_interval is not None:
                     interface.poll_interval = poll_interval
-            else:
-                # If instance exists but port doesn't match, or not connected,
-                # we could try to connect it here.
-                pass
+                connected = True
         else:
             # Interface not active at all, try to auto-connect if we have a port
             if port and hasattr(dcc, 'connect_other_serial'):
                 from app.core.interfaces.other_serial_interface import SerialSequence
                 new_seqs = [SerialSequence.from_dict(s) for s in self.main_window.other_sequences if s.get('port') == port]
-                # Try to connect with the new sequences
                 success = dcc.connect_other_serial(port=port, sequences=new_seqs, poll_interval=poll_interval or 1.0)
+                connected = bool(success)
                 if success and hasattr(self.main_window, 'update_device_connection_status_ui'):
-                    # Use QMetaObject.invokeMethod to safely update UI from whatever thread we are on
                     QMetaObject.invokeMethod(self.main_window, "update_device_connection_status_ui",
                                            Qt.ConnectionType.QueuedConnection,
                                            Q_ARG(object, "other"),
@@ -3153,13 +3488,65 @@ class MCPServer(QObject):
         # 3. Persist
         if hasattr(self.main_window, 'save_virtual_sensors'):
             self.main_window.save_virtual_sensors()
-            
+
         return {
             "success": True,
             "port": port,
             "sequence": sequence_name,
-            "step_count": len(steps)
+            "step_count": len(normalized_steps),
+            "steps": normalized_steps,
+            "auto_added_publish_count": norm["auto_added_publish_count"],
+            "notes": norm["notes"],
+            "publish_targets": publish_targets,
+            "sensor_mapping_hint": sensor_mapping_hint,
+            "interface_connected": connected,
+            "tip": (
+                "Verify with get_serial_sequence. For custom sensor names, set publish.target "
+                "to the display name (e.g. 'ser_Humidity') then add_sensor(interface='Serial', "
+                "sensor_name=that name). Mapping form is SequenceName:publish_target."
+            )
         }
+
+    def get_serial_sequence(self, port: str = "", sequence_name: str = "") -> Dict[str, Any]:
+        """
+        Inspect saved Serial (OtherSerial) sequences. Not the same as Automations.
+        """
+        sequences = getattr(self.main_window, 'other_sequences', None) or []
+        if not sequences:
+            return {
+                "sequences": [],
+                "note": "No serial sequences configured. Use configure_serial_sequence after test_serial_command."
+            }
+
+        matched = []
+        for s in sequences:
+            if port and s.get("port") != port:
+                continue
+            if sequence_name and s.get("name") != sequence_name:
+                continue
+            matched.append({
+                "name": s.get("name"),
+                "port": s.get("port"),
+                "poll_interval": s.get("poll_interval"),
+                "step_count": len(s.get("steps") or s.get("actions") or []),
+                "steps": s.get("steps") or s.get("actions") or [],
+            })
+
+        if (port or sequence_name) and not matched:
+            return {
+                "error": f"No serial sequence found matching port='{port}' sequence_name='{sequence_name}'.",
+                "available": [{"name": s.get("name"), "port": s.get("port")} for s in sequences]
+            }
+
+        return {
+            "sequences": matched,
+            "count": len(matched),
+            "note": "These are Serial protocol pipelines, NOT Automations. Use get_automation_info for Automations."
+        }
+
+    def list_serial_sequences(self) -> Dict[str, Any]:
+        """List all configured Serial sequences (summary only)."""
+        return self.get_serial_sequence()
 
     def remove_serial_sequence(self, port: str, sequence_name: str) -> Dict[str, Any]:
         """
@@ -3168,17 +3555,21 @@ class MCPServer(QObject):
         dcc = getattr(self.main_window, 'data_collection_controller', None)
         if not dcc:
             return {"error": "Data collection controller not available."}
-            
+
         if not hasattr(self.main_window, 'other_sequences'):
             return {"error": "No serial sequences found."}
-            
+
         # 1. Find and remove from global list
         original_count = len(self.main_window.other_sequences)
-        self.main_window.other_sequences = [s for s in self.main_window.other_sequences 
+        self.main_window.other_sequences = [s for s in self.main_window.other_sequences
                                           if not (s.get('name') == sequence_name and s.get('port') == port)]
-        
+
         if len(self.main_window.other_sequences) == original_count:
-            return {"error": f"Sequence '{sequence_name}' on port '{port}' not found."}
+            available = [{"name": s.get("name"), "port": s.get("port")} for s in getattr(self.main_window, 'other_sequences', [])]
+            return {
+                "error": f"Sequence '{sequence_name}' on port '{port}' not found.",
+                "available": available
+            }
 
         # 2. Update live interface if active
         if hasattr(dcc, 'interfaces') and 'other_serial' in dcc.interfaces:
@@ -3191,10 +3582,11 @@ class MCPServer(QObject):
         # 3. Persist
         if hasattr(self.main_window, 'save_virtual_sensors'):
             self.main_window.save_virtual_sensors()
-            
+
         return {
             "success": True,
-            "message": f"Sequence '{sequence_name}' removed from port '{port}'."
+            "message": f"Sequence '{sequence_name}' removed from port '{port}'.",
+            "remaining_sequences": [{"name": s.get("name"), "port": s.get("port")} for s in self.main_window.other_sequences]
         }
 
     def list_serial_ports(self) -> List[str]:
@@ -3209,7 +3601,7 @@ class MCPServer(QObject):
             "server_thread": QThread.currentThread().objectName() or "Main",
             "main_thread": QCoreApplication.instance().thread().objectName() or "Main",
             "is_main_thread": QThread.currentThread() == QCoreApplication.instance().thread(),
-            "active_tools": len(self._execute_internal("list_tools", {}))
+            "active_tools": len(self.list_tools())
         }
 
     def get_ui_state(self) -> Dict[str, Any]:
@@ -3265,28 +3657,29 @@ class MCPServer(QObject):
         return [
             {
                 "name": "add_sensor",
-                "description": "Add a new sensor to a hardware interface. \n- For 'Arduino': Standard protocol (Master-Slave). \n- For 'Serial': Custom protocol (Requires SerialSequence). \nCRITICAL: If using 'Serial' on an Arduino port, the interface type in this tool MUST be 'Serial', not 'Arduino'. They are different drivers.",
+                "description": "Add a new sensor to a hardware interface. \n- For 'Arduino': Standard protocol (Master-Slave). \n- For 'Serial': Custom protocol (Requires SerialSequence). Set params.mapping to 'SequenceName:publish_target' OR make publish.target match sensor_name. \nCRITICAL: If using 'Serial' on an Arduino port, the interface type in this tool MUST be 'Serial', not 'Arduino'. They are different drivers.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "interface_name": {"type": "string", "description": "Interface type (e.g., 'Arduino', 'Serial', 'LabJack', 'Read CSV')"},
-                        "sensor_name": {"type": "string", "description": "Unique name for the sensor"},
+                        "sensor_name": {"type": "string", "description": "Unique display name for the sensor (e.g. 'ser_Humidity')"},
                         "unit": {"type": "string", "description": "Measurement unit (e.g., 'V', 'C', '%')"},
-                        "params": {"type": "object", "description": "Interface-specific settings."}
+                        "params": {"type": "object", "description": "Interface-specific settings. For Serial: {mapping: 'SeqName:publish_target', port: 'COM4'}."}
                     },
                     "required": ["interface_name", "sensor_name"]
                 }
             },
             {
                 "name": "test_serial_command",
-                "description": "Send a manual command to a serial port and return the response. WARNING: Use this ONLY for custom 'Serial' (OtherSerial) devices. Do NOT use for standard 'Arduino' interface boards, as it may disrupt communication.",
+                "description": "Send a manual command to a serial port and return the response. WARNING: Use this ONLY for custom 'Serial' (OtherSerial) devices. Do NOT use for standard 'Arduino' interface boards, as it may disrupt communication. Prefer line_ending='CR' or 'LF' when probing Arduinos.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "port": {"type": "string", "description": "Serial port (e.g., 'COM3')"},
-                        "command": {"type": "string", "description": "The command string to send (including line endings if needed)"},
+                        "command": {"type": "string", "description": "The command string to send (do NOT include line endings here — use line_ending)"},
                         "baud_rate": {"type": "integer", "default": 9600},
-                        "timeout": {"type": "number", "default": 2.0, "description": "Time to wait for response (seconds)"}
+                        "timeout": {"type": "number", "default": 2.0, "description": "Time to wait for response (seconds)"},
+                        "line_ending": {"type": "string", "description": "None | LF (\\n) | CR (\\r) | CRLF (\\r\\n). Many devices need CR or LF."}
                     },
                     "required": ["port", "command"]
                 }
@@ -3305,7 +3698,7 @@ class MCPServer(QObject):
             },
             {
                 "name": "configure_serial_sequence",
-                "description": "Configure a custom communication sequence. CRITICAL: You MUST use 'test_serial_command' FIRST to see the actual hardware response. NEVER guess commands or markers (like AT+ or T:) unless the user explicitly provided them. Every sequence MUST end with 'publish' steps.",
+                "description": "Configure a Serial (OtherSerial) protocol pipeline. CRITICAL: Call test_serial_command FIRST. Use ONLY the fields listed for each step type — do NOT fill unused fields. REQUIRED pattern: SendCommand (optional) -> Wait (>=300ms) -> ReadResponse (result_var) -> ParseValue (source_var+result_var) -> publish (source_var+target). For multi-value lines, repeat ParseValue+publish per value. publish.target should match the sensor display name. Returns the normalized steps so you can verify — use get_serial_sequence to re-read later. NOT an Automation.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -3313,29 +3706,47 @@ class MCPServer(QObject):
                         "sequence_name": {"type": "string", "description": "Name of the sequence"},
                         "steps": {
                             "type": "array",
+                            "description": "Ordered pipeline steps. Each object should ONLY include fields for its type.",
                             "items": {
                                 "type": "object",
                                 "properties": {
                                     "type": {"type": "string", "enum": ["SendCommand", "Wait", "ReadResponse", "ParseValue", "publish"]},
-                                    "command": {"type": "string", "description": "For SendCommand. String to send."},
-                                    "line_ending": {"type": "string", "description": "For SendCommand (None, LF, CR, CRLF). Most devices need LF or CRLF."},
-                                    "wait_time": {"type": "integer", "description": "For Wait. Time in ms (minimum 300 recommended)."},
-                                    "read_type": {"type": "string", "description": "For ReadResponse (Read Line, Read Until Timeout, Read N Bytes)."},
-                                    "timeout": {"type": "integer", "description": "For ReadResponse. Max wait time in ms."},
-                                    "result_var": {"type": "string", "description": "For ReadResponse and ParseValue. Variable name to store the output (e.g., 'raw_data' or 'h_val')."},
-                                    "source_var": {"type": "string", "description": "For ParseValue and publish. Variable name to read from (e.g., 'raw_data' or 'h_val')."},
-                                    "parse_method": {"type": "string", "description": "For ParseValue (Regex Pattern, Between Markers, After Marker, Before Marker, Entire Response)."},
-                                    "start_marker": {"type": "string", "description": "For 'Between Markers' or 'After Marker'. String preceding the value (e.g., 'Humidity:'). MUST be unique and specific."},
-                                    "end_marker": {"type": "string", "description": "For 'Between Markers' or 'Before Marker'. String following the value (e.g., ';')."},
-                                    "result_type": {"type": "string", "description": "For ParseValue (Number (Float), Number (Integer), Text)."},
-                                    "target": {"type": "string", "description": "For 'publish' ONLY. This is the final sensor key (e.g., 'Humidity')."}
-                                }
+                                    "command": {"type": "string", "description": "SendCommand only."},
+                                    "line_ending": {"type": "string", "description": "SendCommand only: None, LF, CR, CRLF."},
+                                    "wait_time": {"type": "integer", "description": "Wait only. Milliseconds (minimum 300)."},
+                                    "read_type": {"type": "string", "description": "ReadResponse only: Read Line, Read Until Timeout, Read N Bytes."},
+                                    "timeout": {"type": "integer", "description": "ReadResponse only. Max wait ms."},
+                                    "result_var": {"type": "string", "description": "REQUIRED for ReadResponse and ParseValue. Where to store the output (e.g. 'raw_data', 'h_val')."},
+                                    "source_var": {"type": "string", "description": "REQUIRED for ParseValue and publish. Variable to read from."},
+                                    "parse_method": {"type": "string", "description": "ParseValue only: Between Markers (preferred), After Marker, Before Marker, Regex Pattern, Entire Response."},
+                                    "start_marker": {"type": "string", "description": "ParseValue: text before the value (e.g. 'Humidity:')."},
+                                    "end_marker": {"type": "string", "description": "ParseValue: text after the value (e.g. ';'). Empty string allowed."},
+                                    "result_type": {"type": "string", "description": "ParseValue: Number (Float), Number (Integer), or Text."},
+                                    "target": {"type": "string", "description": "publish ONLY. Final sensor key / display name (e.g. 'ser_Humidity')."}
+                                },
+                                "required": ["type"]
                             }
                         },
                         "poll_interval": {"type": "number", "description": "How often to run the sequence (seconds)"}
                     },
                     "required": ["port", "sequence_name", "steps"]
                 }
+            },
+            {
+                "name": "get_serial_sequence",
+                "description": "Inspect saved Serial protocol sequences (steps, port, poll_interval). Use this to VERIFY configure_serial_sequence. This is NOT get_automation_info — Automations are a different system.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "port": {"type": "string", "description": "Optional filter by COM port"},
+                        "sequence_name": {"type": "string", "description": "Optional filter by sequence name"}
+                    }
+                }
+            },
+            {
+                "name": "list_serial_sequences",
+                "description": "List all configured Serial protocol sequences (summary). Alias of get_serial_sequence with no filters.",
+                "parameters": {"type": "object", "properties": {}}
             },
             {
                 "name": "update_interface_config",
@@ -3512,7 +3923,7 @@ class MCPServer(QObject):
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "topic": {"type": "string", "enum": ["overview", "sensors", "sensors_arduino", "sensors_serial", "sensors_labjack", "sensors_mqtt", "sensors_csv", "sensors_advanced", "sensors_optical", "sensors_audio", "automation", "vision", "dashboard_video", "ai_graphs"], "default": "overview"}
+                        "topic": {"type": "string", "enum": ["overview", "projects", "sensors", "sensors_arduino", "sensors_serial", "sensors_labjack", "sensors_mqtt", "sensors_csv", "sensors_advanced", "sensors_optical", "sensors_audio", "sensors_remote_daq", "automation", "vision", "camera", "dashboard_video", "ai_graphs", "tools_overview", "tools_fft", "tools_calibration", "tools_statistics", "tools_diagnostics", "tools_calculator", "tools_optical_rpm", "remote_grpc", "plugins"], "default": "overview"}
                     }
                 }
             },
@@ -3601,7 +4012,7 @@ class MCPServer(QObject):
             },
             {
                 "name": "get_automation_info",
-                "description": "Get LIVE status of all automation sequences, active steps, and shared variables. Use this to see which sequence is currently running.",
+                "description": "Get LIVE status of all automation sequences, active steps, and shared variables. Use this to see which sequence is currently running. Does NOT list Serial protocol sequences — use get_serial_sequence for those.",
                 "parameters": {"type": "object", "properties": {}}
             },
             {
@@ -4039,6 +4450,8 @@ class MCPServer(QObject):
             "list_serial_ports": self.list_serial_ports,
             "configure_interface": self.configure_interface,
             "configure_serial_sequence": self.configure_serial_sequence,
+            "get_serial_sequence": self.get_serial_sequence,
+            "list_serial_sequences": self.list_serial_sequences,
             "remove_serial_sequence": self.remove_serial_sequence,
             "update_interface_config": self.update_interface_config,
             "check_server_status": self.check_server_status,
@@ -4052,13 +4465,7 @@ class MCPServer(QObject):
             "read_plugin_code": self.read_plugin_code
         }
         
-        # 3. Try exact match, then substring match
         func = mapping.get(clean_name)
-        if not func:
-            for key in mapping.keys():
-                if key in clean_name or clean_name in key:
-                    func = mapping[key]
-                    break
         
         if func:
             try:
@@ -4080,5 +4487,6 @@ class MCPServer(QObject):
                 print(f"[MCP] ERROR in '{name}': {str(e)}\n{traceback.format_exc()}")
                 return {"error": f"Execution error: {str(e)}"}
                 
+        available = sorted(mapping.keys())
         print(f"[MCP] ERROR: Tool '{name}' not found.")
-        raise ValueError(f"Tool '{name}' not found. Available: {list(mapping.keys())}")
+        return {"error": f"Tool '{name}' not found. Available: {available}"}

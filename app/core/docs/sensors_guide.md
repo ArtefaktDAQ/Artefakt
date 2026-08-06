@@ -40,8 +40,8 @@ Valid colors are Hex strings.
 ## AI Management Protocol (MANDATORY)
 
 1.  **Observe First**: Always query existing state (`get_project_config`, `get_available_sensors`) before making changes.
-2.  **Use Tools directly**: Never ask the user to configure sensors or run sequences. You have the tools: `add_sensor`, `remove_sensor`, `edit_sensor`, `configure_interface`, and `configure_serial_sequence`.
-3.  **Discovery Workflow**: For any serial device, use `test_serial_command` to see raw data before attempting to write a sequence.
+2.  **Use Tools directly**: Never ask the user to configure sensors or run sequences. You have the tools: `add_sensor`, `remove_sensor`, `edit_sensor`, `configure_interface`, `configure_serial_sequence`, and `get_serial_sequence`.
+3.  **Discovery Workflow**: For any serial device, use `test_serial_command` to see raw data before attempting to write a sequence, then verify with `get_serial_sequence`.
 4.  **No Tool Syntax in Chat**: Communicate in plain English. Perform the tool calls silently and report results.
 
-**NOTE**: For detailed Serial (OtherSerial) protocol rules (Wait steps, Publish steps, etc.), see `topic="sensors_serial"`.
+**NOTE**: For detailed Serial (OtherSerial) protocol rules (Wait steps, Publish steps, exact JSON), see `topic="sensors_serial"`. Serial sequences are NOT Automations — do not use `get_automation_info` to inspect them.

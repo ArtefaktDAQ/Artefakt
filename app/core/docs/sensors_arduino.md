@@ -1,6 +1,6 @@
 # Arduino Interface Guide
 
-The **Arduino** interface is designed for devices running the standard EvoLabs Master-Slave protocol.
+The **Arduino** interface is designed for devices running the standard Artefakt Master-Slave protocol.
 
 ## Protocol Details
 

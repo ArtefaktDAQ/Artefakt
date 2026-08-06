@@ -13,6 +13,7 @@ import numpy as np
 import time
 import csv
 import json
+import threading
 from datetime import datetime
 from scipy.fft import fft, fftfreq
 
@@ -42,7 +43,7 @@ class FFTAnalyzerTool(QWidget):
     
     # Signals for thread-safe updates
     analysis_updated = pyqtSignal(dict)
-    audio_devices_scanned = pyqtSignal(list)
+    audio_devices_scanned = pyqtSignal(object)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -66,7 +67,9 @@ class FFTAnalyzerTool(QWidget):
         self.mic_device_id = None
         self.mic_sample_rate = 44100
         self.mic_buffer = []
+        self.mic_buffer_lock = threading.Lock()
         self.mic_buffer_size = 8192  # Keep last N samples
+        self._mic_scan_generation = 0
         
         # Spectrogram data (time x frequency matrix)
         self.spectrogram_data = []
@@ -449,12 +452,15 @@ class FFTAnalyzerTool(QWidget):
         # Scan for microphone in background
         if SOUNDDEVICE_AVAILABLE:
             from threading import Thread
-            
+
+            self._mic_scan_generation += 1
+            scan_generation = self._mic_scan_generation
+
             def scan_audio_task():
                 try:
                     import sounddevice as sd
                     devices = sd.query_devices()
-                    self.audio_devices_scanned.emit(list(devices))
+                    self.audio_devices_scanned.emit((scan_generation, list(devices)))
                 except Exception as e:
                     print(f"Error listing audio devices: {e}")
 
@@ -470,12 +476,30 @@ class FFTAnalyzerTool(QWidget):
                 if not getattr(sensor, 'enabled', True) or not getattr(sensor, 'show_in_graph', True):
                     continue
                 display_name = f"{sensor.name} ({sensor.interface_type})"
-                sensor_key = f"{sensor.interface_type}_{sensor.name}"
+                sensor_key = self.sensor_controller.get_historical_buffer_key(sensor)
                 self.sensor_combo.addItem(display_name, sensor_key)
 
-    @pyqtSlot(list)
-    def _do_update_mic_options(self, devices):
+    def _remove_mic_combo_entries(self):
+        """Remove existing microphone entries before refreshing the device list."""
+        idx = 0
+        while idx < self.sensor_combo.count():
+            data = self.sensor_combo.itemData(idx)
+            if isinstance(data, str) and data.startswith("mic:"):
+                self.sensor_combo.removeItem(idx)
+            else:
+                idx += 1
+
+    @pyqtSlot(object)
+    def _do_update_mic_options(self, payload):
         """Actual UI update for microphone options."""
+        if not isinstance(payload, tuple) or len(payload) != 2:
+            return
+        scan_generation, devices = payload
+        if scan_generation != self._mic_scan_generation:
+            return
+
+        self._remove_mic_combo_entries()
+
         # Find where to insert (before "── Sensors ──")
         insert_idx = 1
         self.sensor_combo.insertItem(insert_idx, "🎤 Live Microphone (Default)", "mic:default")
@@ -690,29 +714,16 @@ class FFTAnalyzerTool(QWidget):
         
         try:
             data_controller = getattr(self.main_window, 'data_collection_controller', None)
-            if not data_controller:
+            if not data_controller or not hasattr(data_controller, 'get_historical_data'):
                 return None, None
-            
-            # Try to get data from data manager
-            data_manager = getattr(data_controller, 'data_manager', None)
-            if data_manager and hasattr(data_manager, 'get_sensor_data'):
-                try:
-                    data = data_manager.get_sensor_data(self.current_sensor_key)
-                    if data:
-                        # Return shallow copies to avoid RuntimeError if original lists are modified
-                        return list(data.get('time', [])), list(data.get('value', []))
-                except (RuntimeError, AttributeError):
-                    pass
-            
-            # Fallback: try to get from collected_data
-            try:
-                collected_data = getattr(data_controller, 'collected_data', {})
-                if self.current_sensor_key in collected_data:
-                    data = collected_data[self.current_sensor_key]
-                    # Return shallow copies to avoid RuntimeError if original lists are modified
-                    return list(data.get('time', [])), list(data.get('value', []))
-            except (RuntimeError, AttributeError):
-                pass
+
+            historical = data_controller.get_historical_data([self.current_sensor_key])
+            if historical and self.current_sensor_key in historical:
+                data = historical[self.current_sensor_key]
+                times = data.get('time', [])
+                values = data.get('value', [])
+                if times and values:
+                    return list(times), list(values)
         except Exception as e:
             print(f"Error in FFTAnalyzerTool._get_sensor_data: {e}")
         
@@ -735,7 +746,8 @@ class FFTAnalyzerTool(QWidget):
                 self.mic_device_id = int(device_str)
             
             # Create input stream
-            self.mic_buffer = []
+            with self.mic_buffer_lock:
+                self.mic_buffer = []
             self.mic_stream = sd.InputStream(
                 device=self.mic_device_id,
                 channels=1,
@@ -760,7 +772,8 @@ class FFTAnalyzerTool(QWidget):
             except:
                 pass
             self.mic_stream = None
-        self.mic_buffer = []
+        with self.mic_buffer_lock:
+            self.mic_buffer = []
     
     def _mic_callback(self, indata, frames, time_info, status):
         """Callback for microphone audio data"""
@@ -769,22 +782,23 @@ class FFTAnalyzerTool(QWidget):
         
         # Add samples to buffer
         samples = indata[:, 0].tolist()
-        self.mic_buffer.extend(samples)
-        
-        # Keep buffer at max size
-        if len(self.mic_buffer) > self.mic_buffer_size:
-            self.mic_buffer = self.mic_buffer[-self.mic_buffer_size:]
+        with self.mic_buffer_lock:
+            self.mic_buffer.extend(samples)
+            if len(self.mic_buffer) > self.mic_buffer_size:
+                self.mic_buffer = self.mic_buffer[-self.mic_buffer_size:]
     
     def _get_microphone_data(self):
         """Get data from microphone buffer for FFT analysis"""
-        if not self.mic_buffer or len(self.mic_buffer) < 128:
-            return None, None
+        with self.mic_buffer_lock:
+            if not self.mic_buffer or len(self.mic_buffer) < 128:
+                return None, None
+            buffer_copy = list(self.mic_buffer)
         
         # Create time array based on sample rate
-        n_samples = len(self.mic_buffer)
+        n_samples = len(buffer_copy)
         sample_spacing = 1.0 / self.mic_sample_rate
         times = np.arange(n_samples) * sample_spacing
-        values = np.array(self.mic_buffer)
+        values = np.array(buffer_copy)
         
         return times.tolist(), values.tolist()
     
@@ -1140,5 +1154,8 @@ class FFTAnalyzerTool(QWidget):
         """Stop live analysis (call when closing)"""
         self.live_timer.stop()
         self.is_live = False
+        self.live_btn.setChecked(False)
+        self.live_btn.setText("▶ Start Live")
+        self.analyze_btn.setEnabled(True)
         self._stop_microphone()
 

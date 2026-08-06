@@ -85,36 +85,50 @@ class InterfaceRegistry:
 
         for filename in os.listdir(directory):
             if filename.endswith(".py") and filename != "__init__.py":
-                module_name = filename[:-3]
+                module_stem = filename[:-3]
+                unique_name = f"artefakt_plugin_{module_stem}"
+                file_path = os.path.join(directory, filename)
                 try:
-                    # Clear from sys.modules if it was already loaded (to allow hot-reloading if needed)
-                    if module_name in sys.modules:
-                        del sys.modules[module_name]
-                    cls._load_module(module_name)
+                    if unique_name in sys.modules:
+                        del sys.modules[unique_name]
+                    cls._load_module_from_file(unique_name, file_path)
                 except Exception as e:
                     logger.error(f"Error loading plugin {filename}: {e}")
+
+    @classmethod
+    def _load_module_from_file(cls, module_name, file_path):
+        """Load a plugin file with a unique module name to avoid sys.path collisions."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(module_name, file_path)
+        if spec is None or spec.loader is None:
+            logger.error(f"Could not load spec for plugin {file_path}")
+            return
+        module = importlib.util.module_from_spec(spec)
+        import sys
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        cls._register_classes_from_module(module, module_name)
+
+    @classmethod
+    def _register_classes_from_module(cls, module, module_name):
+        """Register BaseInterface / BaseOutboundInterface subclasses from a loaded module."""
+        for name, obj in inspect.getmembers(module):
+            if not inspect.isclass(obj) or inspect.isabstract(obj):
+                continue
+
+            if issubclass(obj, BaseInterface) and obj is not BaseInterface:
+                cls.register(obj)
+            elif issubclass(obj, BaseOutboundInterface) and obj is not BaseOutboundInterface:
+                cls.register_outbound(obj)
 
     @classmethod
     def _load_module(cls, module_name):
         """Load a module and register any BaseInterface or BaseOutboundInterface subclasses."""
         try:
             module = importlib.import_module(module_name)
-            for name, obj in inspect.getmembers(module):
-                # Ensure it's a class and not abstract
-                if not inspect.isclass(obj) or inspect.isabstract(obj):
-                    continue
-                
-                # Register regular interfaces
-                if issubclass(obj, BaseInterface) and obj is not BaseInterface:
-                    cls.register(obj)
-                    
-                # Register outbound interfaces
-                elif issubclass(obj, BaseOutboundInterface) and obj is not BaseOutboundInterface:
-                    cls.register_outbound(obj)
-                    
+            cls._register_classes_from_module(module, module_name)
         except Exception as e:
-            # logger.error(f"Failed to load module {module_name}: {e}")
-            pass # Some modules might fail due to missing dependencies, which is expected for optional interfaces
+            logger.error(f"Failed to load module {module_name}: {e}")
 
     @classmethod
     def register(cls, interface_class):

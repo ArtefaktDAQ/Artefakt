@@ -159,7 +159,7 @@ class NotesController(QObject):
                     break
                 
         # If we've switched to the notes tab, refresh the template data
-        if index == notes_tab_index:
+        if index == notes_tab_index and not self.template_populated:
             self.refresh_template()
             
     def refresh_template(self):
@@ -167,6 +167,9 @@ class NotesController(QObject):
         # Check if the document is already loaded
         if not self.document_loaded:
             self.load_note()
+            return
+
+        if self.template_populated:
             return
             
         # Get the HTML content
@@ -190,6 +193,7 @@ class NotesController(QObject):
             
             # Replace placeholders with updated data
             updated_html = self.populate_template(html_content)
+            self.template_populated = True
             
             # Only update if there are changes to avoid resetting the editor state
             if updated_html != html_content:
@@ -635,7 +639,7 @@ class NotesController(QObject):
                 camera_controller = self.main_window.camera_controller
                 
                 # Check if camera is connected
-                if not camera_controller.is_connected:
+                if not camera_controller.any_connected():
                     # Show error message
                     QMessageBox.information(self.notes_editor, 
                                         "Insert Camera Image", 
@@ -806,11 +810,15 @@ class NotesController(QObject):
             cursor.insertImage(format)
             return
             
-        # Copy the image to the destination directory
-        file_name = os.path.basename(file_path)
+        # Copy the image to the destination directory with a unique name so
+        # inserting two different files that share a basename does not overwrite.
+        original_name = os.path.basename(file_path)
+        base, ext = os.path.splitext(original_name)
+        if not ext:
+            ext = ".png"
+        file_name = f"{base}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}{ext}"
         dest_path = os.path.join(dest_dir, file_name)
         
-        # Copy the file, overwriting if it exists
         try:
             # Use shutil.copy2 to preserve metadata
             shutil.copy2(file_path, dest_path)
@@ -839,23 +847,16 @@ class NotesController(QObject):
             file_name = f"snapshot_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}.png"
             dest_path = os.path.join(dest_dir, file_name)
             
-            # Save the pixmap in a background thread to avoid blocking
-            import threading
-            pixmap_copy = pixmap.copy()
-            
-            def save_async(p, path):
-                try:
-                    p.save(path, "PNG")
-                    if hasattr(self.main_window, 'logger'):
-                        self.main_window.logger.log(f"Saved pixmap to {path}", "DEBUG")
-                except Exception as e:
-                    if hasattr(self.main_window, 'logger'):
-                        self.main_window.logger.log(f"Error saving pixmap: {e}", "ERROR")
+            try:
+                pixmap.save(dest_path, "PNG")
+                if hasattr(self.main_window, 'logger'):
+                    self.main_window.logger.log(f"Saved pixmap to {dest_path}", "DEBUG")
+            except Exception as e:
+                if hasattr(self.main_window, 'logger'):
+                    self.main_window.logger.log(f"Error saving pixmap: {e}", "ERROR")
+                return
 
-            # Start the save thread
-            threading.Thread(target=save_async, args=(pixmap_copy, dest_path), daemon=True).start()
-            
-            # Continue with UI insertion immediately using the path we know will be created
+            # Insert HTML after the file is saved
             rel_path = os.path.join("images", file_name).replace('\\', '/')
             
             # Insert with tracking attributes - use relative path for src since we have baseUrl set
@@ -996,11 +997,11 @@ class NotesController(QObject):
         return updated_html
 
     def save_note(self, html_content=None, is_autosave=False):
-        """Save the current note to the run directory
-        
-        Args:
-            html_content: Optional HTML content to save. If None, will use the current editor content.
-            is_autosave: Whether this is an automatic save or manual.
+        """Save the current note to the run directory.
+
+        Intentionally NOT gated by is_replay_mode / replay_mode_enabled.
+        Scientific notes are edited while reviewing historical runs (post-analysis
+        documentation) and must write into that run's notes.html.
         """
         if not self.document_loaded:
             return
@@ -1076,12 +1077,14 @@ class NotesController(QObject):
             not hasattr(project_controller, 'current_test_series') or not project_controller.current_test_series or
             not hasattr(project_controller, 'current_run') or not project_controller.current_run):
             self.main_window.logger.log("Cannot load note - no active run", "WARN")
+            self.template_populated = False
             # Load empty template if no run is active
             template_html = self.load_template()
             if template_html:
                 template_html = self.populate_template(template_html)
                 self.notes_editor.setHtml(template_html)
                 self.document_loaded = True
+                self.template_populated = True
                 # Calculate hash for the loaded content
                 self.last_saved_content_hash = hashlib.md5(template_html.encode()).hexdigest()
             return
@@ -1094,6 +1097,15 @@ class NotesController(QObject):
         # Check if run directory exists
         if not os.path.exists(run_dir):
             self.main_window.logger.log(f"Cannot load note - run directory not found: {run_dir}", "WARN")
+            self.notes_editor.clear()
+            self.document_loaded = False
+            self.template_populated = False
+            self.last_saved_content_hash = None
+            # Clear base URL so relative images from a previous run cannot resolve here.
+            try:
+                self.notes_editor.document().setBaseUrl(QUrl())
+            except Exception:
+                pass
             return
             
         # Look for notes.html in the run directory
@@ -1118,6 +1130,7 @@ class NotesController(QObject):
                 # Calculate hash for the loaded content
                 self.last_saved_content_hash = hashlib.md5(note_html.encode()).hexdigest()
                 self.document_loaded = True
+                self.template_populated = False
             except Exception as e:
                 self.main_window.logger.log(f"Error loading note: {str(e)}", "ERROR")
         else:
@@ -1145,6 +1158,7 @@ class NotesController(QObject):
                     self.main_window.logger.log(f"Error creating note from template: {str(e)}", "ERROR")
                     
                 self.document_loaded = True
+                self.template_populated = True
                 
     def convert_absolute_to_relative(self, html_content, run_dir):
         """Convert absolute paths in HTML to relative paths based on run_dir"""
@@ -1451,7 +1465,6 @@ class NotesController(QObject):
                 new_height = height_input.value()
                 
                 # 1. Get the full HTML of the document
-                self.notes_editor.selectAll()
                 html_content = self.notes_editor.toHtml()
                 current_cursor_pos = current_cursor.position()
                 

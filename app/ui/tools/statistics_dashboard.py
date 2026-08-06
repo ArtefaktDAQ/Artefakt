@@ -486,6 +486,7 @@ class StatisticsDashboard(QWidget):
         self.start_time = None
         self.last_update_time = None
         self.update_count = 0
+        self.last_sensor_update_times = {}
     
     def _populate_sensors(self):
         """Populate sensor list and histogram combo"""
@@ -539,6 +540,10 @@ class StatisticsDashboard(QWidget):
         
         # Update summary
         self.total_sensors_card.set_value(str(len(self.sensor_rows)))
+
+        if self.hist_sensor_combo.count() > 1:
+            self.hist_sensor_combo.setCurrentIndex(1)
+            self._on_hist_sensor_changed()
     
     def update_sensor_color(self, sensor):
         """Update the color of a sensor row if it exists in the dashboard
@@ -614,7 +619,15 @@ class StatisticsDashboard(QWidget):
                             # Get current value
                             current_val = getattr(sensor, 'current_value', None)
                             if current_val is not None:
-                                row.add_value(current_val)
+                                sensor_update_time = getattr(sensor, 'last_update_time', None)
+                                last_seen_time = self.last_sensor_update_times.get(sensor_key)
+                                last_buffered = row.data_buffer[-1][1] if row.data_buffer else None
+                                value_changed = last_buffered is None or current_val != last_buffered
+                                time_changed = sensor_update_time is not None and sensor_update_time != last_seen_time
+                                if value_changed or time_changed:
+                                    row.add_value(current_val)
+                                    if sensor_update_time is not None:
+                                        self.last_sensor_update_times[sensor_key] = sensor_update_time
                                 row.update_stats()
                                 
                                 total_samples += len(row.data_buffer)

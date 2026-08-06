@@ -941,10 +941,21 @@ class OpticalSensorConfigDialog(QDialog):
     
     def _stop_preview(self):
         """Stop the camera preview"""
-        if self.preview_thread:
-            self.preview_thread.stop()
+        thread = self.preview_thread
+        if thread:
+            try:
+                thread.frame_ready.disconnect(self._update_preview)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                thread.error_occurred.disconnect(self._preview_error)
+            except (TypeError, RuntimeError):
+                pass
+            thread.stop()
+            if thread.isRunning():
+                thread.wait(3000)
             self.preview_thread = None
-        
+
         self.preview_running = False
         self.preview_start_btn.setText("▶️ Start Preview")
         self.preview_start_btn.setStyleSheet(ButtonStyles.success("small"))
@@ -1140,16 +1151,19 @@ class OpticalSensorConfigDialog(QDialog):
                 results.append(f"Color pixels: {color_pixels} ({color_percent:.2f}%)")
                 
             elif mode == "particle_count":
-                # Test particle counting
-                threshold = self.brightness_threshold_spin.value()
                 baseline = np.mean(gray)
-                
-                _, binary = cv2.threshold(gray, baseline + threshold, 255, cv2.THRESH_BINARY)
+                std_dev = np.std(gray)
+
+                if self.particle_threshold_mode_combo.currentIndex() == 0:
+                    threshold_val = baseline + self.particle_brightness_threshold_spin.value()
+                else:
+                    threshold_val = baseline + self.particle_relative_threshold_spin.value() * std_dev
+
+                _, binary = cv2.threshold(gray, threshold_val, 255, cv2.THRESH_BINARY)
                 contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                # Filter by size
-                min_area = self.min_pixels_spin.value()
-                max_area = self.max_pixels_spin.value()
+
+                min_area = self.particle_min_size_spin.value()
+                max_area = self.particle_max_size_spin.value()
                 valid_contours = [c for c in contours if min_area <= cv2.contourArea(c) <= max_area]
                 
                 # Draw contours
@@ -1392,14 +1406,35 @@ class OpticalSensorConfigDialog(QDialog):
         
         return settings
     
+    def _validate_settings(self):
+        """Reject invalid min/max ranges and obviously invalid ROIs."""
+        issues = []
+        if self.min_pixels_spin.value() > self.max_pixels_spin.value():
+            issues.append("Light events: Min pixels cannot exceed max pixels.")
+        if self.particle_min_size_spin.value() > self.particle_max_size_spin.value():
+            issues.append("Particle counter: Min size cannot exceed max size.")
+        if self.rpm_min_hz_spin.value() > self.rpm_max_hz_spin.value():
+            issues.append("RPM: Min frequency cannot exceed max frequency.")
+        if self.roi_width_spin.value() < 1 or self.roi_height_spin.value() < 1:
+            issues.append("Fill level ROI must have positive width and height.")
+        if issues:
+            QMessageBox.warning(self, "Validation Error", "\n".join(issues))
+            return False
+        return True
+
     def _apply_settings(self):
         """Apply settings without closing dialog"""
+        if not self._validate_settings():
+            return
         self.settings = self._collect_settings()
         self.settings_changed.emit(self.settings)
     
     def _ok_clicked(self):
         """OK button clicked - apply and close"""
-        self._apply_settings()
+        if not self._validate_settings():
+            return
+        self.settings = self._collect_settings()
+        self.settings_changed.emit(self.settings)
         self.accept()
     
     def get_settings(self):

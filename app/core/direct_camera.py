@@ -20,6 +20,7 @@ import copy
 from scipy.io import wavfile
 from .motion_detector import MotionDetector
 from .overlay_manager import BaseOverlay
+import threading
 from threading import Thread
 
 # NDI imports are now handled inside methods to avoid driver lock/conflicts
@@ -111,8 +112,15 @@ def get_available_ffmpeg_encoders():
     available.append('cpu')  # CPU is always available
     return available
 
-AVAILABLE_ENCODERS = get_available_ffmpeg_encoders()
-print(f"Available hardware encoders: {AVAILABLE_ENCODERS}")
+AVAILABLE_ENCODERS = None  # Lazily detected on first recording to avoid blocking startup
+
+def get_available_encoders():
+    """Lazy hardware encoder detection (avoids blocking app import/startup)."""
+    global AVAILABLE_ENCODERS
+    if AVAILABLE_ENCODERS is None:
+        AVAILABLE_ENCODERS = get_available_ffmpeg_encoders()
+        print(f"Available hardware encoders: {AVAILABLE_ENCODERS}")
+    return AVAILABLE_ENCODERS
 
 class DirectCameraThread(QThread):
     """Thread for direct camera capture"""
@@ -120,6 +128,7 @@ class DirectCameraThread(QThread):
     frame_captured = pyqtSignal(int, QImage)  # Changed from QPixmap to QImage for thread safety
     status_update = pyqtSignal(int, bool, str)  # Added index, connected, message
     recording_status_signal = pyqtSignal(int, bool)  # Added index, recording status
+    recording_finalized_signal = pyqtSignal(int, str)  # index, output file path
     motion_detected_signal = pyqtSignal(int, bool) # Added index, Signal for motion detection status
     framerate_warning_signal = pyqtSignal(int, float, float)  # Added index, expected_fps, actual_fps
     
@@ -164,6 +173,8 @@ class DirectCameraThread(QThread):
         
         # Recording state
         self.recording = False
+        self.record_width = 0
+        self.record_height = 0
         self.recording_start_time = 0
         self.recording_next_frame_time = 0
         self.output_file = ""
@@ -173,6 +184,7 @@ class DirectCameraThread(QThread):
         self.audio_enabled = False
         self.audio_stream = None
         self.audio_frames = []
+        self._audio_frames_lock = threading.Lock()
         self.audio_sample_rate = 44100
         self.audio_channels = 1
         self.audio_temp_path = ""
@@ -181,7 +193,6 @@ class DirectCameraThread(QThread):
         # Video settings
         self.video_quality = 85  # Default quality
         self.ffmpeg_path = FFMPEG_BINARY
-        self.direct_streaming = True  # Always use direct streaming
         self.use_hw_accel = True  # Default to True as requested
         
         # Overlay settings
@@ -193,6 +204,29 @@ class DirectCameraThread(QThread):
         # Motion detector
         self.motion_detector = MotionDetector()
         self._last_motion_state = False  # Store last motion detection state for overlay
+        self._last_emitted_motion = None  # Only emit motion signal on state change
+        
+        # Recording / overlay options
+        self.record_with_overlays = True
+        self.ffmpeg_process = None
+        self.ffmpeg_err_file = None
+        self._finalize_thread = None
+        self.audio_temp_dir = ""
+        
+        # Pending camera property updates applied in the capture thread (thread-safe)
+        self._pending_camera_props = None
+        self._props_mutex = QMutex()
+        
+        # Soft limit for in-memory audio (~30 min at ~23 chunks/sec)
+        self._max_audio_chunks = 44100 * 60 * 30 // 512
+        self._audio_cap_warned = False
+        
+        # Latest raw frame for snapshots when preview is off (CAM-05)
+        self.latest_frame = None
+        self._latest_frame_mutex = threading.Lock()
+        
+        # Optional shared NDI finder from controller (CAM-06 / CAM-12)
+        self.ndi_finder = None
     
     @staticmethod
     def get_audio_input_devices():
@@ -248,7 +282,15 @@ class DirectCameraThread(QThread):
             if self.isRunning():
                 print("Camera thread already running, stopping for reconnect...")
                 self.running = False
-                self.wait(500)
+                if not self.wait(3000):
+                    print("Warning: previous camera thread did not stop cleanly before reconnect")
+                    self.status_update.emit(
+                        self.index, False,
+                        "Camera reconnect aborted: previous thread did not stop",
+                    )
+                    return False
+                # Thread stopped — safe to release before opening again
+                self._release_capture_devices()
             
             # Reset connection state
             self.connected = False
@@ -359,18 +401,31 @@ class DirectCameraThread(QThread):
                         self.status_update.emit(self.index, False, error_msg)
                         return False
                 else:
-                    # Fallback: try to find by name if only string was provided
-                    finder = NDISourceFinder()
-                    # Give it a moment to discover sources
-                    time.sleep(0.5)
-                    sources = finder.get_sources()
-                    target_source = None
+                    # Fallback: resolve by name via shared finder with retries (CAM-06)
                     clean_name = self.camera_id.replace("NDI:", "").strip()
+                    target_source = None
+                    finder = self.ndi_finder
+                    created_finder = False
+                    if finder is None:
+                        finder = NDISourceFinder()
+                        created_finder = True
                     
-                    for s in sources:
-                        if getattr(s, 'ndi_name', '') == clean_name or str(s) == clean_name:
-                            target_source = s
+                    for attempt in range(3):
+                        sources = finder.get_sources()
+                        for s in sources:
+                            if getattr(s, 'ndi_name', '') == clean_name or str(s) == clean_name:
+                                target_source = s
+                                break
+                        if target_source:
                             break
+                        if attempt < 2:
+                            time.sleep(0.5)
+                    
+                    if created_finder and hasattr(finder, 'stop'):
+                        try:
+                            finder.stop()
+                        except Exception:
+                            pass
                     
                     if target_source and self.ndi_receiver.connect(target_source):
                         self.connected = True
@@ -564,6 +619,34 @@ class DirectCameraThread(QThread):
                 self.cap = None
             return False
     
+    def _release_capture_devices(self):
+        """Release OpenCV/NDI capture handles. Safe to call only when capture loop is stopped."""
+        if self.cap:
+            print("DirectCameraThread: Releasing camera...")
+            try:
+                self.cap.release()
+            except Exception as release_error:
+                print(f"Error releasing camera: {release_error}")
+            self.cap = None
+        
+        if self.ndi_receiver:
+            print("DirectCameraThread: Releasing NDI receiver...")
+            try:
+                self.ndi_receiver.disconnect()
+            except Exception as release_error:
+                print(f"Error releasing NDI: {release_error}")
+            self.ndi_receiver = None
+
+    def _wait_for_finalize(self, timeout_s=20.0):
+        """Wait for background FFmpeg finalize/mux thread if still running."""
+        if self._finalize_thread and self._finalize_thread.is_alive():
+            print(f"DirectCameraThread: Waiting up to {timeout_s}s for recording finalize...")
+            self._finalize_thread.join(timeout=timeout_s)
+            if self._finalize_thread.is_alive():
+                print("DirectCameraThread: Finalize thread still running after timeout")
+            else:
+                self._finalize_thread = None
+
     def disconnect(self):
         """Disconnect from the camera"""
         try:
@@ -579,33 +662,22 @@ class DirectCameraThread(QThread):
             if self.recording:
                 print("DirectCameraThread: Stopping active recording...")
                 self.stop_recording()
+            self._wait_for_finalize(timeout_s=20.0)
             
             # Stop the thread if running
             if self.running:
                 print("DirectCameraThread: Stopping thread...")
                 self.running = False
-                # Wait with timeout to avoid hanging
-                if not self.wait(500):  # Reduced from 5000ms
-                    print("DirectCameraThread: Thread did not stop in time. Releasing camera anyway...")
-                    # Don't use terminate() - it's unsafe and can leave resources in bad state
-                    # Instead, just proceed with cleanup. The thread will exit on next loop iteration.
+                # Wait long enough for the capture loop to exit before releasing devices
+                if not self.wait(3000):
+                    print("DirectCameraThread: Thread did not stop in time; leaving device release to run() cleanup.")
+                    # Do NOT release cap/NDI here while the capture thread may still be reading
+                    self.status_update.emit(self.index, False, "Camera disconnected")
+                    print("DirectCameraThread: Disconnect completed (deferred release)")
+                    return
             
-            # Release camera or NDI
-            if self.cap:
-                print("DirectCameraThread: Releasing camera...")
-                try:
-                    self.cap.release()
-                except Exception as release_error:
-                    print(f"Error releasing camera: {release_error}")
-                self.cap = None
-            
-            if self.ndi_receiver:
-                print("DirectCameraThread: Releasing NDI receiver...")
-                try:
-                    self.ndi_receiver.disconnect()
-                except Exception as release_error:
-                    print(f"Error releasing NDI: {release_error}")
-                self.ndi_receiver = None
+            # Thread stopped — safe to release from this side
+            self._release_capture_devices()
             
             # Emit the final status update
             print("DirectCameraThread: Set connected to False, emitting final status update...")
@@ -622,21 +694,17 @@ class DirectCameraThread(QThread):
     def stop(self):
         """Stop the camera thread"""
         try:
-            # Stop the thread
-            self.running = False
-            self.wait()
-            
-            # Stop recording if active
+            # Stop recording if active first
             if self.recording:
                 self.stop_recording()
-                
-            # Release camera or NDI
-            if self.cap:
-                self.cap.release()
-                self.cap = None
-            if self.ndi_receiver:
-                self.ndi_receiver.disconnect()
-                self.ndi_receiver = None
+            self._wait_for_finalize(timeout_s=20.0)
+
+            # Stop the thread
+            self.running = False
+            if not self.wait(3000):
+                print("DirectCameraThread: stop() timed out waiting for thread; deferred device release")
+            else:
+                self._release_capture_devices()
                 
             # Update state
             self.connected = False
@@ -660,6 +728,7 @@ class DirectCameraThread(QThread):
             self.audio_frames = []
             self.audio_temp_path = ""
             self.audio_enabled = True
+            self._audio_cap_warned = False
             
             self.audio_stream = sd.InputStream(
                 device=self.audio_device_index,
@@ -683,8 +752,20 @@ class DirectCameraThread(QThread):
         try:
             if not self.recording or not self.audio_enabled:
                 return
-            # Copy to avoid referencing the internal buffer
-            self.audio_frames.append(indata.copy())
+            # Soft cap to avoid unbounded RAM growth on very long recordings
+            with self._audio_frames_lock:
+                if len(self.audio_frames) >= self._max_audio_chunks:
+                    if not self._audio_cap_warned:
+                        self._audio_cap_warned = True
+                        msg = (
+                            f"Cam {self.index + 1}: audio buffer cap reached "
+                            f"({self._max_audio_chunks} chunks); further audio dropped"
+                        )
+                        print(f"WARNING: {msg}")
+                        self.status_update.emit(self.index, self.connected, msg)
+                    return
+                # Copy to avoid referencing the internal buffer
+                self.audio_frames.append(indata.copy())
         except Exception as e:
             print(f"Audio callback error: {e}")
     
@@ -699,15 +780,20 @@ class DirectCameraThread(QThread):
             finally:
                 self.audio_stream = None
         
-        if not self.audio_enabled or not self.audio_frames:
+        if not self.audio_enabled:
             return None
         
-        try:
+        with self._audio_frames_lock:
+            if not self.audio_frames:
+                return None
             audio_data = np.concatenate(self.audio_frames, axis=0)
+            self.audio_frames = []
+        
+        try:
             # Convert float32 [-1,1] to int16 PCM
             audio_int16 = np.clip(audio_data * 32767, -32768, 32767).astype(np.int16)
-            temp_dir = tempfile.mkdtemp()
-            self.audio_temp_path = os.path.join(temp_dir, "audio.wav")
+            self.audio_temp_dir = tempfile.mkdtemp(prefix="artefakt_audio_")
+            self.audio_temp_path = os.path.join(self.audio_temp_dir, "audio.wav")
             wavfile.write(self.audio_temp_path, self.audio_sample_rate, audio_int16)
             print(f"Audio captured to {self.audio_temp_path}")
             return self.audio_temp_path
@@ -717,12 +803,30 @@ class DirectCameraThread(QThread):
             self.audio_temp_path = ""
             return None
     
+    def _cleanup_audio_temp(self):
+        """Remove temporary audio files and directory."""
+        import shutil
+        if self.audio_temp_path and os.path.exists(self.audio_temp_path):
+            try:
+                os.remove(self.audio_temp_path)
+            except Exception:
+                pass
+            self.audio_temp_path = ""
+        if self.audio_temp_dir and os.path.isdir(self.audio_temp_dir):
+            try:
+                shutil.rmtree(self.audio_temp_dir, ignore_errors=True)
+            except Exception:
+                pass
+            self.audio_temp_dir = ""
+    
     def _mux_audio_with_video(self, video_path, audio_path, final_path):
         """Mux recorded audio into the video file using FFmpeg."""
         if not video_path or not audio_path:
+            self._cleanup_audio_temp()
             return
         if not os.path.exists(video_path) or not os.path.exists(audio_path):
             print("Mux skipped: video or audio path missing.")
+            self._cleanup_audio_temp()
             return
         
         base, ext = os.path.splitext(final_path)
@@ -771,12 +875,7 @@ class DirectCameraThread(QThread):
                         print(f"Successfully deleted temporary video file on retry: {video_path}")
                     except Exception as e2:
                         print(f"Error: Failed to delete temporary video file {video_path} after retry: {e2}")
-            if audio_path and os.path.exists(audio_path):
-                try:
-                    os.remove(audio_path)
-                    print(f"Cleaned up temporary audio file: {audio_path}")
-                except Exception as e:
-                    print(f"Warning: Could not delete temporary audio file {audio_path}: {e}")
+            self._cleanup_audio_temp()
     
     def run(self):
         """Thread main method - handles connection then captures frames."""
@@ -798,11 +897,15 @@ class DirectCameraThread(QThread):
             start_time = time.time()
             error_count = 0
             max_errors = 5  # Maximum number of consecutive errors before stopping
+            ndi_stall_start = None
             
             # Main capture loop
             while self.running:
                 # Brief sleep to allow other threads to run and prevent tight loops
                 time.sleep(0.001)
+                
+                # Apply pending focus/exposure updates on this thread (OpenCV is not thread-safe)
+                self._apply_pending_camera_props()
                 
                 # Check connection status
                 is_connected = False
@@ -832,9 +935,26 @@ class DirectCameraThread(QThread):
                             frame = None
                             time.sleep(0.1) # Cool down on error
                         
-                        # For NDI, a timeout isn't necessarily a fatal error
+                        # For NDI, track consecutive timeouts and disconnect on stall (CAM-07)
                         if not ret:
-                            # Give UI time to breathe even on timeout
+                            ndi_failures = (
+                                self.ndi_receiver.consecutive_capture_failures()
+                                if hasattr(self.ndi_receiver, 'consecutive_capture_failures')
+                                else 1
+                            )
+                            if ndi_stall_start is None:
+                                ndi_stall_start = time.time()
+                            stall_elapsed = time.time() - ndi_stall_start
+                            if ndi_failures >= 300 or stall_elapsed >= 5.0:
+                                error_msg = (
+                                    f"NDI source stalled "
+                                    f"({ndi_failures} timeouts, {stall_elapsed:.1f}s)"
+                                )
+                                print(error_msg)
+                                self.status_update.emit(self.index, False, error_msg)
+                                self.connected = False
+                                self.running = False
+                                break
                             time.sleep(0.01)
                             continue
                     else:
@@ -843,19 +963,30 @@ class DirectCameraThread(QThread):
                     if ret and frame is not None:
                         # Reset error count on successful frame capture
                         error_count = 0
+                        ndi_stall_start = None
                         
-                        # Sync resolution - especially important for NDI which may not match requested res
+                        # Always cache latest raw frame for snapshots (CAM-05)
+                        self._latest_frame_mutex.acquire()
+                        try:
+                            self.latest_frame = frame.copy()
+                        finally:
+                            self._latest_frame_mutex.release()
+                        
+                        # Sync resolution for display; recording dimensions stay locked at start_recording
                         f_h, f_w = frame.shape[:2]
                         if f_w != self.width or f_h != self.height:
                             if f_w > 0 and f_h > 0:
-                                print(f"Camera resolution changed/mismatch: {self.width}x{self.height} -> {f_w}x{f_h}. Updating...")
+                                print(f"Camera resolution changed/mismatch: {self.width}x{self.height} -> {f_w}x{f_h}. Updating display dims...")
                                 self.width = f_w
                                 self.height = f_h
                         
                         # --- Motion Detection --- START
                         motion_detected = self.motion_detector.process_frame(frame)
-                        self.motion_detected_signal.emit(self.index, motion_detected)
-                        self._last_motion_state = motion_detected  # Store for overlay drawing
+                        self._last_motion_state = motion_detected
+                        # Emit only on state change to avoid automation/UI spam
+                        if motion_detected != self._last_emitted_motion:
+                            self._last_emitted_motion = motion_detected
+                            self.motion_detected_signal.emit(self.index, motion_detected)
                         # --- Motion Detection --- END
                         
                         # Update FPS calculation
@@ -881,8 +1012,20 @@ class DirectCameraThread(QThread):
                         
                         # --- Lazy Overlay Application ---
                         frame_with_overlays = None
-                        if self.recording or self.is_visible:
-                            frame_with_overlays = self.apply_overlays(frame)
+                        need_overlays_for_ui = self.is_visible
+                        need_frame_for_record = self.recording
+                        if need_frame_for_record or need_overlays_for_ui:
+                            if need_frame_for_record and not self.record_with_overlays:
+                                # Record clean frames; still apply overlays for UI preview if visible
+                                record_frame = frame
+                                ui_source = self.apply_overlays(frame) if need_overlays_for_ui else frame
+                                frame_with_overlays = record_frame
+                                preview_source = ui_source
+                            else:
+                                frame_with_overlays = self.apply_overlays(frame)
+                                preview_source = frame_with_overlays
+                        else:
+                            preview_source = None
                         
                         # Store frame if recording
                         if self.recording and frame_with_overlays is not None:
@@ -891,8 +1034,7 @@ class DirectCameraThread(QThread):
                                 if frame_count % 10 == 0:
                                     if self.ffmpeg_process.poll() is not None:
                                         print(f"CRITICAL: FFmpeg process cam{self.index+1} died during recording!")
-                                        self.recording = False
-                                        self.recording_status_signal.emit(self.index, False)
+                                        self._abort_recording("FFmpeg process died during recording")
                                         continue
 
                                 try:
@@ -909,12 +1051,17 @@ class DirectCameraThread(QThread):
                                                 break
                                         
                                         if frames_to_send > 0:
-                                            if not frame_with_overlays.flags['C_CONTIGUOUS']:
-                                                frame_with_overlays = np.ascontiguousarray(frame_with_overlays)
+                                            out_frame = frame_with_overlays
+                                            rw = self.record_width or self.width
+                                            rh = self.record_height or self.height
+                                            if out_frame.shape[1] != rw or out_frame.shape[0] != rh:
+                                                out_frame = cv2.resize(out_frame, (rw, rh), interpolation=cv2.INTER_LINEAR)
+                                            if not out_frame.flags['C_CONTIGUOUS']:
+                                                out_frame = np.ascontiguousarray(out_frame)
                                             
-                                            frame_bytes = frame_with_overlays.tobytes()
+                                            frame_bytes = out_frame.tobytes()
                                             
-                                            expected_size = self.width * self.height * 3
+                                            expected_size = rw * rh * 3
                                             if len(frame_bytes) != expected_size:
                                                 print(f"CRITICAL: Frame byte size mismatch! Got {len(frame_bytes)}, expected {expected_size}. Skipping frame.")
                                             else:
@@ -927,29 +1074,30 @@ class DirectCameraThread(QThread):
                                 except Exception as write_error:
                                     print(f"Error writing frame to FFmpeg: {str(write_error)}")
                                     if "Broken pipe" in str(write_error) or "Invalid argument" in str(write_error) or (hasattr(write_error, 'errno') and write_error.errno == 32):
-                                        self.recording = False
-                                        self.recording_status_signal.emit(self.index, False)
+                                        self._abort_recording(f"FFmpeg write error: {write_error}")
 
                         # --- UI Preview Optimization ---
-                        if self.is_visible and frame_with_overlays is not None:
+                        if self.is_visible and preview_source is not None:
                             effective_fps = self.preview_fps
                             if self.preview_mode == "thumbnail":
                                 effective_fps = min(self.preview_fps, 5)
+                            elif self.preview_mode == "cache":
+                                effective_fps = min(self.preview_fps, 2)
                             
-                            preview_interval = 1.0 / effective_fps
+                            preview_interval = 1.0 / max(1, effective_fps)
                             
                             if current_time - self.last_preview_time >= preview_interval:
                                 self.last_preview_time = current_time
                                 try:
-                                    ui_frame = frame_with_overlays
-                                    if self.preview_mode in ["dashboard", "thumbnail"] and self.width > 640:
+                                    ui_frame = preview_source
+                                    if self.preview_mode in ["dashboard", "thumbnail", "cache"] and self.width > 640:
                                         new_w = 640
                                         new_h = int(640 * self.height / self.width)
-                                        ui_frame = cv2.resize(frame_with_overlays, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                                        ui_frame = cv2.resize(preview_source, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
                                     elif self.preview_mode == "active" and self.width > 1280:
                                         new_w = 1280
                                         new_h = int(1280 * self.height / self.width)
-                                        ui_frame = cv2.resize(frame_with_overlays, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                                        ui_frame = cv2.resize(preview_source, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
                                     rgb_frame = cv2.cvtColor(ui_frame, cv2.COLOR_BGR2RGB)
                                     h, w, ch = rgb_frame.shape
@@ -982,10 +1130,8 @@ class DirectCameraThread(QThread):
                     error_count += 1
                     time.sleep(0.05)  # Brief delay only on error (reduced from 0.1)
             
-            # Thread is ending
-            if self.cap:
-                self.cap.release()
-                self.cap = None
+            # Thread is ending — always release devices here
+            self._release_capture_devices()
             
             self.connected = False
             print("Camera thread stopped")
@@ -997,19 +1143,23 @@ class DirectCameraThread(QThread):
             print("Camera thread traceback:")
             traceback.print_exc()
             self.connected = False
+            try:
+                self._release_capture_devices()
+            except Exception:
+                pass
             self.status_update.emit(self.index, False, f"Camera thread error: {str(e)}")
     
-    def start_recording(self, output_dir=None, filename=None, codec=None, use_direct_streaming=None, record_audio=True, audio_device_index=None, use_hw_accel=None):
-        """Start recording video (optionally with audio)
+    def start_recording(self, output_dir=None, filename=None, codec=None, record_audio=True, audio_device_index=None, use_hw_accel=None, record_with_overlays=None):
+        """Start recording video via direct FFmpeg streaming (optionally with audio).
         
         Args:
             output_dir: Directory to save the recording
             filename: Name of the output file (if None, will be generated)
             codec: Video codec to use (if None, will use default)
-            use_direct_streaming: Whether to use direct FFmpeg streaming
             record_audio: Whether to capture microphone audio
             audio_device_index: Index of the audio device to use (if None, use default)
             use_hw_accel: Whether to use hardware acceleration
+            record_with_overlays: Whether to burn overlays into the recorded video
         """
         if not self.connected:
             print("Start recording failed: Camera not connected.")
@@ -1032,11 +1182,17 @@ class DirectCameraThread(QThread):
             self.recording_status_signal.emit(self.index, True) 
             return True  # Already recording
         
-        print(f"Attempting to start recording. Received use_direct_streaming flag: {use_direct_streaming}")
+        print("Attempting to start recording (direct FFmpeg streaming).")
         
         try:
-            # Set audio device index
-            self.audio_device_index = audio_device_index
+            # Wait for any previous finalize to finish before starting a new recording
+            self._wait_for_finalize(timeout_s=15.0)
+
+            # Set audio device index (-1 / invalid means default device)
+            if audio_device_index is not None and int(audio_device_index) < 0:
+                self.audio_device_index = None
+            else:
+                self.audio_device_index = audio_device_index
             
             # Set output directory
             if output_dir:
@@ -1065,16 +1221,14 @@ class DirectCameraThread(QThread):
             # Set audio preference (actual availability checked later)
             self.record_audio = bool(record_audio)
             self.audio_enabled = self.record_audio
-                
-            # Set direct streaming option based on argument received
-            if use_direct_streaming is not None:
-                self.direct_streaming = bool(use_direct_streaming)
-            print(f"Internal direct_streaming flag set to: {self.direct_streaming}")
 
             # Set hardware acceleration option
             if use_hw_accel is not None:
                 self.use_hw_accel = bool(use_hw_accel)
             print(f"Internal use_hw_accel flag set to: {self.use_hw_accel}")
+
+            if record_with_overlays is not None:
+                self.record_with_overlays = bool(record_with_overlays)
             
             # Determine actual video target path (temp file if muxing later)
             base, ext = os.path.splitext(self.output_file)
@@ -1088,7 +1242,13 @@ class DirectCameraThread(QThread):
                 started = self._start_audio_capture()
                 if not started:
                     self.audio_enabled = False
+                    # No mux temp needed if audio failed
+                    self.video_output_path = self.output_file
                     print("Audio capture could not be started; continuing with video-only recording.")
+            
+            # Lock recording dimensions for FFmpeg (display dims may change mid-recording)
+            self.record_width = self.width
+            self.record_height = self.height
             
             # --- Start Direct FFmpeg Streaming --- 
             recording_started_successfully = False
@@ -1117,6 +1277,10 @@ class DirectCameraThread(QThread):
                 print("Recording failed to start.")
                 self.recording = False
                 self.ffmpeg_process = None
+                if self.audio_enabled:
+                    self._stop_audio_capture()
+                    self._cleanup_audio_temp()
+                self.audio_enabled = False
                 self.recording_status_signal.emit(self.index, False)
                 return False
                 
@@ -1131,9 +1295,10 @@ class DirectCameraThread(QThread):
     def _start_direct_ffmpeg_streaming(self):
         """Start streaming frames directly to FFmpeg with automatic fallback"""
         try:
-            width = self.width
-            height = self.height
+            width = self.record_width or self.width
+            height = self.record_height or self.height
             fps = self.fps
+            available = get_available_encoders()
             
             # Get file extension from output file
             _, ext = os.path.splitext(self.output_file)
@@ -1145,7 +1310,7 @@ class DirectCameraThread(QThread):
             
             # 1. GPU Encoders (if enabled)
             if self.use_hw_accel:
-                if 'nvidia' in AVAILABLE_ENCODERS:
+                if 'nvidia' in available:
                     configs.append({
                         'name': 'nvidia',
                         'codec': 'h264_nvenc',
@@ -1160,7 +1325,7 @@ class DirectCameraThread(QThread):
                             "-profile:v", "high"
                         ]
                     })
-                if 'intel' in AVAILABLE_ENCODERS:
+                if 'intel' in available:
                     configs.append({
                         'name': 'intel',
                         'codec': 'h264_qsv',
@@ -1171,7 +1336,7 @@ class DirectCameraThread(QThread):
                             "-bf", "0"
                         ]
                     })
-                if 'amd' in AVAILABLE_ENCODERS:
+                if 'amd' in available:
                     configs.append({
                         'name': 'amd',
                         'codec': 'h264_amf',
@@ -1182,7 +1347,7 @@ class DirectCameraThread(QThread):
                             "-bf", "0"
                         ]
                     })
-                if 'windows' in AVAILABLE_ENCODERS:
+                if 'windows' in available:
                     configs.append({
                         'name': 'windows',
                         'codec': 'h264_mf',
@@ -1211,6 +1376,7 @@ class DirectCameraThread(QThread):
             last_error = ""
 
             for config in configs:
+                err_file = None
                 try:
                     # Input options (MUST come before -i)
                     cmd = [
@@ -1257,6 +1423,7 @@ class DirectCameraThread(QThread):
                     else:
                         # Process died
                         err_file.close()
+                        err_file = None
                         with open(log_path, "r") as f:
                             error_text = f.read()
                         print(f"Encoder {config['codec']} failed to start. Error: {error_text[:100]}...")
@@ -1264,6 +1431,11 @@ class DirectCameraThread(QThread):
                 except Exception as e:
                     print(f"Error trying encoder {config['codec']}: {e}")
                     last_error = str(e)
+                    if err_file:
+                        try:
+                            err_file.close()
+                        except Exception:
+                            pass
 
             # If we get here, no encoder worked
             raise Exception(f"All FFmpeg encoders failed to start. Last error: {last_error}")
@@ -1274,6 +1446,198 @@ class DirectCameraThread(QThread):
             self.recording_status_signal.emit(self.index, False)
             raise e 
     
+    def _recording_file_ok(self, path):
+        """Return True if path points to a non-empty recording file."""
+        return bool(path) and os.path.exists(path) and os.path.getsize(path) > 0
+
+    def _run_recording_finalize(
+        self,
+        ffmpeg_proc,
+        video_path,
+        output_file,
+        audio_path,
+        audio_was_enabled,
+        err_file,
+        cam_index,
+        graceful=True,
+        abort_reason=None,
+    ):
+        """Finalize FFmpeg encoding/mux and emit success only when output is valid."""
+        encode_ok = False
+        try:
+            if ffmpeg_proc:
+                if graceful:
+                    print("Closing FFmpeg stdin...")
+                    if ffmpeg_proc.stdin:
+                        ffmpeg_proc.stdin.close()
+
+                    print("Waiting for FFmpeg process to finish...")
+                    try:
+                        stdout, stderr = ffmpeg_proc.communicate(timeout=15)
+                        if ffmpeg_proc.returncode == 0:
+                            encode_ok = True
+                            print("FFmpeg encoding completed successfully.")
+                            print(f"Recording saved to {video_path}")
+                        else:
+                            error_output = stderr.decode(errors='ignore') if stderr else 'None'
+                            print(f"FFmpeg error (returncode {ffmpeg_proc.returncode}):")
+                            print(f"FFmpeg stderr: {error_output}")
+                    except Exception as comm_error:
+                        print(f"FFmpeg communication timeout/error: {comm_error}")
+                        try:
+                            ffmpeg_proc.terminate()
+                            ffmpeg_proc.wait(timeout=5)
+                        except Exception:
+                            try:
+                                ffmpeg_proc.kill()
+                            except Exception:
+                                pass
+                else:
+                    try:
+                        if ffmpeg_proc.stdin:
+                            ffmpeg_proc.stdin.close()
+                    except Exception:
+                        pass
+                    if ffmpeg_proc.poll() is None:
+                        try:
+                            ffmpeg_proc.terminate()
+                            ffmpeg_proc.wait(timeout=3)
+                        except Exception:
+                            try:
+                                ffmpeg_proc.kill()
+                            except Exception:
+                                pass
+                    encode_ok = self._recording_file_ok(video_path)
+                    if encode_ok:
+                        print(f"Partial recording may be salvaged at {video_path}")
+                    else:
+                        print("Recording aborted with no usable output file.")
+            else:
+                encode_ok = self._recording_file_ok(video_path)
+
+            if err_file:
+                try:
+                    err_file.close()
+                except Exception:
+                    pass
+
+            if encode_ok and audio_path and audio_was_enabled:
+                self._mux_audio_with_video(video_path, audio_path, output_file)
+            elif audio_path:
+                self._cleanup_audio_temp()
+
+            if self._recording_file_ok(output_file):
+                self.recording_finalized_signal.emit(cam_index, output_file)
+            else:
+                reason = abort_reason or "encode/mux failed or output file missing"
+                print(f"Recording finalize failed for cam{cam_index + 1}: {reason}")
+                self.status_update.emit(
+                    cam_index,
+                    self.connected,
+                    f"Recording failed: {reason}",
+                )
+        except Exception as e:
+            print(f"Error in FFmpeg finalization thread: {str(e)}")
+            traceback.print_exc()
+            reason = abort_reason or str(e)
+            self.status_update.emit(
+                cam_index,
+                self.connected,
+                f"Recording failed: {reason}",
+            )
+
+    def _start_recording_finalize_thread(
+        self,
+        ffmpeg_proc,
+        video_path,
+        output_file,
+        audio_path,
+        audio_was_enabled,
+        err_file,
+        graceful=True,
+        abort_reason=None,
+    ):
+        """Run recording finalization in a background thread."""
+        cam_index = self.index
+
+        def finalize_ffmpeg():
+            self._run_recording_finalize(
+                ffmpeg_proc,
+                video_path,
+                output_file,
+                audio_path,
+                audio_was_enabled,
+                err_file,
+                cam_index,
+                graceful=graceful,
+                abort_reason=abort_reason,
+            )
+
+        self._finalize_thread = Thread(target=finalize_ffmpeg, daemon=False)
+        self._finalize_thread.start()
+
+    def _finish_recording(self, audio_path, audio_was_enabled, graceful=True, abort_reason=None):
+        """Shared teardown for normal stop and abnormal abort."""
+        if graceful:
+            print("Processing stop for direct streaming mode.")
+        else:
+            print(f"Aborting recording on cam{self.index + 1}: {abort_reason}")
+
+        ffmpeg_proc = getattr(self, 'ffmpeg_process', None)
+        video_path = getattr(self, 'video_output_path', None)
+        output_file = getattr(self, 'output_file', None)
+        err_file = getattr(self, 'ffmpeg_err_file', None)
+
+        if ffmpeg_proc:
+            self._start_recording_finalize_thread(
+                ffmpeg_proc,
+                video_path,
+                output_file,
+                audio_path,
+                audio_was_enabled,
+                err_file,
+                graceful=graceful,
+                abort_reason=abort_reason,
+            )
+            self.ffmpeg_process = None
+            self.ffmpeg_err_file = None
+        else:
+            print("No ffmpeg_process found during recording teardown.")
+            if audio_path:
+                self._cleanup_audio_temp()
+            if self._recording_file_ok(output_file):
+                self.recording_finalized_signal.emit(self.index, output_file)
+            elif abort_reason:
+                print(f"Recording aborted: {abort_reason}")
+                self.status_update.emit(
+                    self.index,
+                    self.connected,
+                    f"Recording failed: {abort_reason}",
+                )
+
+        self.recording_status_signal.emit(self.index, False)
+        self.audio_enabled = False
+
+    def _abort_recording(self, reason):
+        """Abort an in-progress recording after FFmpeg failure."""
+        if not self.recording:
+            return
+
+        self.recording = False
+        self.framerate_warning_shown = False
+
+        audio_path = None
+        audio_was_enabled = self.audio_enabled
+        if audio_was_enabled:
+            audio_path = self._stop_audio_capture()
+
+        self._finish_recording(
+            audio_path=audio_path,
+            audio_was_enabled=audio_was_enabled,
+            graceful=False,
+            abort_reason=reason,
+        )
+
     def stop_recording(self):
         """Stop recording and save the video file"""
         if not self.recording:
@@ -1291,72 +1655,15 @@ class DirectCameraThread(QThread):
         
         # Stop audio capture and save to temp if enabled
         audio_path = None
-        if self.audio_enabled:
+        audio_was_enabled = self.audio_enabled
+        if audio_was_enabled:
             audio_path = self._stop_audio_capture()
         
-        # --- Handle Direct Streaming Finalization ---            
-        print("Processing stop for direct streaming mode.")
-        if hasattr(self, 'ffmpeg_process') and self.ffmpeg_process:
-            # Run FFmpeg finalization in a separate thread to avoid blocking
-            ffmpeg_proc = self.ffmpeg_process
-            video_path = self.video_output_path
-            output_file = self.output_file
-            audio_enabled = self.audio_enabled
-            
-            def finalize_ffmpeg():
-                try:
-                    # Close stdin pipe to signal end of input to FFmpeg
-                    print("Closing FFmpeg stdin...")
-                    if ffmpeg_proc.stdin:
-                        ffmpeg_proc.stdin.close()
-                    
-                    # Wait for FFmpeg to finish (with timeout)
-                    print("Waiting for FFmpeg process to finish...")
-                    try:
-                        stdout, stderr = ffmpeg_proc.communicate(timeout=15)
-                        
-                        if ffmpeg_proc.returncode == 0:
-                            print(f"FFmpeg encoding completed successfully.")
-                            print(f"Recording saved to {video_path}")
-                        else:
-                            error_output = stderr.decode(errors='ignore') if stderr else 'None'
-                            print(f"FFmpeg error (returncode {ffmpeg_proc.returncode}):")
-                            print(f"FFmpeg stderr: {error_output}")
-                    except Exception as comm_error:
-                        print(f"FFmpeg communication timeout/error: {comm_error}")
-                        try:
-                            ffmpeg_proc.terminate()
-                            ffmpeg_proc.wait(timeout=5)
-                        except Exception:
-                            pass
-                    
-                    # Close the error log file if it was opened
-                    if hasattr(self, 'ffmpeg_err_file'):
-                        try:
-                            self.ffmpeg_err_file.close()
-                            delattr(self, 'ffmpeg_err_file')
-                        except: pass
-
-                    # Mux audio if recorded and paths are available
-                    if audio_path and audio_enabled:
-                        self._mux_audio_with_video(video_path, audio_path, output_file)
-                        
-                except Exception as e:
-                    print(f"Error in FFmpeg finalization thread: {str(e)}")
-                    traceback.print_exc()
-            
-            # Start finalization in background thread
-            finalize_thread = Thread(target=finalize_ffmpeg, daemon=True)
-            finalize_thread.start()
-            
-            # Clean up process reference
-            self.ffmpeg_process = None
-        else:
-            print("No ffmpeg_process found during stop.")
-
-        # Emit signal that recording has stopped
-        self.recording_status_signal.emit(self.index, False)
-        self.audio_enabled = False
+        self._finish_recording(
+            audio_path=audio_path,
+            audio_was_enabled=audio_was_enabled,
+            graceful=True,
+        )
     
     def set_preview_fps(self, fps):
         """Set the maximum FPS for the UI preview"""
@@ -1378,11 +1685,6 @@ class DirectCameraThread(QThread):
         self.video_quality = max(0, min(100, int(quality)))
         print(f"Video quality set to {self.video_quality}%")
     
-    def enable_direct_streaming(self, enabled):
-        """Enable or disable direct streaming to FFmpeg"""
-        self.direct_streaming = bool(enabled)
-        print(f"Direct streaming {'enabled' if self.direct_streaming else 'disabled'}")
-    
     def set_ffmpeg_binary(self, binary_path):
         """Set the path to FFmpeg binary"""
         if os.path.exists(binary_path):
@@ -1402,6 +1704,16 @@ class DirectCameraThread(QThread):
     def get_actual_fps(self):
         """Get actual FPS being achieved"""
         return self.actual_fps
+    
+    def get_latest_frame(self):
+        """Return a copy of the latest captured BGR frame, or None."""
+        self._latest_frame_mutex.acquire()
+        try:
+            if self.latest_frame is None:
+                return None
+            return self.latest_frame.copy()
+        finally:
+            self._latest_frame_mutex.release()
     
     def set_overlays(self, overlays):
         """Set the overlays to be applied to frames (thread-safe)"""
@@ -1428,12 +1740,14 @@ class DirectCameraThread(QThread):
         try:
             # Thread-safe access to overlays
             self.overlay_mutex.lock()
-            if self._overlays_changed:
-                # Cache the overlays if they changed
-                self._cached_overlays = copy.deepcopy(self.overlays)
-                self._overlays_changed = False
-            current_overlays = self._cached_overlays
-            self.overlay_mutex.unlock()
+            try:
+                if self._overlays_changed:
+                    # Cache the overlays if they changed
+                    self._cached_overlays = copy.deepcopy(self.overlays)
+                    self._overlays_changed = False
+                current_overlays = self._cached_overlays
+            finally:
+                self.overlay_mutex.unlock()
             
             # Apply each overlay using its specific draw method
             for overlay in current_overlays:
@@ -1471,38 +1785,62 @@ class DirectCameraThread(QThread):
             self._overlays_changed = True
         self.overlay_mutex.unlock() 
 
-    def set_camera_properties(self, manual_focus=None, focus_value=None, manual_exposure=None, exposure_value=None):
-        """Set camera focus and exposure properties"""
+    def _apply_pending_camera_props(self):
+        """Apply queued focus/exposure updates on the capture thread."""
+        self._props_mutex.lock()
+        pending = self._pending_camera_props
+        self._pending_camera_props = None
+        self._props_mutex.unlock()
+        
+        if not pending or not self.cap or not self.connected or self.is_ndi:
+            return
+        
         try:
+            if pending.get('apply_focus'):
+                if self.manual_focus:
+                    self._apply_focus_settings()
+                else:
+                    self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+            if pending.get('apply_exposure'):
+                if self.manual_exposure:
+                    self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+                    self.cap.set(cv2.CAP_PROP_EXPOSURE, self.exposure_value)
+                else:
+                    self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+        except Exception as e:
+            print(f"Error applying pending camera properties: {e}")
+
+    def set_camera_properties(self, manual_focus=None, focus_value=None, manual_exposure=None, exposure_value=None):
+        """Set camera focus and exposure properties (applied on capture thread)."""
+        try:
+            apply_focus = False
+            apply_exposure = False
+
             if manual_focus is not None:
                 self.manual_focus = manual_focus
+                apply_focus = True
             
             if focus_value is not None:
                 # Clamp to typical DirectShow range
                 self.focus_value = max(0, min(255, int(focus_value)))
+                apply_focus = True
             
             if manual_exposure is not None:
                 self.manual_exposure = manual_exposure
+                apply_exposure = True
             
             if exposure_value is not None:
                 self.exposure_value = exposure_value
+                apply_exposure = True
             
-            # Apply settings if camera is connected
-            if self.cap and self.connected:
-                # Apply focus settings
-                if manual_focus is not None or focus_value is not None:
-                    if self.manual_focus:
-                        self._apply_focus_settings()
-                    else:
-                        self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)  # Enable autofocus
-                
-                # Apply exposure settings
-                if manual_exposure is not None:
-                    if self.manual_exposure:
-                        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Manual exposure (0.25 is the magic value for manual)
-                        self.cap.set(cv2.CAP_PROP_EXPOSURE, self.exposure_value)
-                    else:
-                        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)  # Auto exposure (0.75 is the magic value for auto)
+            # Queue OpenCV property writes for the capture thread (applied when connected)
+            if apply_focus or apply_exposure:
+                self._props_mutex.lock()
+                existing = self._pending_camera_props or {}
+                existing['apply_focus'] = existing.get('apply_focus', False) or apply_focus
+                existing['apply_exposure'] = existing.get('apply_exposure', False) or apply_exposure
+                self._pending_camera_props = existing
+                self._props_mutex.unlock()
             
             print(f"Camera properties set: manual focus={self.manual_focus}, focus value={self.focus_value}, "
                   f"manual exposure={self.manual_exposure}, exposure value={self.exposure_value}")

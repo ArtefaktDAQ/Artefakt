@@ -69,7 +69,7 @@ class LabJackDataThread(QThread):
             # Sync thread attributes to interface before connecting if they changed from UI
             self._labjack_interface.device_type = self.device_type
             self._labjack_interface.connection_type = self.connection_type
-            self._labjack_interface.identifier = self.port
+            self._labjack_interface.port = self.port
             self._labjack_interface.auto_reconnect = self.auto_reconnect
             
             print(f"DEBUG LabJackThread: Attempting connection to {self.device_type} via {self.connection_type} ({self.port})...")
@@ -106,14 +106,14 @@ class LabJackDataThread(QThread):
         if self.isRunning():
             # Wait briefly for the run loop to exit to avoid concurrent access on reconnect
             self.wait(2000)
-        if self._labjack_interface and self._connected:
+        if self._labjack_interface:
             try:
                 self._labjack_interface.disconnect()
                 print("DEBUG LabJackThread: Interface disconnected.")
             except Exception as e:
-                 error_msg = f"LabJackThread disconnect error: {e}"
-                 print(f"ERROR: {error_msg}")
-                 self.error_signal.emit(error_msg)
+                error_msg = f"LabJackThread disconnect error: {e}"
+                print(f"ERROR: {error_msg}")
+                self.error_signal.emit(error_msg)
         self._connected = False
         self.connection_status_signal.emit(False, "Disconnected")
 
@@ -181,6 +181,11 @@ class LabJackDataThread(QThread):
                         continue
                 else:
                     print("DEBUG LabJackThread: Exiting run loop - not connected.")
+                    try:
+                        self._labjack_interface.disconnect()
+                    except Exception as e:
+                        print(f"ERROR: LabJackThread disconnect on connection loss: {e}")
+                    self._connected = False
                     self.connection_status_signal.emit(False, "Connection lost")
                     break
 

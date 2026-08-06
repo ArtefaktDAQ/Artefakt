@@ -18,12 +18,33 @@ try:
     # Option 1: Try the 'ndi' module (from common versions of ndi-python)
     import ndi
     from ndi import (
-        finder, send, recv, 
+        finder, send, recv,
         timecode_from_time, VideoFrameV2, FrameFormatType, Create,
         find_create_v2, find_get_current_sources, find_destroy,
         recv_create_v3, recv_connect, recv_capture_v2, recv_destroy,
         recv_free_video_v2, FRAME_TYPE_VIDEO
     )
+    FRAME_TYPE_NONE = getattr(ndi, 'FRAME_TYPE_NONE', 0)
+    FRAME_TYPE_AUDIO = getattr(ndi, 'FRAME_TYPE_AUDIO', None)
+    FRAME_TYPE_METADATA = getattr(ndi, 'FRAME_TYPE_METADATA', None)
+    recv_free_audio_v2 = getattr(ndi, 'recv_free_audio_v2', None)
+    recv_free_audio_v3 = getattr(ndi, 'recv_free_audio_v3', None)
+    recv_free_metadata = getattr(ndi, 'recv_free_metadata', None)
+
+    _ndi_initialized = False
+
+    def ensure_ndilib_initialized():
+        """Initialize the ndi module once before any NDI API calls."""
+        global _ndi_initialized
+        if not _ndi_initialized:
+            if hasattr(ndi, 'initialize'):
+                if not ndi.initialize():
+                    logger.error("Failed to initialize NDI")
+                    return False
+                logger.info("NDI initialized successfully")
+            _ndi_initialized = True
+        return True
+
     NDI_AVAILABLE = True
     logger.info("NDI module 'ndi' found and imported successfully.")
 except ImportError:
@@ -45,7 +66,13 @@ except ImportError:
         recv_destroy = NDIlib.recv_destroy
         recv_free_video_v2 = NDIlib.recv_free_video_v2
         FRAME_TYPE_VIDEO = NDIlib.FRAME_TYPE_VIDEO
-        
+        FRAME_TYPE_NONE = getattr(NDIlib, 'FRAME_TYPE_NONE', 0)
+        FRAME_TYPE_AUDIO = getattr(NDIlib, 'FRAME_TYPE_AUDIO', None)
+        FRAME_TYPE_METADATA = getattr(NDIlib, 'FRAME_TYPE_METADATA', None)
+        recv_free_audio_v2 = getattr(NDIlib, 'recv_free_audio_v2', None)
+        recv_free_audio_v3 = getattr(NDIlib, 'recv_free_audio_v3', None)
+        recv_free_metadata = getattr(NDIlib, 'recv_free_metadata', None)
+
         # Compatibility wrappers
         def timecode_from_time():
             return NDIlib.SEND_TIMECODE_SYNTHESIZE
@@ -127,6 +154,46 @@ except ImportError:
         recv_destroy = lambda x: None
         recv_free_video_v2 = lambda x, y: None
         FRAME_TYPE_VIDEO = 1
+        FRAME_TYPE_NONE = 0
+        FRAME_TYPE_AUDIO = None
+        FRAME_TYPE_METADATA = None
+        recv_free_audio_v2 = None
+        recv_free_audio_v3 = None
+        recv_free_metadata = None
+
+        def ensure_ndilib_initialized():
+            return False
+
+
+def _recv_capture(receiver, timeout_ms):
+    """Call recv_capture_v2, requesting video only when the API supports it."""
+    try:
+        return recv_capture_v2(receiver, timeout_ms, True, False, False)
+    except TypeError:
+        return recv_capture_v2(receiver, timeout_ms)
+
+
+def _free_recv_buffers(receiver, video_data=None, audio_data=None, metadata_data=None,
+                       free_video=True):
+    """Release buffers returned by recv_capture_v2 to avoid SDK leaks."""
+    if free_video and video_data is not None:
+        try:
+            recv_free_video_v2(receiver, video_data)
+        except Exception as e:
+            logger.debug(f"recv_free_video_v2 failed: {e}")
+    if audio_data is not None:
+        try:
+            if recv_free_audio_v3 is not None:
+                recv_free_audio_v3(receiver, audio_data)
+            elif recv_free_audio_v2 is not None:
+                recv_free_audio_v2(receiver, audio_data)
+        except Exception as e:
+            logger.debug(f"recv_free_audio failed: {e}")
+    if metadata_data is not None and recv_free_metadata is not None:
+        try:
+            recv_free_metadata(receiver, metadata_data)
+        except Exception as e:
+            logger.debug(f"recv_free_metadata failed: {e}")
 
 
 class NDIInterface:
@@ -222,8 +289,8 @@ class NDIInterface:
                 # Convert BGR to BGRA if necessary (NDI typically requires BGRA)
                 if frame.shape[2] == 3:  # BGR
                     self._last_frame_bgra = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
-                elif frame.shape[2] == 4: # Assume BGRA
-                    self._last_frame_bgra = frame # Use directly, avoid copy if possible
+                elif frame.shape[2] == 4:  # Assume BGRA
+                    self._last_frame_bgra = frame.copy()
                 else:
                     logger.error(f"Unsupported frame format: {frame.shape}")
                     return False
@@ -253,10 +320,7 @@ class NDIInterface:
             frame_to_send = None
             with self._frame_lock:
                 if self._last_frame_bgra is not None:
-                    # Create a copy to send, releasing the lock quicker
-                    frame_to_send = self._last_frame_bgra
-                    # Optionally clear self._last_frame_bgra if we only want to send new frames
-                    # self._last_frame_bgra = None
+                    frame_to_send = self._last_frame_bgra.copy()
 
             if frame_to_send is not None:
                 try:
@@ -396,6 +460,7 @@ class NDIReceiver:
         self.source_name = source_name
         self._receiver = None
         self._connected = False
+        self._consecutive_capture_failures = 0
 
     def connect(self, source):
         """Connects to a specific NDI source.
@@ -409,13 +474,15 @@ class NDIReceiver:
         try:
             if self._receiver:
                 self.disconnect()
-            
+
+            ensure_ndilib_initialized()
             self._receiver = recv_create_v3()
             if not self._receiver:
                 return False
             
             recv_connect(self._receiver, source)
             self._connected = True
+            self._consecutive_capture_failures = 0
             # Use ndi_name which is often available on the source object
             self.source_name = getattr(source, 'ndi_name', str(source))
             logger.info(f"Connected to NDI source: {self.source_name}")
@@ -433,6 +500,7 @@ class NDIReceiver:
                 pass
             self._receiver = None
         self._connected = False
+        self._consecutive_capture_failures = 0
         logger.info(f"Disconnected from NDI source: {self.source_name}")
 
     def capture_frame(self, timeout_ms=1000):
@@ -441,38 +509,56 @@ class NDIReceiver:
             return None
 
         try:
-            # capture video, audio, metadata
-            frame_type, video_data, audio_data, metadata_data = recv_capture_v2(self._receiver, timeout_ms)
-            
-            if frame_type != 0: # 0 is usually FRAME_TYPE_NONE
-                 # Only log non-none frames to avoid spamming
-                 logger.debug(f"Captured NDI frame type: {frame_type}")
+            deadline = time.perf_counter() + timeout_ms / 1000.0
+            while True:
+                remaining_ms = max(1, int((deadline - time.perf_counter()) * 1000))
+                frame_type, video_data, audio_data, metadata_data = _recv_capture(
+                    self._receiver, remaining_ms
+                )
 
-            if frame_type == FRAME_TYPE_VIDEO:
-                # video_data.data is a numpy array (BGRA)
-                if video_data is None or video_data.data is None:
-                    logger.error("NDI Video frame captured but data is None")
+                if frame_type == FRAME_TYPE_NONE:
+                    self._consecutive_capture_failures += 1
                     return None
-                    
-                frame = np.copy(video_data.data)
-                # Free the frame back to the NDI SDK
-                recv_free_video_v2(self._receiver, video_data)
-                
-                # Convert BGRA to BGR if needed (most of our app uses BGR)
-                if frame is not None and frame.shape[2] == 4:
-                    return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                return frame
-            
-            # If we got audio or metadata, we still want to free them if the SDK requires it
-            # (though our current Dummy/NDIlib wrapper might not handle audio_free yet)
-            
-            return None
+
+                if frame_type == FRAME_TYPE_VIDEO:
+                    if video_data is None or video_data.data is None:
+                        logger.error("NDI video frame captured but data is None")
+                        _free_recv_buffers(
+                            self._receiver, video_data, audio_data, metadata_data
+                        )
+                        self._consecutive_capture_failures += 1
+                        return None
+
+                    frame = np.copy(video_data.data)
+                    _free_recv_buffers(
+                        self._receiver, video_data, audio_data, metadata_data
+                    )
+
+                    self._consecutive_capture_failures = 0
+                    if frame.shape[2] == 4:
+                        return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                    return frame
+
+                logger.debug(f"Captured non-video NDI frame type: {frame_type}")
+                _free_recv_buffers(
+                    self._receiver, video_data, audio_data, metadata_data
+                )
+
+                if time.perf_counter() >= deadline:
+                    self._consecutive_capture_failures += 1
+                    return None
         except Exception as e:
             logger.error(f"Error capturing NDI frame: {e}")
+            self._consecutive_capture_failures += 1
             return None
 
     def is_connected(self):
+        # Connection state only; consecutive timeout handling lives in direct_camera (CAM-07).
         return self._connected
+
+    def consecutive_capture_failures(self) -> int:
+        """Number of consecutive capture_frame calls that did not return video."""
+        return self._consecutive_capture_failures
 
     def __del__(self):
         self.disconnect()

@@ -19,6 +19,7 @@ class InterfaceConfigDialog(QDialog):
     
     def __init__(self, parent=None, interface_class=None, interface_instance=None, config=None):
         super().__init__(parent)
+        self.parent_window = parent
         self.interface_class = interface_class
         self.interface_instance = interface_instance
         self.config = config or {}
@@ -550,6 +551,11 @@ class InterfaceConfigDialog(QDialog):
                 merged_config[key] = widget.text()
                 
         return merged_config
+
+    def closeEvent(self, event):
+        if hasattr(self, 'refresh_timer') and self.refresh_timer:
+            self.refresh_timer.stop()
+        super().closeEvent(event)
 
     def _get_available_sensors_html(self):
         """Try to find and list all available sensor keys from the system."""

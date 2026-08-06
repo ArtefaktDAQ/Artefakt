@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTime
 from app.ui.theme import GroupBoxStyles, DialogStyles, TableStyles
 from app.models.automation import (  # Adjusted import
+    BaseTrigger, BaseAction,
     TimeDurationTrigger, TimeSpecificTrigger, SensorValueTrigger, EventTrigger,
     OpticalEventTrigger, AudioEventTrigger, CompoundTrigger,
     ArduinoCommandAction, LabJackCommandAction, SerialCommandAction, PluginCommandAction, SystemAction,
@@ -39,6 +40,7 @@ class TriggerDialog(QDialog):
         self.setStyleSheet(DialogStyles.dark_dialog())
         self.trigger = trigger
         self.sensors = sensors or []
+        self.compound_extra_triggers = []
         
         self.setup_ui()
         
@@ -218,14 +220,7 @@ class TriggerDialog(QDialog):
         self.optical_sensor_name = QComboBox()
         # Filter sensors to show only optical sensors
         self.optical_sensors = [s for s in self.sensors if hasattr(s, 'interface_type') and s.interface_type == 'OpticalSensor']
-        
-        if not self.optical_sensors:
-            # Fallback if no proper SensorModel objects found
-            optical_sensor_names = [str(s) for s in self.sensors if 'Optical' in str(s) or 'optical' in str(s).lower()]
-            if not optical_sensor_names:
-                optical_sensor_names = [s.name if hasattr(s, 'name') else str(s) for s in self.sensors]
-            self.optical_sensor_name.addItems(optical_sensor_names)
-        else:
+        if self.optical_sensors:
             self.optical_sensor_name.addItems([s.name for s in self.optical_sensors])
             
         self.optical_sensor_name.currentTextChanged.connect(self._on_optical_sensor_changed)
@@ -528,9 +523,9 @@ class TriggerDialog(QDialog):
             mode_to_event = {
                 'rms': 'rms_above',
                 'peak': 'peak_above',
-                'freq': 'frequency_above',
+                'frequency': 'frequency_above',
                 'band_energy': 'band_energy_above',
-                'db': 'db_above'
+                'db_level': 'db_above'
             }
             
             event_type = mode_to_event.get(mode)
@@ -611,6 +606,15 @@ class TriggerDialog(QDialog):
         elif isinstance(trigger, CompoundTrigger):
             self.trigger_type.setCurrentIndex(6)
             self.compound_logic.setCurrentText(trigger.logic)
+            self.compound_extra_triggers = []
+            if len(trigger.triggers) > 2:
+                QMessageBox.warning(
+                    self,
+                    "Compound Trigger",
+                    "Only the first 2 sub-triggers are editable in the UI. "
+                    "Additional triggers will be preserved.",
+                )
+                self.compound_extra_triggers = list(trigger.triggers[2:])
             if len(trigger.triggers) >= 1:
                 self.sub_trigger1 = trigger.triggers[0]
                 self.label_trig1.setText(self.sub_trigger1.description)
@@ -629,12 +633,18 @@ class TriggerDialog(QDialog):
         if trigger_type == 0:  # Duration
             minutes = self.duration_minutes.value()
             seconds = self.duration_seconds.value()
+            if minutes == 0 and seconds == 0:
+                QMessageBox.warning(self, "Invalid Duration", "Duration must be greater than zero.")
+                return None
             return TimeDurationTrigger(name, minutes, seconds)
         elif trigger_type == 1:  # Specific time
             time = self.specific_time.time()
             return TimeSpecificTrigger(name, time.hour(), time.minute())
         elif trigger_type == 2:  # Sensor value
-            sensor_name = self.sensor_name.currentText()
+            sensor_name = self.sensor_name.currentText().strip()
+            if not sensor_name:
+                QMessageBox.warning(self, "Missing Sensor", "Please select a sensor.")
+                return None
             operator = self.sensor_operator.currentText()
             threshold = self.sensor_threshold.value()
             hysteresis = self.sensor_hysteresis.value()
@@ -643,7 +653,10 @@ class TriggerDialog(QDialog):
             event_type = self.event_type.currentText()
             return EventTrigger(name, event_type)
         elif trigger_type == 4:  # Optical Event
-            sensor_name = self.optical_sensor_name.currentText()
+            sensor_name = self.optical_sensor_name.currentText().strip()
+            if not sensor_name:
+                QMessageBox.warning(self, "Missing Sensor", "Please select an optical sensor.")
+                return None
             event_type = self.optical_event_type.currentText()
             threshold_value = self.optical_threshold.value()
             
@@ -674,8 +687,11 @@ class TriggerDialog(QDialog):
         elif trigger_type == 6: # Compound
             logic = self.compound_logic.currentText()
             triggers = []
-            if self.sub_trigger1: triggers.append(self.sub_trigger1)
-            if self.sub_trigger2: triggers.append(self.sub_trigger2)
+            if self.sub_trigger1:
+                triggers.append(self.sub_trigger1)
+            if self.sub_trigger2:
+                triggers.append(self.sub_trigger2)
+            triggers.extend(self.compound_extra_triggers)
             
             if not triggers:
                 QMessageBox.warning(self, "Missing Triggers", "Please configure at least one sub-trigger.")
@@ -685,10 +701,15 @@ class TriggerDialog(QDialog):
         
         return None
 
+    def accept(self):
+        if self.get_trigger() is None:
+            return
+        super().accept()
+
 
 class ActionDialog(QDialog):
     """Dialog for creating or editing an action"""
-    def __init__(self, parent=None, action=None, available_ports=None, app_context=None):
+    def __init__(self, parent=None, action=None, available_ports=None, app_context=None, step_count=1):
         super().__init__(parent)
         self.setWindowTitle("Configure Action")
         self.resize(500, 400)
@@ -696,6 +717,8 @@ class ActionDialog(QDialog):
         self.action = action
         self.available_ports = available_ports or []
         self.app_context = app_context # Used to get LabJack channels, etc.
+        self.step_count = max(1, step_count)
+        self._system_action_params_cache = {}
         
         # Map action type names to classes for loading/getting
         self.action_classes = {
@@ -832,11 +855,22 @@ class ActionDialog(QDialog):
         
         # Try to get available channels from the app context
         labjack_channels = ["dac0", "dac1", "fio0", "fio1"] # Defaults
-        if self.app_context and hasattr(self.app_context, 'interfaces') and 'labjack' in self.app_context.interfaces:
-            labjack = self.app_context.interfaces['labjack']
-            # Make sure get_available_output_channels method exists and labjack is connected
-            if labjack and hasattr(labjack, 'get_available_output_channels') and labjack.connected:
-                labjack_channels = labjack.get_available_output_channels() # Use a method to get channels
+        interfaces = self.app_context.get('interfaces') if self.app_context else None
+        if interfaces and 'labjack' in interfaces:
+            labjack_entry = interfaces['labjack']
+            if isinstance(labjack_entry, dict):
+                labjack = labjack_entry.get('interface') or labjack_entry.get('instance')
+                connected = labjack_entry.get('connected', False)
+            else:
+                labjack = labjack_entry
+                connected = False
+                if labjack is not None:
+                    if hasattr(labjack, 'is_connected'):
+                        connected = labjack.is_connected()
+                    else:
+                        connected = getattr(labjack, 'connected', False)
+            if labjack and connected and hasattr(labjack, 'get_available_output_channels'):
+                labjack_channels = labjack.get_available_output_channels()
         
         self.labjack_channel.addItems(labjack_channels)
         self.labjack_channel.setEditable(True) # Allow manual entry
@@ -893,9 +927,22 @@ class ActionDialog(QDialog):
         
         self.serial_command = QLineEdit()
         self.serial_command.setPlaceholderText("Enter command to send")
+
+        self.serial_baudrate = QSpinBox()
+        self.serial_baudrate.setRange(300, 921600)
+        self.serial_baudrate.setValue(9600)
+
+        self.serial_timeout = QDoubleSpinBox()
+        self.serial_timeout.setRange(0.1, 60.0)
+        self.serial_timeout.setDecimals(1)
+        self.serial_timeout.setSingleStep(0.5)
+        self.serial_timeout.setValue(1.0)
+        self.serial_timeout.setSuffix(" s")
         
         layout.addRow("Port:", self.serial_port)
         layout.addRow("Command:", self.serial_command)
+        layout.addRow("Baud Rate:", self.serial_baudrate)
+        layout.addRow("Timeout:", self.serial_timeout)
         
         return widget
 
@@ -967,7 +1014,9 @@ class ActionDialog(QDialog):
             "stop_recording",
             "take_snapshot",
             "display_message",
-            "play_sound"
+            "play_sound",
+            "start_acquisition",
+            "stop_acquisition",
         ])
         self.system_action_type.currentTextChanged.connect(self.update_system_action_options)
         action_type_layout.addRow("Action:", self.system_action_type)
@@ -1032,8 +1081,7 @@ class ActionDialog(QDialog):
         layout = QFormLayout(widget)
         
         self.jump_target = QSpinBox()
-        self.jump_target.setRange(1, 100)
-        self.jump_target.setPrefix("Step ")
+        self._update_step_target_ranges()
         
         layout.addRow("Target Step:", self.jump_target)
         layout.addRow(QLabel("Note: Steps are 1-indexed in the UI."))
@@ -1050,13 +1098,12 @@ class ActionDialog(QDialog):
         self.cond_expression.setPlaceholderText("e.g., {temp} > 100")
         
         self.cond_true_target = QSpinBox()
-        self.cond_true_target.setRange(1, 100)
         self.cond_true_target.setPrefix("Step ")
         
         self.cond_false_target = QSpinBox()
-        self.cond_false_target.setRange(1, 100)
         self.cond_false_target.setPrefix("Step ")
         self.cond_false_target.setSpecialValueText("Continue (Next Step)")
+        self._update_step_target_ranges()
         
         layout.addRow("Condition:", self.cond_expression)
         layout.addRow("If True, Jump to:", self.cond_true_target)
@@ -1064,8 +1111,67 @@ class ActionDialog(QDialog):
         
         return widget
         
+    def _update_step_target_ranges(self):
+        """Set jump/condition spinbox ranges based on step count."""
+        max_ui = max(1, self.step_count)
+        if hasattr(self, "jump_target"):
+            self.jump_target.setPrefix("Step ")
+            self.jump_target.setRange(1, max_ui)
+        if hasattr(self, "cond_true_target"):
+            self.cond_true_target.setRange(1, max_ui)
+        if hasattr(self, "cond_false_target"):
+            self.cond_false_target.setMinimum(0)
+            self.cond_false_target.setRange(0, max_ui)
+            self.cond_false_target.setSpecialValueText("Continue (Next Step)")
+
+    def _validate_step_target(self, index, label):
+        if index < 0 or index >= self.step_count:
+            QMessageBox.warning(
+                self,
+                "Invalid Step",
+                f"{label} must be between 1 and {self.step_count}.",
+            )
+            return False
+        return True
+
+    def _cache_system_action_params(self):
+        if not hasattr(self, "system_action_type"):
+            return
+        action_type = self.system_action_type.currentText()
+        params = {}
+        if action_type == "display_message" and hasattr(self, "message_title_input"):
+            params["title"] = self.message_title_input.text()
+            params["message"] = self.message_input.toPlainText()
+        elif action_type == "play_sound" and hasattr(self, "sound_type"):
+            params["sound"] = self.sound_type.currentText()
+            if hasattr(self, "sound_file_input"):
+                params["file_path"] = self.sound_file_input.text()
+        elif action_type == "take_snapshot" and hasattr(self, "camera_selector"):
+            params["camera_index"] = self.camera_selector.currentData()
+        self._system_action_params_cache[action_type] = params
+
+    def _restore_system_action_params(self, action_type):
+        params = self._system_action_params_cache.get(action_type, {})
+        if action_type == "display_message":
+            if hasattr(self, "message_title_input"):
+                self.message_title_input.setText(params.get("title", "Automation Message"))
+            if hasattr(self, "message_input"):
+                self.message_input.setPlainText(params.get("message", ""))
+        elif action_type == "play_sound":
+            if hasattr(self, "sound_type"):
+                self.sound_type.setCurrentText(params.get("sound", "beep"))
+                self.update_sound_options()
+            if hasattr(self, "sound_file_input"):
+                self.sound_file_input.setText(params.get("file_path", ""))
+        elif action_type == "take_snapshot" and hasattr(self, "camera_selector"):
+            cam_idx = params.get("camera_index")
+            idx = self.camera_selector.findData(cam_idx)
+            if idx >= 0:
+                self.camera_selector.setCurrentIndex(idx)
+
     def update_system_action_options(self):
         """Update the system action options based on the selected action type"""
+        self._cache_system_action_params()
         # Clear existing options
         while self.system_options_layout.count():
             item = self.system_options_layout.takeAt(0)
@@ -1130,6 +1236,8 @@ class ActionDialog(QDialog):
             self.camera_selector.addItem("Camera 3", 2)
             self.camera_selector.addItem("Camera 4", 3)
             self.system_options_layout.addRow("Camera Source:", self.camera_selector)
+
+        self._restore_system_action_params(action_type)
     
     def update_sound_options(self):
         """Update sound options based on selected sound type"""
@@ -1216,6 +1324,8 @@ class ActionDialog(QDialog):
             elif isinstance(action, SerialCommandAction):
                  self.serial_port.setCurrentText(action.port) # Set port separately
                  self.serial_command.setText(action.command)
+                 self.serial_baudrate.setValue(getattr(action, "baudrate", 9600))
+                 self.serial_timeout.setValue(getattr(action, "timeout", 1.0))
             elif isinstance(action, PluginCommandAction):
                  self.plugin_selector.setCurrentText(action.plugin_name)
                  self.plugin_command.setText(action.command)
@@ -1241,6 +1351,7 @@ class ActionDialog(QDialog):
                      idx = self.camera_selector.findData(cam_idx)
                      if idx >= 0:
                          self.camera_selector.setCurrentIndex(idx)
+                 self._cache_system_action_params()
             elif isinstance(action, SetVariableAction):
                  if hasattr(self, 'variable_name_input'):
                      self.variable_name_input.setText(action.variable_name)
@@ -1250,8 +1361,10 @@ class ActionDialog(QDialog):
                  if hasattr(self, 'marker_text_input'):
                      self.marker_text_input.setText(action.marker_text)
             elif isinstance(action, JumpToStepAction):
+                self._update_step_target_ranges()
                 self.jump_target.setValue(action.target_step_index + 1)
             elif isinstance(action, ConditionAction):
+                self._update_step_target_ranges()
                 self.cond_expression.setText(action.condition_expression)
                 self.cond_true_target.setValue(action.if_true_step + 1)
                 if action.if_false_step is not None:
@@ -1270,6 +1383,9 @@ class ActionDialog(QDialog):
         
         if action_type == "Send Arduino Command":
             command = self.arduino_command.text().strip()
+            if not command:
+                QMessageBox.warning(self, "Missing Command", "Arduino command cannot be empty.")
+                return None
             return ArduinoCommandAction(name, command)
             
         elif action_type == "Send LabJack Command":
@@ -1287,16 +1403,33 @@ class ActionDialog(QDialog):
         elif action_type == "Send Serial Command":
             port = self.serial_port.currentText().strip() # Use currentText for editable combo box
             command = self.serial_command.text().strip()
-            return SerialCommandAction(name, port, command)
+            if not port:
+                QMessageBox.warning(self, "Missing Port", "Serial port cannot be empty.")
+                return None
+            if not command:
+                QMessageBox.warning(self, "Missing Command", "Serial command cannot be empty.")
+                return None
+            return SerialCommandAction(
+                name, port, command, self.serial_baudrate.value(), self.serial_timeout.value()
+            )
 
         elif action_type == "Send Plugin Command":
             plugin_name = self.plugin_selector.currentText().strip()
             command = self.plugin_command.text().strip()
+            if not plugin_name:
+                QMessageBox.warning(self, "Missing Plugin", "Plugin name cannot be empty.")
+                return None
+            if not command:
+                QMessageBox.warning(self, "Missing Command", "Plugin command cannot be empty.")
+                return None
             return PluginCommandAction(name, plugin_name, command)
 
         elif action_type == "MQTT Publish":
             topic = self.mqtt_topic.text().strip()
             payload = self.mqtt_payload.text().strip()
+            if not topic:
+                QMessageBox.warning(self, "Missing Topic", "MQTT topic cannot be empty.")
+                return None
             return MQTTPublishAction(name, topic, payload)
             
         elif action_type == "System Action":
@@ -1329,32 +1462,44 @@ class ActionDialog(QDialog):
 
         elif action_type == "Info Marker":
             marker_text = self.marker_text_input.text().strip()
+            if not marker_text:
+                QMessageBox.warning(self, "Missing Text", "Info marker text cannot be empty.")
+                return None
             return InfoMarkerAction(name, marker_text)
 
         elif action_type == "Jump to Step":
             target = self.jump_target.value() - 1
+            if not self._validate_step_target(target, "Target step"):
+                return None
             return JumpToStepAction(name, target)
             
         elif action_type == "Condition (If/Else Jump)":
             expression = self.cond_expression.text().strip()
             true_target = self.cond_true_target.value() - 1
-            false_target = self.cond_false_target.value() - 1
-            
-            if false_target < 0:
-                false_target = None
+            false_ui = self.cond_false_target.value()
+            false_target = None if false_ui == 0 else false_ui - 1
                 
             if not expression:
                  QMessageBox.warning(self, "Missing Condition", "Condition expression cannot be empty.")
                  return None
+            if not self._validate_step_target(true_target, "If-true step"):
+                return None
+            if false_target is not None and not self._validate_step_target(false_target, "If-false step"):
+                return None
                  
             return ConditionAction(name, expression, true_target, false_target)
             
         return None
 
+    def accept(self):
+        if self.get_action() is None:
+            return
+        super().accept()
+
 
 class StepDialog(QDialog):
     """Dialog for creating or editing an automation step"""
-    def __init__(self, parent=None, step=None, sensors=None, available_ports=None, app_context=None):
+    def __init__(self, parent=None, step=None, sensors=None, available_ports=None, app_context=None, step_count=1):
         super().__init__(parent)
         self.setWindowTitle("Configure Automation Step")
         self.resize(700, 500)
@@ -1363,10 +1508,17 @@ class StepDialog(QDialog):
         self.sensors = sensors or []
         self.available_ports = available_ports or []
         self.app_context = app_context
+        self.step_count = max(1, step_count)
         
-        # Initialize variables from step or None
-        self.trigger = step.trigger if step else None
-        self.action = step.action if step else None
+        # Deep-copy trigger/action so Cancel does not mutate the live sequence
+        if step and step.trigger:
+            self.trigger = BaseTrigger.from_dict(step.trigger.to_dict())
+        else:
+            self.trigger = None
+        if step and step.action:
+            self.action = BaseAction.from_dict(step.action.to_dict())
+        else:
+            self.action = None
         
         self.setup_ui()
         
@@ -1439,16 +1591,20 @@ class StepDialog(QDialog):
         # Pass the current trigger (or None) to the dialog
         dialog = TriggerDialog(self, self.trigger, self.sensors)
         if dialog.exec():
-            self.trigger = dialog.get_trigger()
-            self.update_trigger_info()
+            new_trigger = dialog.get_trigger()
+            if new_trigger is not None:
+                self.trigger = new_trigger
+                self.update_trigger_info()
             
     def edit_action(self):
         """Open dialog to edit action"""
         # Pass the current action (or None) and context to the dialog
-        dialog = ActionDialog(self, self.action, self.available_ports, self.app_context)
+        dialog = ActionDialog(self, self.action, self.available_ports, self.app_context, self.step_count)
         if dialog.exec():
-            self.action = dialog.get_action()
-            self.update_action_info()
+            new_action = dialog.get_action()
+            if new_action is not None:
+                self.action = new_action
+                self.update_action_info()
             
     def update_trigger_info(self):
         """Update trigger info display"""
@@ -1491,6 +1647,15 @@ class StepDialog(QDialog):
             self.enabled_checkbox.isChecked()
         )
 
+    def accept(self):
+        if not self.trigger:
+            QMessageBox.warning(self, "Missing Trigger", "Please configure a trigger for this step.")
+            return
+        if not self.action:
+            QMessageBox.warning(self, "Missing Action", "Please configure an action for this step.")
+            return
+        super().accept()
+
 
 class SequenceDialog(QDialog):
     """Dialog for creating or editing an automation sequence"""
@@ -1505,9 +1670,9 @@ class SequenceDialog(QDialog):
         self.available_ports = available_ports or []
         self.app_context = app_context
         
-        # Use a copy of the steps if editing, otherwise start fresh
+        # Deep-copy steps so Cancel does not mutate the live sequence
         if sequence and hasattr(sequence, 'steps'):
-            self.steps = sequence.steps.copy() 
+            self.steps = [AutomationStep.from_dict(s.to_dict()) for s in sequence.steps]
         else:
             self.steps = []
             
@@ -1675,7 +1840,10 @@ class SequenceDialog(QDialog):
     def add_step(self):
         """Add a new step"""
         # Pass context to StepDialog
-        dialog = StepDialog(self, None, self.sensors, self.available_ports, self.app_context)
+        dialog = StepDialog(
+            self, None, self.sensors, self.available_ports, self.app_context,
+            step_count=max(len(self.steps) + 1, 1),
+        )
         if dialog.exec():
             step = dialog.get_step()
             if step:
@@ -1695,7 +1863,10 @@ class SequenceDialog(QDialog):
             
         if 0 <= row < len(self.steps):
             # Pass the selected step and context to StepDialog
-            dialog = StepDialog(self, self.steps[row], self.sensors, self.available_ports, self.app_context)
+            dialog = StepDialog(
+                self, self.steps[row], self.sensors, self.available_ports, self.app_context,
+                step_count=max(len(self.steps), 1),
+            )
             if dialog.exec():
                 updated_step = dialog.get_step()
                 if updated_step:
@@ -1724,6 +1895,7 @@ class SequenceDialog(QDialog):
                                         QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
                 del self.steps[row]
+                self._remap_after_delete(row)
                 self.update_steps_table()
         else:
             print(f"Error: Invalid row index {row} for deletion.")
@@ -1733,6 +1905,7 @@ class SequenceDialog(QDialog):
         row = self.get_selected_row()
         if row is not None and 0 < row < len(self.steps):
             self.steps[row], self.steps[row-1] = self.steps[row-1], self.steps[row]
+            self._remap_after_swap(row - 1, row)
             self.update_steps_table()
             self.steps_table.selectRow(row - 1) # Select the moved item
             
@@ -1741,6 +1914,7 @@ class SequenceDialog(QDialog):
         row = self.get_selected_row()
         if row is not None and 0 <= row < len(self.steps) - 1:
             self.steps[row], self.steps[row+1] = self.steps[row+1], self.steps[row]
+            self._remap_after_swap(row, row + 1)
             self.update_steps_table()
             self.steps_table.selectRow(row + 1) # Select the moved item
     
@@ -1761,6 +1935,54 @@ class SequenceDialog(QDialog):
         # self.steps = sequence.steps.copy() 
         self.update_steps_table()
         
+    def _apply_index_remap(self, remap_fn):
+        """Update jump/condition targets after step delete or reorder."""
+        step_count = len(self.steps)
+        for step in self.steps:
+            action = step.action
+            if isinstance(action, JumpToStepAction):
+                old = action.target_step_index
+                new = remap_fn(old)
+                if new is None:
+                    new = max(0, min(old, step_count - 1))
+                action.target_step_index = max(0, min(new, step_count - 1))
+            elif isinstance(action, ConditionAction):
+                old_true = action.if_true_step
+                new_true = remap_fn(old_true)
+                if new_true is None:
+                    new_true = max(0, min(old_true, step_count - 1))
+                action.if_true_step = max(0, min(new_true, step_count - 1))
+                if action.if_false_step is not None:
+                    old_false = action.if_false_step
+                    new_false = remap_fn(old_false)
+                    if new_false is None:
+                        action.if_false_step = None
+                    else:
+                        action.if_false_step = max(0, min(new_false, step_count - 1))
+
+    def _remap_after_delete(self, deleted_index):
+        def remap(old_idx):
+            if old_idx == deleted_index:
+                return None
+            if old_idx > deleted_index:
+                return old_idx - 1
+            return old_idx
+        self._apply_index_remap(remap)
+
+    def _remap_after_swap(self, a, b):
+        def remap(old_idx):
+            if old_idx == a:
+                return b
+            if old_idx == b:
+                return a
+            return old_idx
+        self._apply_index_remap(remap)
+
+    def accept(self):
+        if self.get_sequence() is None:
+            return
+        super().accept()
+
     def get_sequence(self):
         """Get the configured sequence"""
         name = self.sequence_name.text().strip()

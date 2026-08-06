@@ -399,6 +399,14 @@ class AutomationController(QObject):
             QMessageBox.warning(self.main_window, "Select Sequence", "Please select a sequence to edit.")
             return
 
+        if selected_sequence in self.manager.active_sequences:
+            QMessageBox.warning(
+                self.main_window,
+                "Sequence Running",
+                "Cannot edit a sequence while it is running. Stop it first.",
+            )
+            return
+
         try:
             # Gather context for the dialog
             sensors = self.manager.get_available_sensor_objects()
@@ -711,13 +719,15 @@ class AutomationController(QObject):
             print("No automation sequences checked - continuing without automation")
             return
 
-        # Clear stale sensor data and events before starting NEW sequences
-        # This prevents immediate triggering from values left over from a previous run
-        # ONLY do this if no sequences are already running to avoid interrupting them
-        if not self.manager.active_sequences:
-            self.manager.update_context({'sensors': {}, 'events': set()})
-            self.manager.variables = {} # Reset shared variables for a fresh start
-            print("[Automation] Context and variables reset for new run")
+        # Reset shared context for each acquisition-linked batch start
+        self.manager.update_context({
+            'sensors': {},
+            'events': set(),
+            'optical_sensors': {},
+            'audio_sensors': {},
+        })
+        self.manager.variables = {}
+        print("[Automation] Context and variables reset for new run batch")
 
         started_count = 0
         error_messages = []

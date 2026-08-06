@@ -139,6 +139,13 @@ class ArduinoMasterSlaveThread(QThread):
                     print(f"ArduinoMasterSlaveThread: Already connected to different device ({self.arduino.port} @ {self.arduino.baud_rate}), disconnecting first...")
                     self.disconnect()
             
+            # Close any previous interface before replacing to avoid port leaks
+            if self.arduino:
+                try:
+                    self.arduino.disconnect()
+                except Exception:
+                    pass
+
             # Create new Arduino interface with settings
             self.arduino = ArduinoInterface(
                 port=port, 
@@ -242,12 +249,9 @@ class ArduinoMasterSlaveThread(QThread):
         return True
         
     def stop_data_collection(self):
-        """Stop data collection thread"""
-        self._stop_event.set()
-        
-        # Wait for thread to finish with timeout
-        if not self.wait(self.THREAD_STOP_TIMEOUT_MS):
-            print("ArduinoMasterSlaveThread: Thread did not stop in time during stop_data_collection")
+        """Stop data collection but keep monitoring thread alive."""
+        with QMutexLocker(self.mutex):
+            self.monitoring_only = True
         
     def pause_data_collection(self):
         """Pause data collection"""

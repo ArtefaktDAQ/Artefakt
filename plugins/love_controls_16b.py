@@ -171,6 +171,12 @@ class Dwyer16B(BaseInterface):
             except Exception as e:
                 self.connected = False
                 self.error_message = str(e)
+                if self.serial:
+                    try:
+                        self.serial.close()
+                    except Exception:
+                        pass
+                    self.serial = None
                 logger.error(f"Failed to connect to Dwyer16B on {self.port}: {e}")
                 return False
 
@@ -185,6 +191,32 @@ class Dwyer16B(BaseInterface):
                     logger.error(f"Error closing serial port {self.port}: {e}")
                 finally:
                     self.serial = None
+
+    def is_connected(self):
+        with self.lock:
+            if not self.serial:
+                self.connected = False
+                return False
+
+            try:
+                if not self.serial.is_open:
+                    self.connected = False
+                    return False
+                # A lightweight pyserial call catches unplugged adapters sooner
+                # than checking the stale boolean alone.
+                _ = self.serial.in_waiting
+            except Exception as e:
+                self.connected = False
+                self.error_message = str(e)
+                try:
+                    self.serial.close()
+                except Exception:
+                    pass
+                self.serial = None
+                return False
+
+            self.connected = True
+            return True
 
     def _get_parity_constant(self):
         parity_map = {
@@ -202,9 +234,12 @@ class Dwyer16B(BaseInterface):
                 try:
                     return int(core, 16)
                 except ValueError:
-                    return int(core)
+                    return 1000
             if text.startswith("0X"):
-                return int(text, 16)
+                try:
+                    return int(text, 16)
+                except ValueError:
+                    return 1000
         try:
             return int(value)
         except (ValueError, TypeError):
@@ -248,9 +283,13 @@ class Dwyer16B(BaseInterface):
         else:
             expected_len = 8
 
-        # Read response with a bit more wait for slow devices
-        time.sleep(0.08) 
-        response = self.serial.read(expected_len)
+        deadline = time.monotonic() + getattr(self.serial, 'timeout', 1.0)
+        response = bytearray()
+        while len(response) < expected_len and time.monotonic() < deadline:
+            chunk = self.serial.read(expected_len - len(response))
+            if chunk:
+                response.extend(chunk)
+        response = bytes(response)
 
         if len(response) == 5 and response[1] == (function_code | 0x80):
             exception_code = response[2]
@@ -261,6 +300,10 @@ class Dwyer16B(BaseInterface):
                 0x04: "Slave Device Failure"
             }.get(exception_code, "Unknown Exception")
             
+            self.error_message = (
+                f"Modbus exception 0x{exception_code:02X} ({reason}) "
+                f"for function=0x{function_code:02X}, address={address}"
+            )
             logger.error(
                 f"Modbus exception from ID {modbus_id} on {self.port}: "
                 f"function=0x{function_code:02X}, address={address} (0x{address:04X}), "
@@ -318,6 +361,10 @@ class Dwyer16B(BaseInterface):
 
         if len(body) >= 3 and body[1] == (function_code | 0x80):
             exception_code = body[2]
+            self.error_message = (
+                f"Modbus ASCII exception 0x{exception_code:02X} "
+                f"for function=0x{function_code:02X}, address={address}"
+            )
             logger.error(
                 f"Modbus ASCII exception from ID {self.modbus_id} on {self.port}: "
                 f"function=0x{function_code:02X}, exception=0x{exception_code:02X}, "
@@ -339,7 +386,8 @@ class Dwyer16B(BaseInterface):
 
         with self.lock:
             # Modbus RTU requires a silence between packets
-            time.sleep(0.05) 
+            time.sleep(0.05)
+            self.error_message = ""
 
             retries = 2
             while retries >= 0:
@@ -353,18 +401,18 @@ class Dwyer16B(BaseInterface):
 
                     if response:
                         return response
-                    
-                    # If we got a Modbus exception (like Illegal Address), don't retry, it won't help
+
+                    # Protocol exceptions (illegal address, etc.) will not succeed on retry
                     if self.error_message and "exception" in self.error_message.lower():
                         break
-                            
+
                 except Exception as e:
                     logger.error(f"Modbus communication error on {self.port} (FC=0x{function_code:02X}, Addr={address}): {e}")
-                
+
                 retries -= 1
                 if retries >= 0:
-                    time.sleep(0.1) 
-                    
+                    time.sleep(0.1)
+
             return None
 
     def read_data(self):
@@ -424,13 +472,19 @@ class Dwyer16B(BaseInterface):
                     "message": f"No valid response from device on {self.port}. Check ID, Baud, and A/B wiring.",
                 }
 
+            lines = [f"Read successful on {self.port}"]
+            if "Temperature" in data:
+                lines.append(f"PV: {data['Temperature']:.1f} °C")
+            else:
+                lines.append("PV: (no response)")
+            if "Setpoint" in data:
+                lines.append(f"SV: {data['Setpoint']:.1f} °C")
+            else:
+                lines.append("SV: (no response)")
+
             return {
                 "success": True,
-                "message": (
-                    f"Read successful on {self.port}\n"
-                    f"PV: {data['Temperature']:.1f} °C\n"
-                    f"SV: {data['Setpoint']:.1f} °C"
-                ),
+                "message": "\n".join(lines),
             }
 
         if action_id == "write_setpoint":
@@ -470,10 +524,14 @@ class Dwyer16B(BaseInterface):
                 value = float(val_str)
                 factor = 10.0 ** self.decimal_places
                 raw_value = int(round(value * factor))
-                
+                if raw_value < -32768 or raw_value > 32767:
+                    logger.error(f"SV value out of range for signed 16-bit register: {raw_value}")
+                    return False
+
+                wire_value = raw_value & 0xFFFF
                 wire_sv = self._wire_address(self.REG_SV)
                 logger.debug(f"Writing {raw_value} to SV register {wire_sv}")
-                resp = self._send_modbus_request(0x06, wire_sv, raw_value)
+                resp = self._send_modbus_request(0x06, wire_sv, wire_value)
                 
                 if resp and len(resp) >= 6:
                     logger.info(f"Successfully wrote SV={value} to {self.port}")

@@ -110,6 +110,14 @@ class MQTTDataThread(QThread):
                 'keepalive': keepalive
             }
             
+            # Tear down any previous client before creating a new one
+            if self.mqtt:
+                try:
+                    self.mqtt.disconnect()
+                except Exception:
+                    pass
+                self.mqtt = None
+
             # Create interface
             self.mqtt = MQTTInterface(**self.connection_params)
             self.mqtt.on_connection_lost = self._on_connection_lost

@@ -76,10 +76,6 @@ class CSVInterface(BaseInterface):
             if current_size == self.last_file_size and current_mtime == self.last_mtime:
                 # No changes to the file, return None to avoid re-processing old data
                 return None
-            
-            # Update markers
-            self.last_file_size = current_size
-            self.last_mtime = current_mtime
         except Exception:
             # File might be temporarily inaccessible
             return None
@@ -98,26 +94,40 @@ class CSVInterface(BaseInterface):
                     return None
                     
                 with open(self.file_path, 'r', newline='', encoding='utf-8', errors='ignore') as f:
-                    # Seek to near the end
                     f.seek(0, os.SEEK_END)
-                    pos = f.tell()
-                    if pos == 0: return None
-                    
-                    # Read a chunk from the end to find the last line
+                    end_pos = f.tell()
+                    if end_pos == 0:
+                        return None
+
+                    # Detect whether the file ends on a complete row
+                    f.seek(max(0, end_pos - 1))
+                    ends_with_newline = f.read(1) == '\n'
+
                     chunk_size = 4096
-                    f.seek(max(0, pos - chunk_size))
-                    lines = f.readlines()
-                    
-                    if not lines: return None
-                    
-                    # Get the last complete non-empty line
-                    last_line = ""
-                    for line in reversed(lines):
-                        if line.strip():
-                            last_line = line.strip()
-                            break
-                    
-                    if not last_line: return None
+                    read_size = min(chunk_size, end_pos)
+                    f.seek(end_pos - read_size)
+                    data = f.read(read_size)
+
+                    # Drop a partial first line when reading a tail chunk
+                    if end_pos > read_size and data:
+                        first_nl = data.find('\n')
+                        if first_nl == -1:
+                            return None
+                        data = data[first_nl + 1:]
+
+                    lines = [ln for ln in data.splitlines() if ln.strip()]
+                    if not lines:
+                        return None
+
+                    if ends_with_newline:
+                        last_line = lines[-1].strip()
+                    elif len(lines) >= 2:
+                        last_line = lines[-2].strip()
+                    else:
+                        return None
+
+                    if not last_line:
+                        return None
                     
                     # Use csv reader to handle quotes correctly
                     reader = csv.reader([last_line], delimiter=self.delimiter)
@@ -146,6 +156,8 @@ class CSVInterface(BaseInterface):
                                 data[sensor_name] = val
                     
                     if data:
+                        self.last_file_size = current_size
+                        self.last_mtime = current_mtime
                         return data
                     return None # No mapping matches
                     

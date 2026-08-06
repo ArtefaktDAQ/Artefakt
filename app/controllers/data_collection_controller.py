@@ -18,7 +18,7 @@ import inspect
 from app.utils.power_management import PowerManagement
 
 from app.core.interfaces.arduino_master_slave import ArduinoMasterSlaveThread
-from app.core.interfaces.other_serial_interface import OtherSerialThread, SerialSequence, SendCommandStep, WaitStep, ReadResponseStep, ParseValueStep, PublishValueStep
+from app.core.interfaces.other_serial_interface import OtherSerialThread, SerialSequence, SendCommandStep, WaitStep, ReadResponseStep, ParseValueStep, PublishValueStep, normalize_parse_method
 from app.core.interfaces.csv_interface import CSVThread
 from app.core.interfaces.labjack_data_thread import LabJackDataThread
 from app.core.interfaces.mqtt_thread import MQTTDataThread
@@ -56,8 +56,12 @@ class DataCollectionController(QObject):
 
     @property
     def other_serial_connected(self):
-        """Check if Other Serial interface is connected"""
-        return self.interfaces.get('other_serial', {}).get('connected', False)
+        """Check if any Other Serial port is connected (multi-port aware)."""
+        os_state = self.interfaces.get('other_serial', {})
+        ports = os_state.get('ports', {})
+        if ports:
+            return any(p.get('connected') for p in ports.values())
+        return os_state.get('connected', False)
 
     @property
     def mqtt_connected(self):
@@ -75,7 +79,7 @@ class DataCollectionController(QObject):
         self.interfaces = {
             'arduino': {'connected': False},
             'labjack': {'connected': False},
-            'other_serial': {'connected': False},
+            'other_serial': {'connected': False, 'ports': {}},
             'mqtt': {'connected': False}
         }
         
@@ -143,11 +147,9 @@ class DataCollectionController(QObject):
         self.arduino_thread.connection_status_signal.connect(self.handle_arduino_status)
         self.arduino_thread.error_signal.connect(self.handle_arduino_error)
         
-        # Setup Other Serial interface
-        self.other_serial_thread = OtherSerialThread()
-        self.other_serial_thread.data_received_signal.connect(self.handle_other_serial_data)
-        self.other_serial_thread.connection_status_signal.connect(self.handle_other_serial_status)
-        self.other_serial_thread.error_signal.connect(self.handle_other_serial_error)
+        # Multi-port Other Serial: one OtherSerialThread per COM port.
+        self.other_serial_threads = {}  # port_str -> OtherSerialThread
+        self.other_serial_thread = None  # legacy alias = last used thread
         
         # --- Setup LabJack interface using the new thread ---
         # Initialize with internal hardware polling rate (not user's sampling rate)
@@ -161,14 +163,8 @@ class DataCollectionController(QObject):
             except (ValueError, TypeError):
                 initial_labjack_rate = 100.0
         self.labjack_thread = LabJackDataThread(sampling_rate=initial_labjack_rate)
-        # Initialize averaging window size based on initial LabJack rate
+        self._wire_labjack_thread_signals()
         self._update_averaging_window_size(initial_labjack_rate)
-        self.labjack_thread.data_received_signal.connect(self.handle_labjack_data)
-        self.labjack_thread.connection_status_signal.connect(self.handle_labjack_status) # Need to create this handler
-        self.labjack_thread.error_signal.connect(self.handle_labjack_error) # Need to create this handler
-        # --------------------------------------------------
-        
-        # Setup MQTT interface
         self.mqtt_thread = MQTTDataThread()
         self.mqtt_thread.data_received_signal.connect(self.handle_mqtt_data)
         self.mqtt_thread.connection_status_signal.connect(self.handle_mqtt_status)
@@ -189,8 +185,10 @@ class DataCollectionController(QObject):
         self.update_timer.timeout.connect(self.update_sensor_display)
         self.update_timer.setInterval(500)  # Update UI every 500ms
         
-        # Start timers immediately
-        self._ensure_timers_running()
+        # Do NOT start timers here. They start when an interface connects
+        # (_ensure_timers_running) or when acquisition starts — otherwise we
+        # emit empty combined_data before any hardware is ready.
+        # (initialize() documents the same rule.)
         
     def _update_run_metadata(self, updates: dict):
         """Safely merge updates into the current run's metadata."""
@@ -473,7 +471,64 @@ class DataCollectionController(QObject):
                 
         except Exception as e:
             self.log(f"Error disconnecting from Arduino: {str(e)}", "ERROR")
-            
+
+    def _ensure_other_serial_thread(self, port):
+        """Get or create the OtherSerialThread dedicated to a COM port."""
+        port = str(port)
+        if port not in self.other_serial_threads:
+            t = OtherSerialThread()
+            t.data_received_signal.connect(self.handle_other_serial_data)
+            t.connection_status_signal.connect(self.handle_other_serial_status)
+            t.error_signal.connect(self.handle_other_serial_error)
+            self.other_serial_threads[port] = t
+        self.other_serial_thread = self.other_serial_threads[port]
+        return self.other_serial_threads[port]
+
+    def _default_other_serial_thread_for_listing(self):
+        """Orphan thread used only for list_ports when no port is connected yet."""
+        return self._ensure_other_serial_thread('__list__')
+
+    def _iter_connected_other_serial_threads(self):
+        """Yield (port, thread) for each connected Other Serial port."""
+        os_state = self.interfaces.get('other_serial', {})
+        ports = os_state.get('ports', {})
+        for port_key, port_state in ports.items():
+            if port_state.get('connected'):
+                thread = self.other_serial_threads.get(str(port_key))
+                if thread:
+                    yield str(port_key), thread
+        # Legacy flat state without per-port entries
+        if not ports and os_state.get('connected') and self.other_serial_thread:
+            yield str(os_state.get('port', '')), self.other_serial_thread
+
+    def _other_serial_port_key_from_sender(self):
+        """Map a status-signal sender thread back to its port key."""
+        sender_thread = self.sender()
+        if sender_thread is None:
+            return None
+        for port_key, thread in self.other_serial_threads.items():
+            if thread is sender_thread:
+                return port_key
+        return None
+
+    def _update_other_serial_flat_state(self, os_state):
+        """Mirror the last connected port into flat legacy fields."""
+        ports = os_state.get('ports', {})
+        os_state['connected'] = any(p.get('connected') for p in ports.values())
+        for port_state in ports.values():
+            if port_state.get('connected'):
+                os_state.update({k: v for k, v in port_state.items()})
+                break
+
+    def _emit_other_serial_ui_status(self, connected):
+        """Emit UI status for the Other Serial device group."""
+        self.interface_status_signal.emit('other', connected)
+        if self.main_window:
+            if hasattr(self.main_window, 'update_device_connection_status_ui'):
+                self.main_window.update_device_connection_status_ui('other', connected)
+            elif hasattr(self.main_window, 'update_other_connected_status'):
+                self.main_window.update_other_connected_status(connected)
+
     def connect_other_serial(self, port=None, baud_rate=None, data_bits=8, parity="None", 
                             stop_bits=1, poll_interval=None, sequence=None, sequences=None):
         """
@@ -525,27 +580,45 @@ class DataCollectionController(QObject):
                 self.other_serial_manually_disconnected = False
                 self._explicit_reconnect = False
 
-            # Avoid disconnect + 2s boot sleep + reconnect when already connected to the same port
-            # (startup runs _connect_virtual_sensors then initialize_other_serial_connections).
-            if not getattr(self, '_explicit_reconnect', False):
-                try:
+            # Avoid disconnect + 2s boot sleep + reconnect when this port is already live.
+            # Other ports stay connected (multi-port design).
+            port_key = str(port)
+            os_state = self.interfaces.setdefault('other_serial', {'connected': False, 'ports': {}})
+            if 'ports' not in os_state or not isinstance(os_state.get('ports'), dict):
+                os_state['ports'] = {}
+            port_state = os_state['ports'].get(port_key, {})
+            thread = self._ensure_other_serial_thread(port)
+
+            try:
+                if (
+                    port_state.get('connected')
+                    and thread
+                    and getattr(thread, 'interface', None)
+                    and thread.interface.is_connected()
+                ):
                     if (
-                        'other_serial' in self.interfaces
-                        and self.interfaces['other_serial'].get('connected')
-                        and self.other_serial_thread
-                        and getattr(self.other_serial_thread, 'interface', None)
-                        and self.other_serial_thread.interface.is_connected()
+                        int(port_state.get('baud_rate', 0)) == int(baud_rate)
+                        and abs(float(port_state.get('poll_interval', 0)) - float(poll_interval)) < 1e-6
                     ):
-                        existing = self.interfaces['other_serial']
-                        if (
-                            str(existing.get('port', '')) == str(port)
-                            and int(existing.get('baud_rate', 0)) == int(baud_rate)
-                            and abs(float(existing.get('poll_interval', 0)) - float(poll_interval)) < 1e-6
-                        ):
-                            print("DEBUG connect_other_serial: Already connected on same port/baud/poll; skipping redundant reconnect")
-                            return True
-                except Exception:
-                    pass
+                        iface = thread.interface
+                        if sequences is not None:
+                            iface.sequences = sequences
+                        if sequence is not None:
+                            iface.sequence = sequence
+                        thread.poll_interval = float(poll_interval)
+                        if hasattr(iface, 'poll_interval'):
+                            iface.poll_interval = float(poll_interval)
+                        port_state['poll_interval'] = float(poll_interval)
+                        os_state['ports'][port_key] = port_state
+                        self._update_other_serial_flat_state(os_state)
+                        print("DEBUG connect_other_serial: Already connected on same port/baud/poll; updated sequences/poll without reconnect")
+                        self.log(f"Other Serial on {port}: refreshed sequences without reconnect")
+                        return True
+                    # Same port but different settings: reconnect only this port.
+                    thread.disconnect()
+                    port_state['connected'] = False
+            except Exception:
+                pass
             
             # Debug: Print sequence details before connecting
             if sequences:
@@ -562,16 +635,11 @@ class DataCollectionController(QObject):
                     print("DEBUG connect_other_serial: Sequence has no steps or actions attribute!")
             else:
                 print("DEBUG connect_other_serial: No sequence provided!")
-            
-            # Disconnect if already connected
-            if 'other_serial' in self.interfaces and self.interfaces['other_serial']['connected']:
-                self.other_serial_thread.disconnect()
-                
-            # Update the thread's poll interval
-            self.other_serial_thread.poll_interval = poll_interval
-            
-            # Connect to the device without starting data collection
-            success = self.other_serial_thread.connect(
+
+            # Connect this port only; leave other COM ports running.
+            thread.poll_interval = poll_interval
+
+            success = thread.connect(
                 port=port,
                 baud_rate=baud_rate,
                 data_bits=data_bits,
@@ -581,215 +649,139 @@ class DataCollectionController(QObject):
                 sequence=sequence,
                 sequences=sequences
             )
-            
+
             if success:
-                # Create or update the interface entry
-                self.interfaces['other_serial'] = {
+                os_state['ports'][port_key] = {
                     'type': 'other_serial',
                     'connected': True,
-                    'instance': self.other_serial_thread.interface,
+                    'instance': thread.interface,
                     'port': port,
                     'baud_rate': baud_rate,
                     'data_bits': data_bits,
                     'parity': parity,
                     'stop_bits': stop_bits,
-                    'poll_interval': poll_interval
+                    'poll_interval': poll_interval,
                 }
-                
-                # Explicitly emit connection status to update UI
-                self.interface_status_signal.emit('other', True)
-                
-                # Direct UI update
-                if self.main_window:
-                    if hasattr(self.main_window, 'update_device_connection_status_ui'):
-                        print(f"Direct UI update: update_device_connection_status_ui('other', True)")
-                        self.main_window.update_device_connection_status_ui('other', True)
-                    elif hasattr(self.main_window, 'update_other_connected_status'):
-                        print(f"Direct UI update: update_other_connected_status(True)")
-                        self.main_window.update_other_connected_status(True)
-                
+                # Flat fields mirror this port for legacy readers.
+                self._update_other_serial_flat_state(os_state)
+
+                any_connected = os_state['connected']
+                self._emit_other_serial_ui_status(any_connected)
+
                 self.log(f"Connected to serial device on port {port}")
                 return True
             else:
                 self.log(f"Failed to connect to serial device on port {port}", "ERROR")
-                
-                # Explicitly set connected to False in case it was previously True
-                if 'other_serial' in self.interfaces:
-                    self.interfaces['other_serial']['connected'] = False
-                    
-                # Emit connection status to update UI
-                self.interface_status_signal.emit('other', False)
-                
-                # Direct UI update for failed connection
-                if self.main_window:
-                    if hasattr(self.main_window, 'update_device_connection_status_ui'):
-                        self.main_window.update_device_connection_status_ui('other', False)
-                    elif hasattr(self.main_window, 'update_other_connected_status'):
-                        self.main_window.update_other_connected_status(False)
-                        
+
+                if port_key in os_state['ports']:
+                    os_state['ports'][port_key]['connected'] = False
+                self._update_other_serial_flat_state(os_state)
+                self._emit_other_serial_ui_status(os_state['connected'])
                 return False
-                
+
         except Exception as e:
             self.log(f"Error connecting to serial device: {str(e)}", "ERROR")
-            
-            # Explicitly set connected to False in case of error
-            if 'other_serial' in self.interfaces:
-                self.interfaces['other_serial']['connected'] = False
-                
-            # Emit connection status to update UI
-            self.interface_status_signal.emit('other', False)
-            
-            # Direct UI update for connection error
-            if self.main_window:
-                if hasattr(self.main_window, 'update_device_connection_status_ui'):
-                    self.main_window.update_device_connection_status_ui('other', False)
-                elif hasattr(self.main_window, 'update_other_connected_status'):
-                    self.main_window.update_other_connected_status(False)
-                    
+
+            os_state = self.interfaces.setdefault('other_serial', {'connected': False, 'ports': {}})
+            if port is not None and 'ports' in os_state:
+                port_key = str(port)
+                if port_key in os_state['ports']:
+                    os_state['ports'][port_key]['connected'] = False
+            self._update_other_serial_flat_state(os_state)
+            self._emit_other_serial_ui_status(os_state.get('connected', False))
             return False
             
     def disconnect_other_serial(self):
-        """Disconnect from Other Serial device"""
+        """Disconnect all Other Serial ports."""
         try:
-            if 'other_serial' in self.interfaces and self.interfaces['other_serial']['connected']:
-                self.other_serial_thread.disconnect()
-                self.interfaces['other_serial']['connected'] = False
-                
-                # Emit connection status to update UI
-                self.interface_status_signal.emit('other', False)
-                
-                # Direct UI update for disconnection
-                if self.main_window:
-                    if hasattr(self.main_window, 'update_device_connection_status_ui'):
-                        self.main_window.update_device_connection_status_ui('other', False)
-                    elif hasattr(self.main_window, 'update_other_connected_status'):
-                        self.main_window.update_other_connected_status(False)
-                        
-                # Set all OtherSerial sensor values to None
+            os_state = self.interfaces.get('other_serial', {})
+            ports = os_state.get('ports', {})
+            had_connection = self.other_serial_connected
+
+            # Disconnect every per-port thread.
+            for port_key, thread in list(self.other_serial_threads.items()):
+                if port_key == '__list__':
+                    continue
+                try:
+                    if thread and (thread.isRunning() or getattr(thread, 'interface', None)):
+                        thread.disconnect()
+                except Exception as e:
+                    self.log(f"Error disconnecting Other Serial on {port_key}: {e}", "ERROR")
+
+            if isinstance(ports, dict):
+                for port_state in ports.values():
+                    if isinstance(port_state, dict):
+                        port_state['connected'] = False
+            if isinstance(os_state, dict):
+                os_state['connected'] = False
+
+            if had_connection:
+                self._emit_other_serial_ui_status(False)
+
                 if hasattr(self.main_window, 'sensor_controller'):
                     for sensor in self.main_window.sensor_controller.sensors:
                         if getattr(sensor, 'interface_type', '') in ('OtherSerial', 'Serial'):
-                            # Set current_value to None so it displays as "--"
                             sensor.current_value = None
-                    # Force update of sensor values in UI
                     self.main_window.sensor_controller.update_sensor_values()
-                
-                self.log("Disconnected from serial device")
+
+                self.log("Disconnected from all serial devices")
                 return True
             return False
         except Exception as e:
             self.log(f"Error disconnecting from serial device: {str(e)}", "ERROR")
-            
-            # Explicitly set connected to False in case of error
+
             if 'other_serial' in self.interfaces:
                 self.interfaces['other_serial']['connected'] = False
-            
-            # Emit connection status to update UI
-            self.interface_status_signal.emit('other', False)
-            
-            # Direct UI update for disconnection error
-            if self.main_window:
-                if hasattr(self.main_window, 'update_device_connection_status_ui'):
-                    self.main_window.update_device_connection_status_ui('other', False)
-                elif hasattr(self.main_window, 'update_other_connected_status'):
-                    self.main_window.update_other_connected_status(False)
-                    
+                ports = self.interfaces['other_serial'].get('ports', {})
+                if isinstance(ports, dict):
+                    for port_state in ports.values():
+                        if isinstance(port_state, dict):
+                            port_state['connected'] = False
+
+            self._emit_other_serial_ui_status(False)
             return False
 
     def disconnect_other_serial_all(self):
-        """Disconnect all OtherSerial connections"""
+        """Disconnect all OtherSerial connections (user-initiated full teardown)."""
         print("DEBUG DataCollectionController: Disconnecting all OtherSerial connections")
-        
-        # Set the manual disconnect flag to prevent auto-reconnection
+
         self.other_serial_manually_disconnected = True
-        
-        # Provide immediate UI feedback before disconnection
-        # Emit interface status signal immediately
-        self.interface_status_signal.emit('other', False)
-        
-        # Update UI immediately - do this first for responsive UX
-        if self.main_window:
-            if hasattr(self.main_window, 'update_device_connection_status_ui'):
-                self.main_window.update_device_connection_status_ui('other', False)
-                print("DEBUG DataCollectionController: Updated device_connection_status_ui")
-            elif hasattr(self.main_window, 'update_other_connected_status'):
-                self.main_window.update_other_connected_status(False)
-                print("DEBUG DataCollectionController: Updated other_connected_status")
-        
+        self._emit_other_serial_ui_status(False)
+
         if 'other_serial' not in self.interfaces:
             print("DEBUG DataCollectionController: No other_serial interfaces to disconnect")
             return True
-        
-        # First check if the other_serial interface is just a simple dictionary with a 'connected' key
-        if isinstance(self.interfaces['other_serial'], dict) and 'connected' in self.interfaces['other_serial']:
-            print("DEBUG DataCollectionController: Found simple other_serial interface structure")
-            # Simple case - just set connected to False
-            self.interfaces['other_serial']['connected'] = False
-            
-            # Stop the thread if it's running - do this in parallel if possible
-            if self.other_serial_thread and self.other_serial_thread.isRunning():
-                self.other_serial_thread.disconnect()
-                print("DEBUG DataCollectionController: Stopped other_serial_thread")
-            
-            # Reset OtherSerial sensor values to show "--"
-            if hasattr(self, 'main_window') and hasattr(self.main_window, 'sensor_controller'):
-                for sensor in self.main_window.sensor_controller.sensors:
-                    if getattr(sensor, 'interface_type', '') in ('OtherSerial', 'Serial'):
-                        # Set current_value to None so it displays as "--"
-                        sensor.current_value = None
-                # Force update of sensor values in UI
-                self.main_window.sensor_controller.update_sensor_values()
-                print("DEBUG DataCollectionController: Reset all OtherSerial sensor values to display '--'")
-            
+
+        os_state = self.interfaces['other_serial']
+        if not isinstance(os_state, dict):
             return True
-            
-        # More complex case - a dictionary of port:interface items
-        if isinstance(self.interfaces['other_serial'], dict):
-            for port_name, interface in list(self.interfaces['other_serial'].items()):
-                try:
-                    # Skip non-dictionary items or special keys
-                    if not isinstance(interface, dict):
-                        print(f"DEBUG DataCollectionController: Skipping non-dict item '{port_name}' in other_serial interfaces")
-                        continue
-                        
-                    print(f"DEBUG DataCollectionController: Disconnecting OtherSerial on port {port_name}")
-                    if interface.get('connected', False):
-                        # Stop the polling thread
-                        if 'thread' in interface and interface['thread']:
-                            interface['thread'].stop()
-                            # Don't wait for thread to join - let it terminate in background
-                            print(f"DEBUG DataCollectionController: Stopped polling thread for port {port_name}")
-                        
-                        # Close the serial port
-                        if 'serial' in interface and interface['serial']:
-                            interface['serial'].close()
-                            print(f"DEBUG DataCollectionController: Closed serial port {port_name}")
-                        
-                        # Update the connection status
-                        interface['connected'] = False
-                        
-                        # Log the disconnection
-                        if hasattr(self, 'main_window') and hasattr(self.main_window, 'logger'):
-                            self.main_window.logger.log(f"Disconnected OtherSerial from port {port_name}", "INFO")
-                except Exception as e:
-                    print(f"DEBUG DataCollectionController: Error disconnecting OtherSerial on port {port_name}: {e}")
-                    if hasattr(self, 'main_window') and hasattr(self.main_window, 'logger'):
-                        self.main_window.logger.log(f"Error disconnecting OtherSerial on port {port_name}: {e}", "ERROR")
-        
-        # Update overall connected status to False
-        if isinstance(self.interfaces['other_serial'], dict):
-            self.interfaces['other_serial']['connected'] = False
-        
-        # Reset OtherSerial sensor values to show "--"
+
+        for port_key, thread in list(self.other_serial_threads.items()):
+            if port_key == '__list__':
+                continue
+            try:
+                print(f"DEBUG DataCollectionController: Disconnecting OtherSerial on port {port_key}")
+                if thread:
+                    thread.disconnect()
+            except Exception as e:
+                print(f"DEBUG DataCollectionController: Error disconnecting OtherSerial on port {port_key}: {e}")
+                if hasattr(self, 'main_window') and hasattr(self.main_window, 'logger'):
+                    self.main_window.logger.log(f"Error disconnecting OtherSerial on port {port_key}: {e}", "ERROR")
+
+        ports = os_state.get('ports', {})
+        if isinstance(ports, dict):
+            for port_state in ports.values():
+                if isinstance(port_state, dict):
+                    port_state['connected'] = False
+        os_state['connected'] = False
+
         if hasattr(self, 'main_window') and hasattr(self.main_window, 'sensor_controller'):
             for sensor in self.main_window.sensor_controller.sensors:
                 if getattr(sensor, 'interface_type', '') in ('OtherSerial', 'Serial'):
-                    # Set current_value to None so it displays as "--"
                     sensor.current_value = None
-            # Force update of sensor values in UI
             self.main_window.sensor_controller.update_sensor_values()
             print("DEBUG DataCollectionController: Reset all OtherSerial sensor values to display '--'")
-        
+
         print("DEBUG DataCollectionController: Completed disconnection of all OtherSerial connections")
         return True
         
@@ -971,22 +963,17 @@ class DataCollectionController(QObject):
                 elif action_type == 'parse':
                     # Get parse mode and parameters
                     parse_mode = action.get('parse_mode', 'entire')
-                    parse_method = ''
+                    parse_method = normalize_parse_method(parse_mode)
                     start_marker = ''
                     end_marker = ''
                     
-                    if parse_mode == 'after':
-                        parse_method = 'After Marker'
+                    if parse_method == 'After Marker':
                         start_marker = action.get('start', '')
-                    elif parse_mode == 'between':
-                        parse_method = 'Between Markers'
+                    elif parse_method == 'Between Markers':
                         start_marker = action.get('start', '')
                         end_marker = action.get('end', '')
-                    elif parse_mode == 'before':
-                        parse_method = 'Before Marker'
+                    elif parse_method == 'Before Marker':
                         end_marker = action.get('end', '')
-                    else:  # entire
-                        parse_method = 'Entire Response'
                     
                     # If the user didn't explicitly select a source, default to the last ReadResponse target.
                     parse_source = action.get('source') or last_read_var or 'response'
@@ -1137,10 +1124,59 @@ class DataCollectionController(QObject):
         self.disconnect_other_serial()
         self.disconnect_labjack()
         self.disconnect_mqtt()
+        for plugin_name in self._get_plugin_interface_names():
+            self.disconnect_plugin_interface(plugin_name)
         if hasattr(self, 'csv_thread'):
             self.csv_thread.stop()
             self._clear_interface_sensor_values('csv')
         self.log("Disconnected all interfaces.")
+
+    def _get_plugin_interface_names(self):
+        """Return registered generic plugin interface names."""
+        names = set(self.interface_threads.keys())
+        for name, state in self.interfaces.items():
+            if isinstance(state, dict) and 'instance' in state:
+                names.add(name)
+        return [name for name in names if name not in ('arduino', 'labjack', 'other_serial', 'mqtt')]
+
+    def _get_plugin_poll_rate(self, name, default=1.0):
+        try:
+            if self.main_window and hasattr(self.main_window, 'other_sensors'):
+                rates = []
+                for config in self.main_window.other_sensors:
+                    if config.get("type") == name and config.get("poll_rate"):
+                        rates.append(float(config.get("poll_rate")))
+                if rates:
+                    return max(rates)
+        except (ValueError, TypeError):
+            pass
+        return default
+
+    def _ensure_plugin_thread(self, name, interface_instance, poll_rate=None):
+        """Start or update the single polling thread for a plugin instance."""
+        if poll_rate is None:
+            poll_rate = self._get_plugin_poll_rate(name)
+        if poll_rate <= 0:
+            poll_rate = 1.0
+
+        if name in self.interface_threads:
+            thread = self.interface_threads[name]
+            if thread.isRunning():
+                current_hz = getattr(thread, 'poll_rate_hz', 1.0 / thread.poll_interval if thread.poll_interval else 0.1)
+                # Apply both higher and lower rates from Apply Settings / sensor config.
+                if abs(float(poll_rate) - float(current_hz)) > 1e-6:
+                    thread.set_poll_rate(poll_rate)
+                    self.log(f"Updated poll rate for {name} to {poll_rate}Hz (was {current_hz}Hz)")
+                return thread
+            del self.interface_threads[name]
+
+        thread = PluginPollingThread(interface_instance, name, poll_rate_hz=poll_rate)
+        thread.data_received_signal.connect(lambda data, n=name: self.handle_plugin_data(n, data))
+        thread.connection_status_signal.connect(self.handle_plugin_status)
+        thread.start()
+        self.interface_threads[name] = thread
+        self.log(f"Started polling thread for {name} at {poll_rate}Hz")
+        return thread
         
     def start_data_collection(self, run_dir):
         """
@@ -1167,6 +1203,11 @@ class DataCollectionController(QObject):
             for plugin in self.outbound_plugins:
                 try:
                     plugin.set_run_directory(run_dir)
+                    if getattr(plugin, 'enabled', False) and not getattr(plugin, 'connected', False):
+                        try:
+                            plugin.connect()
+                        except Exception as e:
+                            print(f"ERROR: Failed to connect outbound plugin {getattr(plugin, 'name', 'Unknown')}: {e}")
                 except Exception as e:
                     print(f"ERROR: Failed to set run directory for outbound plugin {getattr(plugin, 'name', 'Unknown')}: {e}")
             # ------------------------------------------------------
@@ -1230,13 +1271,17 @@ class DataCollectionController(QObject):
                     print("DEBUG: clear_graphs method not found in graph_controller")
                     self.log("Could not clear graph display: clear_graphs method not available", "WARNING")
             
-            # --- Setup CSV File --- 
+            # --- Setup CSV File ---
+            # INTENTIONAL: CSV header is locked for the duration of this run.
+            # Rebuilding columns mid-file would shift fields and corrupt/lose samples.
+            # Sensor enable/rename changes mid-run affect live UI/graphs; they do not
+            # alter this run's CSV schema. Start a new run to get a new header.
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             self.csv_filename = os.path.join(self.run_directory, f"rundata_{timestamp}.csv")
             self.log(f"Initializing CSV file: {self.csv_filename}")
             
-            # Determine header from enabled sensors in SensorController
-            # Sensors with show_in_graph=False are excluded from both graphs and CSV recording per user requirement
+            # Determine header from enabled sensors in SensorController.
+            # show_in_graph only controls visualization; all enabled sensors are recorded.
             self.csv_header = ['timestamp', 'arduino_timestamp', 'labjack_timestamp', 'other_serial_timestamp', 'audio_timestamp', 'mqtt_timestamp'] # Global tick + per-interface timestamps
             
             # PERSISTENCE: Save a snapshot of virtual sensors for this run
@@ -1248,8 +1293,7 @@ class DataCollectionController(QObject):
             enabled_sensor_ids = []
             if sensor_controller:
                 for sensor in sensor_controller.sensors:
-                    # Filter for both enabled and show_in_graph to decide what goes in the CSV
-                    if getattr(sensor, 'enabled', False) and getattr(sensor, 'show_in_graph', True):
+                    if getattr(sensor, 'enabled', False):
                         # Use the prefixed key consistent with historical buffer/combined data
                         sensor_id = sensor_controller.get_historical_buffer_key(sensor)
                         if sensor_id:
@@ -1270,7 +1314,7 @@ class DataCollectionController(QObject):
                 
                 # Open in write mode with newline='' to prevent extra blank rows
                 self.csv_file = open(self.csv_filename, 'w', newline='')
-                # Set extrasaction='ignore' so that sensors not in the header (e.g. show_in_graph=False) don't cause errors
+                # Set extrasaction='ignore' so unexpected keys in the row dict don't cause errors
                 self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=self.csv_header, extrasaction='ignore')
                 self.csv_writer.writeheader()
                 # Write an initial marker row with the run start time so replay knows zero point
@@ -1309,14 +1353,15 @@ class DataCollectionController(QObject):
                      self.arduino_thread.monitoring_only = False 
                      self.log("Arduino thread switched from monitoring to full data collection")
             
-            # Example for Other Serial:
-            if 'other_serial' in self.interfaces and self.interfaces['other_serial']['connected']:
-                if not self.other_serial_thread.isRunning():
-                    self.log("Starting Other Serial thread for data collection.")
-                    self.other_serial_thread.start()
-                else:
-                    self.other_serial_thread.monitoring_only = False
-                    self.log("Other Serial thread switched from monitoring to full data collection")
+            # Other Serial: start/switch each connected port thread independently.
+            if 'other_serial' in self.interfaces and self.other_serial_connected:
+                for port_key, thread in self._iter_connected_other_serial_threads():
+                    if not thread.isRunning():
+                        self.log(f"Starting Other Serial thread for port {port_key} (data collection).")
+                        thread.start()
+                    else:
+                        thread.monitoring_only = False
+                self.log("Other Serial thread(s) switched from monitoring to full data collection")
 
             # Example for LabJack:
             if 'labjack' in self.interfaces and self.interfaces['labjack']['connected']:
@@ -1342,6 +1387,27 @@ class DataCollectionController(QObject):
                 self.mqtt_thread.monitoring_only = False
                 self.log("MQTT thread switched from monitoring to full data collection")
             # -----------------------------------------------------
+
+            # Generic plugin interfaces (for example Dwyer16B):
+            # keep the live connection, but mark the thread as active data collection.
+            for plugin_name in self._get_plugin_interface_names():
+                state = self.interfaces.get(plugin_name, {})
+                interface_instance = state.get('instance') if isinstance(state, dict) else None
+                if not interface_instance:
+                    continue
+
+                if not interface_instance.is_connected():
+                    if not interface_instance.connect():
+                        self.log(f"Plugin {plugin_name} is not connected; skipping for this run", "WARNING")
+                        state['connected'] = False
+                        self.interface_status_signal.emit(plugin_name, False)
+                        continue
+
+                state['connected'] = True
+                self.interface_status_signal.emit(plugin_name, True)
+                thread = self._ensure_plugin_thread(plugin_name, interface_instance)
+                thread.start_data_collection()
+                self.log(f"Plugin {plugin_name} switched from monitoring to full data collection")
             
             # Start timers for data collection if not already running
             if not self.update_timer.isActive():
@@ -1365,6 +1431,8 @@ class DataCollectionController(QObject):
             return True
             
         except Exception as e:
+            # Roll back collection state so UI/logic do not think we are recording.
+            self.collecting_data = False
             self.log(f"Error starting data collection: {str(e)}", "ERROR")
             self.status_update_signal.emit(f"Error starting data collection: {str(e)}", "ERROR")
             self._close_csv_file() # Ensure file is closed on error
@@ -1384,11 +1452,12 @@ class DataCollectionController(QObject):
                  self.arduino_thread.monitoring_only = True # If switching back to monitoring
                  self.log("Stopped Arduino data collection (switched to monitoring)." if self.arduino_thread.monitoring_only else "Stopped Arduino thread.")
             
-            # Example for Other Serial:
-            if 'other_serial' in self.interfaces and self.interfaces['other_serial']['connected']:
-                 if hasattr(self, 'other_serial_thread') and self.other_serial_thread.isRunning():
-                     self.other_serial_thread.monitoring_only = True
-                     self.log("Stopped Other Serial data collection (switched to monitoring).")
+            # Other Serial: switch each connected port thread back to monitoring.
+            if 'other_serial' in self.interfaces and self.other_serial_connected:
+                for port_key, thread in self._iter_connected_other_serial_threads():
+                    if thread.isRunning():
+                        thread.monitoring_only = True
+                self.log("Stopped Other Serial data collection (switched to monitoring).")
                 
             # Example for LabJack:
             if 'labjack' in self.interfaces and self.interfaces['labjack']['connected']:
@@ -1401,6 +1470,14 @@ class DataCollectionController(QObject):
                  self.mqtt_thread.monitoring_only = True
                  self.log("Stopped MQTT data collection (switched to monitoring).")
             # ----------------------------
+
+            # Generic plugins should keep polling for live values after a run,
+            # but no longer be considered part of active data collection.
+            for plugin_name in self._get_plugin_interface_names():
+                thread = self.interface_threads.get(plugin_name)
+                if thread and thread.isRunning():
+                    thread.stop_data_collection()
+                    self.log(f"Stopped {plugin_name} data collection (switched to monitoring).")
 
             # --- Close CSV File --- 
             self._close_csv_file()
@@ -1461,9 +1538,11 @@ class DataCollectionController(QObject):
                 self.arduino_thread.pause_data_collection()
                 self.log("Paused Arduino data collection")
             
-            # Pause Other Serial data collection if running
-            if 'other_serial' in self.interfaces and self.other_serial_thread.running:
-                self.other_serial_thread.pause_data_collection()
+            # Pause Other Serial data collection on every connected port.
+            if 'other_serial' in self.interfaces and self.other_serial_connected:
+                for port_key, thread in self._iter_connected_other_serial_threads():
+                    if thread.running:
+                        thread.pause_data_collection()
                 self.log("Paused Other Serial data collection")
             
             # Add more interfaces as needed
@@ -1482,9 +1561,11 @@ class DataCollectionController(QObject):
                 self.arduino_thread.resume_data_collection()
                 self.log("Resumed Arduino data collection")
             
-            # Resume Other Serial data collection if paused
-            if 'other_serial' in self.interfaces and self.other_serial_thread.running:
-                self.other_serial_thread.resume_data_collection()
+            # Resume Other Serial data collection on every connected port.
+            if 'other_serial' in self.interfaces and self.other_serial_connected:
+                for port_key, thread in self._iter_connected_other_serial_threads():
+                    if thread.running:
+                        thread.resume_data_collection()
                 self.log("Resumed Other Serial data collection")
             
             # Add more interfaces as needed
@@ -1494,6 +1575,45 @@ class DataCollectionController(QObject):
             
         except Exception as e:
             self.log(f"Error resuming data collection: {str(e)}", "ERROR")
+
+    def _calibrate_sensor_value(self, sensor, raw_value):
+        """Apply offset/conversion_factor like Arduino/LabJack handlers (value * factor + offset)."""
+        try:
+            offset = float(getattr(sensor, 'offset', 0.0) or 0.0)
+            factor = float(getattr(sensor, 'conversion_factor', 1.0) or 1.0)
+            return (float(raw_value) * factor) + offset
+        except (ValueError, TypeError):
+            return raw_value
+
+    def _find_mqtt_sensor(self, topic):
+        """Match an MQTT payload key (usually sensor.port / topic) to a configured sensor."""
+        sensor_controller = getattr(self.main_window, 'sensor_controller', None)
+        if not sensor_controller:
+            return None
+        topic_str = str(topic)
+        for sensor in sensor_controller.sensors:
+            if str(getattr(sensor, 'interface_type', '')).lower() != 'mqtt':
+                continue
+            if str(getattr(sensor, 'port', '') or '') == topic_str:
+                return sensor
+            if str(getattr(sensor, 'name', '') or '') == topic_str:
+                return sensor
+        return None
+
+    def _find_sensor_by_buffer_key(self, buffer_key):
+        """Resolve a combined_data/CSV key back to a Sensor via get_historical_buffer_key."""
+        sensor_controller = getattr(self.main_window, 'sensor_controller', None)
+        if not sensor_controller or not buffer_key:
+            return None
+        getter = getattr(sensor_controller, 'get_sensor_by_historical_key', None)
+        if callable(getter):
+            sensor = getter(buffer_key)
+            if sensor:
+                return sensor
+        for sensor in sensor_controller.sensors:
+            if sensor_controller.get_historical_buffer_key(sensor) == buffer_key:
+                return sensor
+        return None
     
     @pyqtSlot(dict)
     def handle_mqtt_data(self, data):
@@ -1509,13 +1629,23 @@ class DataCollectionController(QObject):
             data['timestamp'] = time.time()
         sample_ts = data['timestamp']
 
+        sensor_controller = getattr(self.main_window, 'sensor_controller', None)
+
         with QMutexLocker(self.combined_data_mutex):
             for topic, value in data.items():
                 if topic == 'timestamp':
                     continue
                 
-                # Prefix MQTT keys to avoid collisions
-                key = f"mqtt_{topic}"
+                # CSV/graphs use get_historical_buffer_key → mqtt_{sensor.name}.
+                # Payload keys are MQTT topics (usually sensor.port). Map + calibrate
+                # so header columns and combined_data stay aligned with Arduino/LabJack.
+                sensor = self._find_mqtt_sensor(topic)
+                if sensor and sensor_controller:
+                    key = sensor_controller.get_historical_buffer_key(sensor)
+                    value = self._calibrate_sensor_value(sensor, value)
+                else:
+                    key = f"mqtt_{topic}"
+
                 self.combined_data[key] = value
                 self._last_sensor_update[key] = sample_ts
                 
@@ -1556,13 +1686,30 @@ class DataCollectionController(QObject):
             data['timestamp'] = time.time()
         sample_ts = data['timestamp']
 
+        sensor_controller = getattr(self.main_window, 'sensor_controller', None)
+
         with QMutexLocker(self.combined_data_mutex):
             for sensor_name, value in data.items():
                 if sensor_name == 'timestamp':
                     continue
                 
-                # Prefix CSV keys to avoid collisions
+                # Prefix CSV keys; apply same calibration as other interfaces
                 key = f"csv_{sensor_name}"
+                sensor = None
+                if sensor_controller:
+                    sensor = self._find_sensor_by_buffer_key(key)
+                    if sensor is None:
+                        for s in sensor_controller.sensors:
+                            itype = str(getattr(s, 'interface_type', '')).lower()
+                            if itype in ('csv', 'read csv') and (
+                                s.name == sensor_name or str(getattr(s, 'port', '') or '') == sensor_name
+                            ):
+                                sensor = s
+                                key = sensor_controller.get_historical_buffer_key(s) or key
+                                break
+                if sensor:
+                    value = self._calibrate_sensor_value(sensor, value)
+
                 self.combined_data[key] = value
                 self._last_sensor_update[key] = sample_ts
                 
@@ -1913,42 +2060,44 @@ class DataCollectionController(QObject):
 
     @pyqtSlot(bool, str)
     def handle_other_serial_status(self, connected, message):
-        """Handle Other Serial connection status updates"""
-        # print(f"DataCollectionController.handle_other_serial_status: connected={connected}, message='{message}'")
-        
-        if 'other_serial' in self.interfaces:
-            self.interfaces['other_serial']['connected'] = connected
-            print(f"DataCollectionController: Updated 'other_serial' in interfaces: connected={connected}")
-        else:
-            # If not in interfaces yet but successfully connected, create the entry
-            if connected:
-                print(f"DataCollectionController: Other Serial not in interfaces dict but connected=True. Creating entry.")
-                self.interfaces['other_serial'] = {
-                    'type': 'other_serial',
-                    'connected': True
-                }
-            else:
-                print(f"DataCollectionController: Other Serial not in interfaces dict and connected=False.")
-        
-        print(f"DataCollectionController: Emitting interface_status_signal('other', {connected})")
-        # Use 'other' not 'other_serial' to match what MainWindow expects
-        self.interface_status_signal.emit('other', connected)
-        
-        if not connected:
+        """Handle Other Serial connection status updates (per-port, multi-port aware)."""
+        os_state = self.interfaces.setdefault('other_serial', {'connected': False, 'ports': {}})
+        if 'ports' not in os_state or not isinstance(os_state.get('ports'), dict):
+            os_state['ports'] = {}
+
+        port_key = self._other_serial_port_key_from_sender()
+        if port_key and port_key != '__list__':
+            port_state = os_state['ports'].setdefault(str(port_key), {})
+            port_state['connected'] = connected
+            if connected and self.other_serial_threads.get(port_key):
+                thread = self.other_serial_threads[port_key]
+                if getattr(thread, 'interface', None):
+                    port_state['instance'] = thread.interface
+                    port_state['port'] = getattr(thread.interface, 'port', port_key)
+
+        any_connected = any(p.get('connected') for p in os_state['ports'].values())
+        os_state['connected'] = any_connected
+        if any_connected:
+            self._update_other_serial_flat_state(os_state)
+        elif not port_key:
+            # No port info from sender: keep per-port entries, only recompute overall flag.
+            os_state['connected'] = any_connected
+
+        print(f"DataCollectionController: Updated 'other_serial' in interfaces: connected={any_connected}")
+        print(f"DataCollectionController: Emitting interface_status_signal('other', {any_connected})")
+        self.interface_status_signal.emit('other', any_connected)
+
+        if not any_connected:
             self._clear_interface_sensor_values('other')
         else:
             self._ensure_timers_running()
-        
-        # Direct UI update
+
         if self.main_window:
-            # Try multiple methods for backward compatibility - use 'other' as device type
             if hasattr(self.main_window, 'update_device_connection_status_ui'):
-                # print(f"Using direct update_device_connection_status_ui('other', {connected}) from handle_other_serial_status")
-                self.main_window.update_device_connection_status_ui('other', connected)
+                self.main_window.update_device_connection_status_ui('other', any_connected)
             elif hasattr(self.main_window, 'update_other_connected_status'):
-                # print(f"Using direct update_other_connected_status({connected}) from handle_other_serial_status")
-                self.main_window.update_other_connected_status(connected)
-        
+                self.main_window.update_other_connected_status(any_connected)
+
         self.log(f"Other Serial status: {message}")
         
     @pyqtSlot(str)
@@ -1972,13 +2121,15 @@ class DataCollectionController(QObject):
         return ArduinoMasterSlaveThread.list_ports()
         
     def list_ports(self):
-        """List all available serial ports (Harmonized)"""
-        return self.other_serial_thread.list_ports()
+        """List all available serial ports (Harmonized)."""
+        thread = self.other_serial_thread or self._default_other_serial_thread_for_listing()
+        return thread.list_ports()
 
     def get_other_serial_ports(self):
         """Get list of available serial ports for other devices"""
         print("DataCollectionController.get_other_serial_ports() called")
-        ports = self.other_serial_thread.list_ports()
+        thread = self.other_serial_thread or self._default_other_serial_thread_for_listing()
+        ports = thread.list_ports()
         print(f"DataCollectionController.get_other_serial_ports() received: {ports}")
         return ports
         
@@ -2201,11 +2352,13 @@ class DataCollectionController(QObject):
             success = True
             port = config.get("port", "")
             
-            # Auto-connect if port is provided and we have sequences for it
+            # Auto-connect when this port is not already connected (multi-port safe).
             if should_connect and port and hasattr(self.main_window, 'other_sequences'):
                 from app.core.interfaces.other_serial_interface import SerialSequence
                 relevant_seqs = [SerialSequence.from_dict(s) for s in self.main_window.other_sequences if s.get('port') == port]
-                if relevant_seqs and not getattr(self, 'other_serial_connected', False):
+                ports = self.interfaces.get('other_serial', {}).get('ports', {})
+                already = ports.get(str(port), {}).get('connected')
+                if relevant_seqs and not already:
                     self.connect_other_serial(port=port, sequences=relevant_seqs)
         elif device_type == "Read CSV":
             # CSV is managed by a single CSVThread for all files
@@ -2230,9 +2383,11 @@ class DataCollectionController(QObject):
                     # For plugins, we reuse the instance if it already exists
                     if device_type in self.interfaces and 'instance' in self.interfaces[device_type]:
                         interface_instance = self.interfaces[device_type]['instance']
-                        
+
                         # Apply the latest config before reconnecting so edits like port/parity
                         # take effect without requiring an app restart.
+                        reconnect_needed = False
+                        pending_values = {}
                         for key, value in interface_kwargs.items():
                             if not hasattr(interface_instance, key):
                                 continue
@@ -2246,36 +2401,35 @@ class DataCollectionController(QObject):
                                     value = float(value)
                             except (ValueError, TypeError):
                                 pass
+
+                            pending_values[key] = value
+                            if current_value != value:
+                                reconnect_needed = True
+
+                        if reconnect_needed and interface_instance.is_connected():
+                            self.disconnect_plugin_interface(device_type)
+
+                        for key, value in pending_values.items():
                             setattr(interface_instance, key, value)
 
                         # Check if it's already connected or try to reconnect
-                        success = getattr(interface_instance, 'connected', False)
+                        success = interface_instance.is_connected()
                         if should_connect and not success:
                             success = interface_instance.connect()
                         elif not should_connect:
                             success = True # Just adding sensor
                         
                         if success and should_connect:
+                            if device_type not in self.interfaces:
+                                self.interfaces[device_type] = {}
+                            self.interfaces[device_type]['connected'] = True
+                            self.interfaces[device_type]['instance'] = interface_instance
                             # Re-emit status to ensure UI reflects it
                             self.interface_status_signal.emit(device_type, True)
                             
                             # Ensure thread is running
                             poll_rate = float(config.get("poll_rate", 1.0) if config.get("poll_rate") else 1.0)
-                            if device_type in self.interface_threads and self.interface_threads[device_type].isRunning():
-                                # Update poll rate to the highest requested one for this interface
-                                thread = self.interface_threads[device_type]
-                                current_hz = getattr(thread, 'poll_rate_hz', 1.0 / thread.poll_interval if thread.poll_interval else 0.1)
-                                if poll_rate > current_hz:
-                                    thread.set_poll_rate(poll_rate)
-                                    self.log(f"Increased poll rate for {device_type} to {poll_rate}Hz")
-                            else:
-                                thread = PluginPollingThread(interface_instance, device_type, poll_rate_hz=poll_rate)
-                                thread.data_received_signal.connect(lambda data, n=device_type: self.handle_plugin_data(n, data))
-                                # Connect status signal to trigger UI updates and value clearing
-                                thread.connection_status_signal.connect(self.handle_plugin_status)
-                                thread.start()
-                                self.interface_threads[device_type] = thread
-                                self.log(f"Started polling thread for {device_type} at {poll_rate}Hz")
+                            self._ensure_plugin_thread(device_type, interface_instance, poll_rate)
                     else:
                         # Instantiate the interface class with the filtered arguments
                         interface_instance = interface_class(**interface_kwargs)
@@ -2295,11 +2449,7 @@ class DataCollectionController(QObject):
                                 
                                 # Create and start the polling thread for this plugin
                                 poll_rate = float(config.get("poll_rate", 1.0) if config.get("poll_rate") else 1.0)
-                                thread = PluginPollingThread(interface_instance, device_type, poll_rate_hz=poll_rate)
-                                thread.data_received_signal.connect(lambda data, n=device_type: self.handle_plugin_data(n, data))
-                                thread.start()
-                                self.interface_threads[device_type] = thread
-                                self.log(f"Started polling thread for {device_type} at {poll_rate}Hz")
+                                self._ensure_plugin_thread(device_type, interface_instance, poll_rate)
                             
                             success = True
                         else:
@@ -2427,11 +2577,15 @@ class DataCollectionController(QObject):
             return
             
         ts = time.time()
+        sensor_controller = getattr(self.main_window, 'sensor_controller', None)
         self.combined_data_mutex.lock()
         try:
             for key, value in data.items():
                 # Prefix keys to avoid collisions, e.g. "Simulated Power Meter_Voltage"
                 prefixed_key = f"{name}_{key}"
+                sensor = self._find_sensor_by_buffer_key(prefixed_key) if sensor_controller else None
+                if sensor:
+                    value = self._calibrate_sensor_value(sensor, value)
                 self.combined_data[prefixed_key] = value
                 self._last_sensor_update[prefixed_key] = ts
             
@@ -2502,42 +2656,7 @@ class DataCollectionController(QObject):
                     self.interface_status_signal.emit(device_type, True)
                     
                     # Ensure thread is running
-                    if device_type not in self.interface_threads or not self.interface_threads[device_type].isRunning():
-                        # Try to get poll_rate from settings for this interface
-                        poll_rate = 1.0
-                        if self.main_window and hasattr(self.main_window, 'settings'):
-                            settings_key = device_type.lower().replace(" ", "_")
-                            try:
-                                val = self.main_window.settings.value(f"{settings_key}_poll_rate", 1.0)
-                                poll_rate = float(val) if val else 1.0
-                            except (ValueError, TypeError):
-                                poll_rate = 1.0
-                        
-                        if poll_rate <= 0:
-                            poll_rate = 1.0
-                                
-                        thread = PluginPollingThread(instance, device_type, poll_rate_hz=poll_rate)
-                        thread.data_received_signal.connect(lambda data, n=device_type: self.handle_plugin_data(n, data))
-                        thread.connection_status_signal.connect(self.handle_plugin_status)
-                        thread.start()
-                        self.interface_threads[device_type] = thread
-                    else:
-                        # Update poll rate if thread is already running
-                        thread = self.interface_threads[device_type]
-                        poll_rate = 1.0
-                        if self.main_window and hasattr(self.main_window, 'settings'):
-                            settings_key = device_type.lower().replace(" ", "_")
-                            try:
-                                val = self.main_window.settings.value(f"{settings_key}_poll_rate", 1.0)
-                                poll_rate = float(val) if val else 1.0
-                            except (ValueError, TypeError):
-                                poll_rate = 1.0
-                        
-                        if poll_rate > 0:
-                            current_hz = getattr(thread, 'poll_rate_hz', 1.0 / thread.poll_interval if thread.poll_interval else 0.1)
-                            if poll_rate > current_hz:
-                                thread.set_poll_rate(poll_rate)
-                                self.log(f"Updated poll rate for {device_type} to {poll_rate}Hz")
+                    self._ensure_plugin_thread(device_type, instance)
                     return True
             
             self.log(f"No configuration found to connect plugin: {device_type}", "ERROR")
@@ -2551,7 +2670,10 @@ class DataCollectionController(QObject):
         if name in self.interface_threads:
             thread = self.interface_threads[name]
             thread.stop()
-            thread.wait(1000)
+            if thread.isRunning() and not thread.wait(3000):
+                self.log(f"Plugin polling thread for {name} did not stop in time; terminating it", "WARNING")
+                thread.terminate()
+                thread.wait(1000)
             del self.interface_threads[name]
             self.log(f"Stopped polling thread for plugin: {name}")
             
@@ -2559,8 +2681,8 @@ class DataCollectionController(QObject):
             if 'instance' in self.interfaces[name]:
                 try:
                     self.interfaces[name]['instance'].disconnect()
-                except:
-                    pass
+                except Exception as e:
+                    self.log(f"Error disconnecting plugin interface {name}: {e}", "ERROR")
             self.interfaces[name]['connected'] = False
             self._clear_interface_sensor_values(name)
             self.interface_status_signal.emit(name, False)
@@ -3158,6 +3280,20 @@ class DataCollectionController(QObject):
         finally:
             self.historical_buffer_mutex.unlock()
         
+    def _wire_labjack_thread_signals(self):
+        """Wire LabJackDataThread signals to controller handlers."""
+        self.labjack_thread.data_received_signal.connect(self.handle_labjack_data)
+        self.labjack_thread.connection_status_signal.connect(self.handle_labjack_status)
+        self.labjack_thread.error_signal.connect(self.handle_labjack_error)
+
+    def _recreate_labjack_thread(self, sampling_rate=None):
+        """Create a fresh LabJackDataThread (required after QThread.terminate())."""
+        if sampling_rate is None:
+            sampling_rate = getattr(self.labjack_thread, '_sampling_rate', 100.0)
+        self.labjack_thread = LabJackDataThread(sampling_rate=sampling_rate)
+        self._wire_labjack_thread_signals()
+        self._update_averaging_window_size(sampling_rate)
+
     def connect_labjack(self, device_type=None, connection_type=None, port=None):
         """Connect to LabJack device using LabJackDataThread"""
         print(f"DEBUG: connect_labjack called with device='{device_type}', connection='{connection_type}', port='{port}'")
@@ -3167,11 +3303,7 @@ class DataCollectionController(QObject):
             return False
             
         try:
-            if 'labjack' in self.interfaces and self.interfaces['labjack']['connected']:
-                self.log("LabJack already connected")
-                return True
-
-            # Use settings if parameters are None or "ANY"
+            # Resolve desired params from args / settings before the early-return path
             if self.main_window and hasattr(self.main_window, 'settings'):
                 if device_type is None or device_type == "ANY":
                     device_type = self.main_window.settings.value("labjack_type", "ANY")
@@ -3180,13 +3312,41 @@ class DataCollectionController(QObject):
                 if port is None or port == "ANY":
                     port = self.main_window.settings.value("labjack_port", "ANY")
             
-            # Default to "ANY" if still None
             device_type = device_type or "ANY"
             connection_type = connection_type or "ANY"
             port = port or "ANY"
 
-            # --- Use LabJackDataThread --- 
-            # 1. Create the actual interface object
+            internal_rate = 100.0
+            if self.main_window and hasattr(self.main_window, 'settings'):
+                val = self.main_window.settings.value("labjack_internal_rate", "100.0")
+                try:
+                    if val is not None and str(val).lower() != 'none':
+                        internal_rate = float(val)
+                except (ValueError, TypeError):
+                    internal_rate = 100.0
+
+            if 'labjack' in self.interfaces and self.interfaces['labjack'].get('connected'):
+                existing_iface = self.interfaces['labjack'].get('interface')
+                same_device = True
+                if existing_iface is not None:
+                    cur_type = str(getattr(existing_iface, 'device_type', 'ANY') or 'ANY')
+                    cur_conn = str(getattr(existing_iface, 'connection_type', 'ANY') or 'ANY')
+                    cur_port = str(getattr(existing_iface, 'port', 'ANY') or 'ANY')
+                    same_device = (
+                        cur_type == str(device_type)
+                        and cur_conn == str(connection_type)
+                        and cur_port == str(port)
+                    )
+                if same_device:
+                    # Params unchanged: still refresh sampling rate from settings
+                    self.log("LabJack already connected (same device params); refreshing sampling rate")
+                    if self.labjack_thread:
+                        self.labjack_thread.set_sampling_rate(internal_rate)
+                        self._update_averaging_window_size(internal_rate)
+                    return True
+                self.log("LabJack settings changed while connected; reconnecting...")
+                self.disconnect_labjack()
+
             # Use the setting for auto_reconnect (broken connection handling)
             auto_reconnect_setting = False
             if self.main_window and hasattr(self.main_window, 'settings'):
@@ -3198,17 +3358,6 @@ class DataCollectionController(QObject):
                 connection_type=connection_type, 
                 auto_reconnect=auto_reconnect_setting
             )
-            
-            # 2. Set the interface and hardware sampling rate for the thread
-            # Use the internal rate for high-speed hardware polling
-            internal_rate = 100.0
-            if self.main_window and hasattr(self.main_window, 'settings'):
-                val = self.main_window.settings.value("labjack_internal_rate", "100.0")
-                try:
-                    if val is not None and str(val).lower() != 'none':
-                        internal_rate = float(val)
-                except (ValueError, TypeError):
-                    internal_rate = 100.0
             
             self.labjack_thread.set_interface(lj_interface)
             self.labjack_thread.set_sampling_rate(internal_rate)
@@ -3291,10 +3440,26 @@ class DataCollectionController(QObject):
             
     def disconnect_labjack(self):
         """Disconnect from LabJack device via LabJackDataThread"""
-        # print("DEBUG: disconnect_labjack called")
         try:
-            # Check if the interface exists and is marked as connected in our state
-            if 'labjack' in self.interfaces and self.interfaces['labjack'].get('connected', False):
+            was_connected = (
+                'labjack' in self.interfaces
+                and self.interfaces['labjack'].get('connected', False)
+            )
+            thread_terminated = False
+
+            # Always close the LabJack interface handle, even if the thread is not running
+            lj_iface = None
+            if 'labjack' in self.interfaces:
+                lj_iface = self.interfaces['labjack'].get('interface')
+            if lj_iface is None and self.labjack_thread:
+                lj_iface = getattr(self.labjack_thread, '_labjack_interface', None)
+            if lj_iface:
+                try:
+                    lj_iface.disconnect()
+                except Exception as e:
+                    self.log(f"Error disconnecting LabJack interface: {e}", "ERROR")
+
+            if was_connected:
                 # Clear LabJack averaging buffers on disconnect
                 window_size = self._averaging_window_size if self._averaging_window_size is not None else 10
                 self.combined_data_mutex.lock()
@@ -3316,19 +3481,18 @@ class DataCollectionController(QObject):
                 # --- Stop the LabJack Thread ---
                 if self.labjack_thread and self.labjack_thread.isRunning():
                     print("DEBUG: Stopping LabJackDataThread...")
-                    # Call the thread's disconnect method, which handles stopping the loop
-                    # and disconnecting the underlying interface.
-                    self.labjack_thread.disconnect() 
-                    
-                    # Ask the Qt event loop to quit cleanly
-                    self.labjack_thread.quit() 
-                    
-                    # Wait for the thread to finish execution
-                    if not self.labjack_thread.wait(3000): # Wait up to 3 seconds
+                    self.labjack_thread.stop()
+                    if not self.labjack_thread.wait(3000):
                         print("WARNING: LabJackDataThread did not finish gracefully within 3 seconds. Terminating.")
-                        self.labjack_thread.terminate() # Force terminate if stuck
+                        self.labjack_thread.terminate()
+                        self.labjack_thread.wait(1000)
+                        thread_terminated = True
                     else:
                         print("DEBUG: LabJackDataThread finished gracefully.")
+
+                if thread_terminated:
+                    sampling_rate = getattr(self.labjack_thread, '_sampling_rate', 100.0)
+                    self._recreate_labjack_thread(sampling_rate)
                 # -----------------------------
                 
                 # Update internal state and UI immediately after stopping thread
@@ -3337,17 +3501,17 @@ class DataCollectionController(QObject):
                 
                 self.log("Disconnected from LabJack")
                 return True
-            else:
-                # If not in interfaces or not marked as connected, assume already disconnected
-                print("DEBUG: LabJack interface not found or already marked as disconnected.")
-                # Ensure thread is stopped if it somehow still exists and is running
-                if self.labjack_thread and self.labjack_thread.isRunning():
-                     print("WARNING: LabJack thread was running despite interface being marked disconnected. Stopping now.")
-                     self.labjack_thread.disconnect()
-                     self.labjack_thread.quit()
-                     if not self.labjack_thread.wait(3000):
-                         self.labjack_thread.terminate()
-                return False # Indicate no action was needed or already disconnected
+
+            print("DEBUG: LabJack interface not found or already marked as disconnected.")
+            if self.labjack_thread and self.labjack_thread.isRunning():
+                print("WARNING: LabJack thread was running despite interface being marked disconnected. Stopping now.")
+                self.labjack_thread.stop()
+                if not self.labjack_thread.wait(3000):
+                    self.labjack_thread.terminate()
+                    self.labjack_thread.wait(1000)
+                    sampling_rate = getattr(self.labjack_thread, '_sampling_rate', 100.0)
+                    self._recreate_labjack_thread(sampling_rate)
+            return False
         except Exception as e:
             # Log any unexpected errors during disconnection
             self.log(f"Error disconnecting LabJack: {str(e)}", "ERROR")
@@ -3817,6 +3981,22 @@ class DataCollectionController(QObject):
         """Re-scan and load any newly added outbound plugins."""
         from app.core.interfaces.interface_registry import InterfaceRegistry
         InterfaceRegistry._initialized = False # Force re-scan of plugins folder
+
+        outbound_classes = InterfaceRegistry.get_outbound_interfaces()
+        registry_names = set(outbound_classes.keys())
+        remaining = []
+        for plugin in self.outbound_plugins:
+            name = getattr(plugin, 'name', '')
+            if name not in registry_names:
+                try:
+                    if getattr(plugin, 'connected', False):
+                        plugin.disconnect()
+                except Exception as e:
+                    print(f"ERROR: Failed to disconnect removed outbound plugin {name}: {e}")
+            else:
+                remaining.append(plugin)
+        self.outbound_plugins = remaining
+
         self._setup_outbound_plugins()
         
         # Also notify main window to update its UI
@@ -3841,6 +4021,9 @@ class DataCollectionController(QObject):
         
         if not self.combined_data and not self.averaging_buffers:
             return
+
+        combined_data_copy = None
+        collecting_now = False
             
         self.combined_data_mutex.lock()
         try:
@@ -4081,11 +4264,13 @@ class DataCollectionController(QObject):
                     if 0 <= time_diff <= tolerance:
                         events_to_include.append(event)
                 
-                # Remove written events
-                written_event_timestamps = {e.get('timestamp', 0) for e in events_to_include}
+                # Remove only the event objects we actually included (identity), not all
+                # events that share the same timestamp — two simultaneous events must both
+                # survive until written, otherwise one is dropped from CSV silently.
+                written_ids = {id(e) for e in events_to_include}
                 self.pending_automation_events = [
-                    e for e in self.pending_automation_events 
-                    if e.get('timestamp', 0) not in written_event_timestamps
+                    e for e in self.pending_automation_events
+                    if id(e) not in written_ids
                 ]
                 
                 # Format event strings
@@ -4120,32 +4305,31 @@ class DataCollectionController(QObject):
                 self.pending_events_mutex.unlock()
             # ------------------------------------------------------
 
-            # Emit signal with all latest combined data for graphs and metrics
-            # This is done even if NOT collecting_data to allow for live monitoring
-            if combined_data_copy:
-                self.combined_data_signal.emit(combined_data_copy)
-
-            # --- Push data to Outbound Plugins ---
-            # Outbound plugins are only active during an active collection run
-            if self.collecting_data:
-                for plugin in self.outbound_plugins:
-                    if getattr(plugin, 'enabled', False) and getattr(plugin, 'connected', False):
-                        try:
-                            # Call push_data in a non-blocking way if possible, or ensure it's fast
-                            plugin.push_data(combined_data_copy)
-                        except Exception as e:
-                            # Only log error once to avoid terminal spam
-                            if not hasattr(plugin, '_last_push_error') or str(e) != plugin._last_push_error:
-                                print(f"ERROR: Outbound plugin {getattr(plugin, 'name', 'Unknown')} failed to push data: {e}")
-                                plugin._last_push_error = str(e)
-            # --------------------------------------
-
-            # Do not log to main CSV if collection is not active
-            if not self.collecting_data:
-                return
+            # Do not emit/push/CSV under combined_data_mutex — slots may touch UI
+            # or take other locks and would stall acquisition under load.
+            collecting_now = self.collecting_data
             
         finally:
             self.combined_data_mutex.unlock()
+
+        # Emit / outbound / CSV outside the combined_data lock
+        if not combined_data_copy:
+            return
+
+        self.combined_data_signal.emit(combined_data_copy)
+
+        if collecting_now:
+            for plugin in self.outbound_plugins:
+                if getattr(plugin, 'enabled', False) and getattr(plugin, 'connected', False):
+                    try:
+                        plugin.push_data(combined_data_copy)
+                    except Exception as e:
+                        if not hasattr(plugin, '_last_push_error') or str(e) != plugin._last_push_error:
+                            print(f"ERROR: Outbound plugin {getattr(plugin, 'name', 'Unknown')} failed to push data: {e}")
+                            plugin._last_push_error = str(e)
+
+        if not collecting_now:
+            return
             
         # --- Write data to CSV if collecting and file is open ---
         if self.collecting_data and self.csv_writer and self.csv_file:
@@ -4158,6 +4342,11 @@ class DataCollectionController(QObject):
                 row_data['timestamp'] = combined_data_copy.get('timestamp', current_emit_time)
                 
                 self.csv_writer.writerow(row_data)
+                # Flush so a crash loses at most one sampling interval, not a large OS buffer.
+                try:
+                    self.csv_file.flush()
+                except Exception:
+                    pass
                 
                 # Track CSV write for data flow monitoring
                 if hasattr(self.main_window, 'data_flow_controller'):
@@ -4651,12 +4840,22 @@ class DataCollectionController(QObject):
             self.log(f"Routing serial command to active Arduino on {target_port}", "DEBUG")
             return self.arduino_thread.send_command(command)
             
-        # 2. Check if it's the Other Serial port
+        # 2. Check if it's an active Other Serial port (multi-port aware).
+        ports = self.interfaces.get('other_serial', {}).get('ports', {})
+        for port_key, port_state in ports.items():
+            if port_state.get('connected') and str(port_key).strip().upper() == target_port:
+                thread = self.other_serial_threads.get(str(port_key))
+                if thread:
+                    self.log(f"Routing serial command to active generic Serial on {target_port}", "DEBUG")
+                    return thread.send_command(command)
+
+        # Legacy flat-state fallback
         other_port = None
         if self.other_serial_thread and hasattr(self.other_serial_thread, 'interface') and self.other_serial_thread.interface:
             other_port = getattr(self.other_serial_thread.interface, 'port', None)
-        if other_port: other_port = str(other_port).strip().upper()
-        
+        if other_port:
+            other_port = str(other_port).strip().upper()
+
         if self.other_serial_connected and other_port == target_port:
             self.log(f"Routing serial command to active generic Serial on {target_port}", "DEBUG")
             return self.other_serial_thread.send_command(command)
@@ -4706,7 +4905,7 @@ class DataCollectionController(QObject):
         """
         self._explicit_reconnect = True
         try:
-            result = self.connect_other_serial(
+            return self.connect_other_serial(
                 port=port,
                 baud_rate=baud_rate,
                 data_bits=data_bits,
@@ -4716,8 +4915,5 @@ class DataCollectionController(QObject):
                 sequence=sequence,
                 sequences=sequences
             )
-            return result
         finally:
             self._explicit_reconnect = False
-        return result
-        return result

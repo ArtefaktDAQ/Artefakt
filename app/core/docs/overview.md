@@ -1,11 +1,11 @@
-# EvoLabs DAQ System Overview
+# Artefakt DAQ System Overview
 
-EvoLabs DAQ is a high-performance Data Acquisition and Automation system designed for experimental research and industrial testing. It follows a **Project-Driven Workflow**, where all data is organized into Projects, Test Series, and individual Runs.
+Artefakt DAQ is a high-performance Data Acquisition and Automation system designed for experimental research and industrial testing. It follows a **Project-Driven Workflow**, where all data is organized into Projects, Test Series, and individual Runs.
 
 ## Core Concepts & Workflow
 
 ### 1. Project-Driven Approach
-Every action in EvoLabs DAQ occurs within a Project context. 
+Every action in Artefakt DAQ occurs within a Project context. 
 - **Project**: The top-level container for a specific research goal.
 - **Test Series**: A group of runs performed under similar conditions within a project.
 - **Run**: A single data acquisition event.

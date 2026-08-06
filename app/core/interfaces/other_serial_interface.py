@@ -14,6 +14,19 @@ from PyQt6.QtCore import QThread, pyqtSignal, QMutex
 from app.core.interfaces.base_interface import BaseInterface
 
 
+def normalize_parse_method(parse_mode):
+    """Map UI short parse modes to engine strings; pass through long form."""
+    mapping = {
+        "after": "After Marker",
+        "between": "Between Markers",
+        "before": "Before Marker",
+        "entire": "Entire Response",
+    }
+    if parse_mode in mapping.values():
+        return parse_mode
+    return mapping.get(parse_mode, "Entire Response")
+
+
 class SerialStep:
     """Base class for a step in a serial sequence"""
     
@@ -121,10 +134,12 @@ class ReadResponseStep(SerialStep):
         if not interface.is_connected():
             print("DEBUG ReadResponseStep: Interface not connected!")
             return False
-            
+
+        original_timeout = None
         try:
             # Set the timeout
-            if hasattr(interface, 'serial'):
+            if hasattr(interface, 'serial') and interface.serial:
+                original_timeout = interface.serial.timeout
                 interface.serial.timeout = self.timeout / 1000.0
                 print(f"DEBUG ReadResponseStep: Set timeout to {self.timeout}ms, read_type='{self.read_type}', result_var='{self.result_var}'")
                 # Check if there's any data waiting
@@ -181,6 +196,9 @@ class ReadResponseStep(SerialStep):
         except Exception as e:
             print(f"Error reading from serial: {e}")
             return False
+        finally:
+            if hasattr(interface, 'serial') and interface.serial and original_timeout is not None:
+                interface.serial.timeout = original_timeout
 
 
 class ParseValueStep(SerialStep):
@@ -253,18 +271,18 @@ class ParseValueStep(SerialStep):
             try:
                 if self.result_type == "Number (Float)":
                     # Find the first floating point number in the string
-                    number_match = re.search(r'[-+]?\d*\.\d+|\d+', result)
+                    number_match = re.search(r'[-+]?\d*\.\d+|\d+', str(result))
                     if number_match:
                         result = float(number_match.group(0)) * self.multiplier
                     else:
-                        result = 0.0
+                        return False
                 elif self.result_type == "Number (Integer)":
                     # Find the first integer in the string
-                    number_match = re.search(r'[-+]?\d+', result)
+                    number_match = re.search(r'[-+]?\d+', str(result))
                     if number_match:
                         result = int(int(number_match.group(0)) * self.multiplier)
                     else:
-                        result = 0
+                        return False
                 # Text type just stays as is
             except (ValueError, TypeError):
                 # If conversion fails, return original string
@@ -488,9 +506,9 @@ class SerialSequence:
                     # UI uses 'source' and 'target' instead of 'source_var' and 'result_var'
                     step = ParseValueStep(
                         source_var=step_data.get("source", "response"),
-                        parse_method=step_data.get("parse_mode", "Entire Response"), # UI uses 'parse_mode'
-                        start_marker=step_data.get("start", ""), # UI uses 'start'
-                        end_marker=step_data.get("end", ""), # UI uses 'end'
+                        parse_method=normalize_parse_method(step_data.get("parse_mode", "entire")),
+                        start_marker=step_data.get("start", ""),
+                        end_marker=step_data.get("end", ""),
                         result_var=step_data.get("target", "value"),
                         multiplier=float(step_data.get("multiplier", 1.0))
                     )
@@ -684,7 +702,11 @@ class OtherSerialInterface(BaseInterface):
                     _ = self.serial.in_waiting
                 return True
             except Exception:
-                # If any exception occurs, port is no longer connected
+                # If any exception occurs, close the port before dropping the reference
+                try:
+                    self.serial.close()
+                except Exception:
+                    pass
                 self.connected = False
                 self.serial = None
                 return False
@@ -983,6 +1005,16 @@ class OtherSerialThread(QThread):
             
             # Send immediate feedback that connection is in progress
             self.connection_status_signal.emit(False, f"Connecting to {port}...")
+
+            # Disconnect previous interface before replacing to avoid port leaks
+            if self.interface:
+                self.interface.should_stop = True
+                try:
+                    self.interface.disconnect()
+                except Exception:
+                    pass
+                time.sleep(0.1)  # Brief wait if thread is mid-read
+                self.interface = None
             
             # Create the interface if it doesn't exist or parameters changed
             self.interface = OtherSerialInterface(

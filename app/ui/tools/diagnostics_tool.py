@@ -489,12 +489,25 @@ class DiagnosticsTool(QWidget):
             vid_pid = f"{port.vid:04X}:{port.pid:04X}" if port.vid and port.pid else "--"
             self.ports_table.setItem(row, 2, QTableWidgetItem(vid_pid))
             
-            # Status (check if in use)
+            # Status (check if in use via data_collection_controller.interfaces)
             status = "Available"
-            if self.main_window and hasattr(self.main_window, 'sensor_controller'):
-                sc = self.main_window.sensor_controller
-                if hasattr(sc, 'arduino_port') and sc.arduino_port == port.device:
-                    status = "In Use (Arduino)"
+            dcc = getattr(self.main_window, 'data_collection_controller', None) if self.main_window else None
+            if dcc and hasattr(dcc, 'interfaces'):
+                try:
+                    arduino = dcc.interfaces.get('arduino', {})
+                    if arduino.get('connected') and str(arduino.get('port', '')) == port.device:
+                        status = "In Use (Arduino)"
+                    other = dcc.interfaces.get('other_serial', {})
+                    if other.get('connected'):
+                        for port_key, port_state in other.get('ports', {}).items():
+                            port_name = port_state.get('port', port_key)
+                            if port_state.get('connected') and str(port_name) == port.device:
+                                status = "In Use (Other Serial)"
+                                break
+                        if status == "Available" and str(other.get('port', '')) == port.device:
+                            status = "In Use (Other Serial)"
+                except (RuntimeError, AttributeError):
+                    pass
             
             status_item = QTableWidgetItem(status)
             if "In Use" in status:
@@ -603,20 +616,24 @@ class DiagnosticsTool(QWidget):
                 cc = getattr(self.main_window, 'camera_controller', None)
                 
                 if cc:
-                    # Use is_connected attribute which is managed by CameraController
-                    is_connected = getattr(cc, 'is_connected', False)
+                    is_connected = cc.any_connected() if hasattr(cc, 'any_connected') else any(getattr(cc, 'is_connected', []) or [])
                     card.set_connected(is_connected)
                     
                     if is_connected:
-                        card.update_info("name", str(getattr(cc, 'camera_name', 'Camera')))
+                        connected_count = sum(1 for c in getattr(cc, 'is_connected', []) if c)
+                        card.update_info("name", f"{connected_count} Cam(s)")
                         
-                        width = getattr(cc, 'frame_width', 0)
-                        height = getattr(cc, 'frame_height', 0)
-                        if width and height:
-                            card.update_info("resolution", f"{int(width)}x{int(height)}")
-                        
-                        fps = getattr(cc, 'current_fps', 0)
-                        card.update_info("fps", f"{fps:.1f}")
+                        # Prefer active/main view thread for resolution/fps
+                        idx = getattr(cc, 'main_view_index', 0)
+                        threads = getattr(cc, 'camera_threads', None)
+                        thread = threads[idx] if threads and idx < len(threads) else None
+                        if thread:
+                            width = getattr(thread, 'width', 0)
+                            height = getattr(thread, 'height', 0)
+                            if width and height:
+                                card.update_info("resolution", f"{int(width)}x{int(height)}")
+                            fps = thread.get_actual_fps() if hasattr(thread, 'get_actual_fps') else 0
+                            card.update_info("fps", f"{fps:.1f}")
         except Exception as e:
             print(f"Error in DiagnosticsTool._update_device_status: {e}")
 
@@ -626,28 +643,27 @@ class DiagnosticsTool(QWidget):
             return
             
         try:
-            # Calculate current data rate
             total_samples = 0
             dc = getattr(self.main_window, 'data_collection_controller', None)
             
-            if dc and hasattr(dc, 'collected_data'):
-                # Safely iterate over dictionary items
+            if dc and hasattr(dc, 'historical_buffer') and hasattr(dc, 'historical_buffer_mutex'):
                 try:
-                    # Create a static copy of items to avoid RuntimeError during iteration
-                    items = list(dc.collected_data.items())
-                    for sensor_key, data in items:
+                    dc.historical_buffer_mutex.lock()
+                    try:
+                        buffer_items = list(dc.historical_buffer.items())
+                    finally:
+                        dc.historical_buffer_mutex.unlock()
+
+                    for sensor_key, data_deque in buffer_items:
                         try:
-                            current_count = len(data.get('time', []))
-                            
+                            current_count = len(data_deque)
                             if sensor_key in self.last_sample_counts:
                                 diff = current_count - self.last_sample_counts[sensor_key]
                                 total_samples += max(0, diff)
-                            
                             self.last_sample_counts[sensor_key] = current_count
                         except (AttributeError, TypeError, RuntimeError):
                             continue
                 except RuntimeError:
-                    # If dictionary changed size during items() call
                     pass
             
             # Add to history
@@ -797,17 +813,22 @@ class DiagnosticsTool(QWidget):
                 self.serial_monitor.append_error("Camera controller not available")
                 return
             
-            if getattr(cc, 'camera_connected', False):
+            is_connected = cc.any_connected() if hasattr(cc, 'any_connected') else any(getattr(cc, 'is_connected', []) or [])
+            if is_connected:
                 self.serial_monitor.append_received("Camera is connected")
-                self.serial_monitor.append_info(f"Name: {getattr(cc, 'camera_name', 'Camera')}")
-                
-                width = getattr(cc, 'frame_width', 0)
-                height = getattr(cc, 'frame_height', 0)
-                if width and height:
-                    self.serial_monitor.append_info(f"Resolution: {int(width)}x{int(height)}")
-                
-                fps = getattr(cc, 'current_fps', 0)
-                self.serial_monitor.append_info(f"FPS: {fps:.1f}")
+                connected_count = sum(1 for c in getattr(cc, 'is_connected', []) if c)
+                self.serial_monitor.append_info(f"Name: {connected_count} Cam(s)")
+
+                idx = getattr(cc, 'main_view_index', 0)
+                threads = getattr(cc, 'camera_threads', None)
+                thread = threads[idx] if threads and idx < len(threads) else None
+                if thread:
+                    width = getattr(thread, 'width', 0)
+                    height = getattr(thread, 'height', 0)
+                    if width and height:
+                        self.serial_monitor.append_info(f"Resolution: {int(width)}x{int(height)}")
+                    fps = thread.get_actual_fps() if hasattr(thread, 'get_actual_fps') else 0
+                    self.serial_monitor.append_info(f"FPS: {fps:.1f}")
             else:
                 self.serial_monitor.append_error("Camera is not connected")
         except Exception as e:
@@ -821,4 +842,6 @@ class DiagnosticsTool(QWidget):
     def stop(self):
         """Stop monitoring"""
         self.update_timer.stop()
+        self.monitor_btn.setChecked(False)
+        self.monitor_btn.setText("▶ Start Monitoring")
 

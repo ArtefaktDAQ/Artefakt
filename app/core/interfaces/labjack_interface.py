@@ -351,8 +351,8 @@ class LabJackInterface(BaseInterface):
                 data = {}
                 
                 # 1. Collect all names we want to read
-                # Always read AIN0-AIN3 as "standard" defaults
-                standard_names = ["AIN0", "AIN1", "AIN2", "AIN3"]
+                # Read AIN0-AIN13 (full T7 analog input range)
+                standard_names = [f"AIN{i}" for i in range(14)]
                 
                 # Add EF channels from cache
                 ef_channels = self.get_ef_channels()
@@ -390,9 +390,16 @@ class LabJackInterface(BaseInterface):
                         except ljm.LJMError:
                             continue
                 
-                # Update health tracking
-                self._last_successful_read = time.time()
-                self._consecutive_errors = 0
+                # Update health tracking only when at least one channel succeeded
+                if data:
+                    self._last_successful_read = time.time()
+                    self._consecutive_errors = 0
+                else:
+                    self._consecutive_errors += 1
+                    logger.warning(
+                        f"LabJack read returned no channel values "
+                        f"(consecutive errors: {self._consecutive_errors})"
+                    )
                 
                 # Log slow reads to help debug timing issues
                 read_duration = time.time() - read_start_time

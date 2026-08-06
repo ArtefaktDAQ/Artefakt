@@ -5,6 +5,7 @@ Handles communication with Arduino devices.
 """
 
 import time
+import threading
 import serial
 import serial.tools.list_ports
 from app.core.interfaces.base_interface import BaseInterface
@@ -78,6 +79,7 @@ class ArduinoInterface(BaseInterface):
         self._consecutive_errors = 0
         self._max_consecutive_errors = 3  # Disconnect after this many consecutive errors
         self._discovered_sensors = set()
+        self._serial_lock = threading.RLock()
 
     @classmethod
     def get_output_keys(cls):
@@ -97,6 +99,16 @@ class ArduinoInterface(BaseInterface):
             return cls.list_ports()
         return []
         
+    def _check_connected(self):
+        """Check connection state. Must be called with _serial_lock held."""
+        if not self.connected or self.serial is None:
+            return False
+        try:
+            return self.serial.is_open
+        except Exception:
+            self.connected = False
+            return False
+
     def connect(self, wait_for_reset=True):
         """
         Connect to the Arduino device
@@ -108,6 +120,10 @@ class ArduinoInterface(BaseInterface):
         Returns:
             True if connected successfully, False otherwise
         """
+        with self._serial_lock:
+            return self._connect_unlocked(wait_for_reset)
+
+    def _connect_unlocked(self, wait_for_reset=True):
         try:
             # Close any existing connection first
             if self.serial:
@@ -160,8 +176,8 @@ class ArduinoInterface(BaseInterface):
             self.serial = None
             return False
             
-    def disconnect(self):
-        """Disconnect from the Arduino device"""
+    def _disconnect_unlocked(self):
+        """Close the serial port. Must be called with _serial_lock held."""
         self.connected = False
         if self.serial:
             try:
@@ -169,6 +185,11 @@ class ArduinoInterface(BaseInterface):
             except Exception:
                 pass  # Ignore errors during close
             self.serial = None
+
+    def disconnect(self):
+        """Disconnect from the Arduino device"""
+        with self._serial_lock:
+            self._disconnect_unlocked()
             
     def is_connected(self):
         """
@@ -177,15 +198,8 @@ class ArduinoInterface(BaseInterface):
         Returns:
             True if connected, False otherwise
         """
-        if not self.connected or self.serial is None:
-            return False
-        
-        # Verify the serial port is actually open
-        try:
-            return self.serial.is_open
-        except Exception:
-            self.connected = False
-            return False
+        with self._serial_lock:
+            return self._check_connected()
     
     def _handle_serial_error(self, error):
         """
@@ -202,8 +216,8 @@ class ArduinoInterface(BaseInterface):
         
         if self._consecutive_errors >= self._max_consecutive_errors:
             print("Arduino: Too many consecutive errors, marking as disconnected")
-            self.connected = False
             self.error_message = f"Connection lost: {error}"
+            self._disconnect_unlocked()
             
             # Notify parent if callback is set
             if self.on_connection_lost:
@@ -222,28 +236,29 @@ class ArduinoInterface(BaseInterface):
         Returns:
             Dictionary with sensor values or None if failed
         """
-        if not self.is_connected():
-            return None
-        
-        try:
-            # Handle polling mode
-            if self.mode.lower() == "polled":
-                return self._read_polled()
-            else:
-                return self._read_continuous()
-                
-        except serial.SerialException as e:
-            if self._handle_serial_error(e):
+        with self._serial_lock:
+            if not self._check_connected():
                 return None
-            return None
-        except OSError as e:
-            # OSError can occur when device is unplugged
-            if self._handle_serial_error(e):
+            
+            try:
+                # Handle polling mode
+                if self.mode.lower() == "polled":
+                    return self._read_polled()
+                else:
+                    return self._read_continuous()
+                    
+            except serial.SerialException as e:
+                if self._handle_serial_error(e):
+                    return None
                 return None
-            return None
-        except Exception as e:
-            print(f"Unexpected error reading from Arduino: {e}")
-            return None
+            except OSError as e:
+                # OSError can occur when device is unplugged
+                if self._handle_serial_error(e):
+                    return None
+                return None
+            except Exception as e:
+                print(f"Unexpected error reading from Arduino: {e}")
+                return None
     
     def _read_polled(self):
         """Read data in polled mode - simplified logic"""
@@ -319,30 +334,31 @@ class ArduinoInterface(BaseInterface):
         Returns:
             True if successful, False otherwise
         """
-        if not self.is_connected():
-            return False
-            
-        try:
-            if isinstance(data, str):
-                self.serial.write(data.encode('utf-8', errors='replace'))
-            else:
-                self.serial.write(data)
-            # Flush the write buffer to ensure data is sent
-            self.serial.flush()
-            self._consecutive_errors = 0  # Reset error counter on successful write
-            return True
-            
-        except serial.SerialException as e:
-            self.error_message = f"Serial error writing data: {e}"
-            self._handle_serial_error(e)
-            return False
-        except OSError as e:
-            self.error_message = f"OS error writing data: {e}"
-            self._handle_serial_error(e)
-            return False
-        except Exception as e:
-            self.error_message = f"Error writing data: {e}"
-            return False
+        with self._serial_lock:
+            if not self._check_connected():
+                return False
+                
+            try:
+                if isinstance(data, str):
+                    self.serial.write(data.encode('utf-8', errors='replace'))
+                else:
+                    self.serial.write(data)
+                # Flush the write buffer to ensure data is sent
+                self.serial.flush()
+                self._consecutive_errors = 0  # Reset error counter on successful write
+                return True
+                
+            except serial.SerialException as e:
+                self.error_message = f"Serial error writing data: {e}"
+                self._handle_serial_error(e)
+                return False
+            except OSError as e:
+                self.error_message = f"OS error writing data: {e}"
+                self._handle_serial_error(e)
+                return False
+            except Exception as e:
+                self.error_message = f"Error writing data: {e}"
+                return False
             
     @staticmethod
     def list_ports():

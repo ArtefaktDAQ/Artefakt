@@ -10,7 +10,7 @@ import threading
 import queue
 import grpc
 from concurrent import futures
-from PyQt6.QtCore import QObject, pyqtSignal, QTimer, QThread
+from PyQt6.QtCore import QObject, pyqtSignal, QTimer, QThread, QMutexLocker
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                             QPushButton, QLineEdit, QCheckBox, QTextEdit,
                             QMessageBox, QTableWidget, QTableWidgetItem,
@@ -23,6 +23,25 @@ from PyQt6.QtGui import QColor, QFont
 from app.core.logger import Logger
 from app.ui.theme import GroupBoxStyles, ButtonStyles, CardStyles, COLORS
 from app.utils.common_types import StatusState
+
+GRPC_CHANNEL_OPTIONS = [
+    ('grpc.keepalive_time_ms', 10000),
+    ('grpc.keepalive_timeout_ms', 5000),
+    ('grpc.http2.max_pings_without_data', 0),
+    ('grpc.keepalive_permit_without_calls', 1),
+]
+GRPC_CONNECT_TIMEOUT = 5.0
+DEFAULT_GRPC_PORT = 50051
+
+
+def _parse_grpc_target(master_address, default_port=DEFAULT_GRPC_PORT):
+    """Return host:port, preserving an explicit port in master_address."""
+    address = master_address.strip()
+    if ':' in address:
+        host, port = address.rsplit(':', 1)
+        return f"{host}:{port}"
+    return f"{address}:{default_port}"
+
 
 # Import protobuf generated files
 try:
@@ -43,6 +62,7 @@ class StreamController(QObject):
     remote_video_available = pyqtSignal(bool)
     status_changed = pyqtSignal()
     error_occurred = pyqtSignal(str)  # Error message
+    connect_finished = pyqtSignal(bool, str)
     
     def __init__(self, main_window):
         super().__init__()
@@ -73,8 +93,22 @@ class StreamController(QObject):
         
         # gRPC components
         self.grpc_server = None
+        self.grpc_executor = None
+        self.service_servicer = None
         self.grpc_thread = None
         self.client_stub = None
+        self.client_session_id = None
+        self.client_stop_event = threading.Event()
+        self.receive_threads = []
+        self._connect_worker = None
+        self._pending_available_sensors = []
+        
+        # Coalesced remote UI updates (GRPC-10)
+        self._pending_sensor_data = {}
+        self._pending_video_frame = None
+        self._ui_coalesce_timer = QTimer()
+        self._ui_coalesce_timer.setInterval(50)
+        self._ui_coalesce_timer.timeout.connect(self._drain_pending_remote_ui)
         
         # UI elements
         self.setup_ui()
@@ -176,11 +210,17 @@ class StreamController(QObject):
                              enable_audio=False):
         """Start streaming as master (data source)"""
         try:
-            self.is_master = True
+            # STR-R-11: mutual exclusion with client mode
+            if self.is_client:
+                self.disconnect_from_stream(self.current_stream_name)
+            if self.grpc_server:
+                self.stop_master_streaming()
             
             # Start gRPC server
             self.start_grpc_server(stream_name, password, description,
                                  enable_sensors, enable_video, enable_audio)
+            
+            self.is_master = True
             
             # Store current stream info
             self.current_stream_name = stream_name
@@ -201,6 +241,7 @@ class StreamController(QObject):
             return True, "Streaming started successfully"
             
         except Exception as e:
+            self.is_master = False
             self.logger.log(f"Failed to start streaming: {str(e)}", "ERROR")
             self.error_occurred.emit(f"Failed to start streaming: {str(e)}")
             return False, str(e)
@@ -208,15 +249,78 @@ class StreamController(QObject):
     def connect_to_master_stream(self, master_address, stream_name, password, 
                                client_name, request_sensors=True, request_video=True,
                                request_audio=False):
-        """Connect as client to a master stream"""
+        """Connect as client to a master stream (blocking, main-thread safe)."""
+        # Mutual exclusion when called synchronously from UI thread
+        if self.is_master:
+            self.stop_master_streaming()
+        if self.is_client:
+            self.disconnect_from_stream(self.current_stream_name)
+        success, message = self._connect_to_master_stream_sync(
+            master_address, stream_name, password, client_name,
+            request_sensors, request_video, request_audio
+        )
+        if success:
+            self._apply_pending_available_sensors()
+        return success, message
+
+    def begin_connect_to_master_stream(self, master_address, stream_name, password,
+                                       client_name, request_sensors=True, request_video=True,
+                                       request_audio=False):
+        """Start non-blocking connect in a background thread (GRPC-03)."""
+        if self._connect_worker and self._connect_worker.isRunning():
+            return False
+        # Mutual exclusion / reconnect cleanup must run on the UI thread
+        if self.is_master:
+            self.stop_master_streaming()
+        if self.is_client:
+            self.disconnect_from_stream(self.current_stream_name)
+
+        self._connect_worker = _ConnectWorker(
+            self, master_address, stream_name, password, client_name,
+            request_sensors, request_video, request_audio
+        )
+        self._connect_worker.finished_with_result.connect(self._on_async_connect_finished)
+        self._connect_worker.start()
+        return True
+
+    def _on_async_connect_finished(self, success, message):
+        """Main-thread follow-up after background connect (sensor ingest is UI-bound)."""
+        if success:
+            self._apply_pending_available_sensors()
+        self.connect_finished.emit(success, message)
+
+    def _apply_pending_available_sensors(self):
+        """Register sensors advertised at connect time (must run on main thread)."""
+        available = getattr(self, '_pending_available_sensors', None) or []
+        self._pending_available_sensors = []
+        if not available:
+            return
+        for rs in available:
+            self._ingest_remote_sensor(
+                sensor_id=rs.id,
+                name=rs.name,
+                unit=rs.unit,
+                value=rs.current_value,
+                timestamp_ms=None,
+                update_table_on_create=False,
+            )
+        self.remote_sensors_available.emit(available)
+        if hasattr(self.main_window, 'sensor_controller'):
+            self.main_window.sensor_controller.update_sensor_table()
+
+    def _connect_to_master_stream_sync(self, master_address, stream_name, password,
+                                       client_name, request_sensors=True, request_video=True,
+                                       request_audio=False):
+        """Internal synchronous connect with timeout. Avoid Qt UI work here (may run off main thread)."""
+        if daq_service_pb2 is None or daq_service_pb2_grpc is None:
+            return False, "gRPC protobuf files not available"
+
+        channel = None
         try:
-            self.is_client = True
-            
-            # Create gRPC channel
-            channel = grpc.insecure_channel(f"{master_address}:50051")
-            self.client_stub = daq_service_pb2_grpc.DAQServiceStub(channel)
-            
-            # Connect to stream
+            target = _parse_grpc_target(master_address)
+            channel = grpc.insecure_channel(target, options=GRPC_CHANNEL_OPTIONS)
+            client_stub = daq_service_pb2_grpc.DAQServiceStub(channel)
+
             request = daq_service_pb2.ConnectRequest(
                 master_address=master_address,
                 stream_name=stream_name,
@@ -226,37 +330,50 @@ class StreamController(QObject):
                 client_name=client_name,
                 request_audio=request_audio
             )
-            
-            response = self.client_stub.ConnectToStream(request)
-            
+
+            response = client_stub.ConnectToStream(request, timeout=GRPC_CONNECT_TIMEOUT)
+
             if response.success:
+                self.is_client = True
+                self.client_stub = client_stub
+                self.client_session_id = response.session_id
                 self.connected_streams[stream_name] = channel
-                # Store current connection info
+                self.client_stop_event.clear()
+                self.receive_threads.clear()
                 self.current_master_address = master_address
                 self.current_stream_name = stream_name
                 self.current_stream_password = password
                 self.current_client_name = client_name
                 self.current_request_audio = request_audio
-                
+
+                # Defer SensorModel/UI ingest to main thread (see _on_async_connect_finished)
+                self._pending_available_sensors = list(response.available_sensors) if response.available_sensors else []
+
                 self.logger.log(f"Connected to stream: {stream_name}", "INFO")
                 self.stream_connected.emit(stream_name)
                 self.status_changed.emit()
-                
 
-                
-                # Start receiving data
                 if request_sensors:
                     self.start_sensor_streaming(stream_name)
                 if request_video:
                     self.start_video_streaming(stream_name)
                 if request_audio:
                     self.start_audio_streaming(stream_name)
-                
+
                 return True, "Connected successfully"
             else:
+                channel.close()
                 return False, response.message
-                
+
         except Exception as e:
+            self.is_client = False
+            self.client_stub = None
+            self.client_session_id = None
+            if channel is not None:
+                try:
+                    channel.close()
+                except Exception:
+                    pass
             self.logger.log(f"Failed to connect to stream: {str(e)}", "ERROR")
             self.error_occurred.emit(f"Connection failed: {str(e)}")
             return False, str(e)
@@ -267,36 +384,60 @@ class StreamController(QObject):
         if daq_service_pb2_grpc is None:
             raise ImportError("gRPC protobuf files not available")
         
-        # Create server
-        self.grpc_server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+        self.grpc_executor = futures.ThreadPoolExecutor(max_workers=10)
+        self.grpc_server = grpc.server(self.grpc_executor)
         
-        # Add service
-        service_servicer = DAQServiceServicer(self.main_window, stream_name, password, enable_audio=enable_audio)
-        daq_service_pb2_grpc.add_DAQServiceServicer_to_server(service_servicer, self.grpc_server)
+        self.service_servicer = DAQServiceServicer(
+            self.main_window, stream_name, password,
+            enable_sensors=enable_sensors,
+            enable_video=enable_video,
+            enable_audio=enable_audio
+        )
+        daq_service_pb2_grpc.add_DAQServiceServicer_to_server(
+            self.service_servicer, self.grpc_server
+        )
         
-        # Start server
-        port = 50051
-        self.grpc_server.add_insecure_port(f'[::]:{port}')
+        port = DEFAULT_GRPC_PORT
+        bound = self.grpc_server.add_insecure_port(f'[::]:{port}')
+        if bound == 0:
+            raise RuntimeError(f"Failed to bind gRPC port {port}")
         self.grpc_server.start()
         
         self.logger.log(f"gRPC server started on port {port}", "INFO")
+    
+    def _stream_metadata(self):
+        """Client metadata for authenticated stream RPCs."""
+        if self.client_session_id:
+            return (('session-id', self.client_session_id),)
+        return ()
+    
+    def _on_client_stream_lost(self):
+        """Handle unexpected client stream disconnect (GRPC-12)."""
+        if self.is_client:
+            self.logger.log("Client stream connection lost", "WARNING")
+            self.disconnect_from_stream(self.current_stream_name)
     
     def start_sensor_streaming(self, stream_name):
         """Start receiving sensor data from stream"""
         if not self.client_stub:
             return
         
+        metadata = self._stream_metadata()
+        
         def receive_sensor_data():
             try:
                 request = daq_service_pb2.StreamRequest()
-                for sensor_data in self.client_stub.StreamSensorData(request):
-                    # Process received sensor data
+                for sensor_data in self.client_stub.StreamSensorData(request, metadata=metadata):
+                    if self.client_stop_event.is_set():
+                        break
                     self.process_remote_sensor_data(sensor_data)
             except Exception as e:
-                self.logger.log(f"Sensor streaming error: {str(e)}", "ERROR")
+                if not self.client_stop_event.is_set():
+                    self.logger.log(f"Sensor streaming error: {str(e)}", "ERROR")
+                    QTimer.singleShot(0, self._on_client_stream_lost)
         
-        # Start in separate thread
         sensor_thread = threading.Thread(target=receive_sensor_data, daemon=True)
+        self.receive_threads.append(sensor_thread)
         sensor_thread.start()
     
     def start_video_streaming(self, stream_name):
@@ -304,23 +445,30 @@ class StreamController(QObject):
         if not self.client_stub:
             return
         
+        metadata = self._stream_metadata()
+        
         def receive_video_data():
             try:
                 request = daq_service_pb2.VideoRequest()
-                for video_frame in self.client_stub.StreamVideo(request):
-                    # Process received video frame
+                for video_frame in self.client_stub.StreamVideo(request, metadata=metadata):
+                    if self.client_stop_event.is_set():
+                        break
                     self.process_remote_video_frame(video_frame)
             except Exception as e:
-                self.logger.log(f"Video streaming error: {str(e)}", "ERROR")
+                if not self.client_stop_event.is_set():
+                    self.logger.log(f"Video streaming error: {str(e)}", "ERROR")
+                    QTimer.singleShot(0, self._on_client_stream_lost)
         
-        # Start in separate thread
         video_thread = threading.Thread(target=receive_video_data, daemon=True)
+        self.receive_threads.append(video_thread)
         video_thread.start()
 
     def start_audio_streaming(self, stream_name):
         """Start receiving audio data from stream and play back locally"""
         if not self.client_stub:
             return
+        
+        metadata = self._stream_metadata()
         
         def receive_audio_data():
             try:
@@ -333,7 +481,9 @@ class StreamController(QObject):
                 audio_request = daq_service_pb2.AudioRequest()
                 output_stream = None
                 
-                for audio_frame in self.client_stub.StreamAudio(audio_request):
+                for audio_frame in self.client_stub.StreamAudio(audio_request, metadata=metadata):
+                    if self.client_stop_event.is_set():
+                        break
                     # Lazily create output stream using first frame parameters
                     if output_stream is None:
                         sample_rate = audio_frame.sample_rate or 44100
@@ -353,7 +503,9 @@ class StreamController(QObject):
                             break
             
             except Exception as e:
-                self.logger.log(f"Audio streaming error: {str(e)}", "ERROR")
+                if not self.client_stop_event.is_set():
+                    self.logger.log(f"Audio streaming error: {str(e)}", "ERROR")
+                    QTimer.singleShot(0, self._on_client_stream_lost)
             
             finally:
                 try:
@@ -364,33 +516,51 @@ class StreamController(QObject):
                     pass
         
         audio_thread = threading.Thread(target=receive_audio_data, daemon=True)
+        self.receive_threads.append(audio_thread)
         audio_thread.start()
     
     def process_remote_sensor_data(self, sensor_data):
-        """Process received sensor data and add to local sensors"""
-        # Record in data flow controller
+        """Queue sensor data for coalesced UI update (GRPC-10)."""
+        self._pending_sensor_data[sensor_data.sensor_id] = sensor_data
+        if not self._ui_coalesce_timer.isActive():
+            self._ui_coalesce_timer.start()
+
+    def process_remote_video_frame(self, video_frame):
+        """Queue latest video frame for coalesced UI update (GRPC-10)."""
+        self._pending_video_frame = video_frame
+        if not self._ui_coalesce_timer.isActive():
+            self._ui_coalesce_timer.start()
+
+    def _drain_pending_remote_ui(self):
+        """Drain coalesced remote updates on the main thread."""
+        pending_sensors = self._pending_sensor_data
+        pending_video = self._pending_video_frame
+        self._pending_sensor_data = {}
+        self._pending_video_frame = None
+        if not pending_sensors and pending_video is None:
+            self._ui_coalesce_timer.stop()
+            return
+        for sensor_data in pending_sensors.values():
+            self._process_remote_sensor_data_ui(sensor_data)
+        if pending_video is not None:
+            self._process_remote_video_frame_ui(pending_video)
+        if not self._pending_sensor_data and self._pending_video_frame is None:
+            self._ui_coalesce_timer.stop()
+
+    def _process_remote_sensor_data_ui(self, sensor_data):
         if self.main_window and hasattr(self.main_window, 'data_flow_controller'):
             self.main_window.data_flow_controller.record_remote_daq_data(len(str(sensor_data)))
 
-        # Create or update remote sensor
-        remote_sensor = RemoteSensor(
-            id=sensor_data.sensor_id,
+        timestamp_ms = getattr(sensor_data, 'timestamp', None)
+        self._ingest_remote_sensor(
+            sensor_id=sensor_data.sensor_id,
             name=sensor_data.sensor_name,
             unit=sensor_data.unit,
-            current_value=sensor_data.value,
-            interface_type="remote_stream",
-            available=True,
-            color="#FF6B6B"  # Red for remote sensors
+            value=sensor_data.value,
+            timestamp_ms=timestamp_ms,
         )
-        
-        self.remote_sensors[sensor_data.sensor_id] = remote_sensor
-        
-        # Add to local sensor controller if not already present
-        if hasattr(self.main_window, 'sensor_controller'):
-            self.add_remote_sensor_to_local(remote_sensor)
-    
-    def process_remote_video_frame(self, video_frame):
-        """Process received video frame"""
+
+    def _process_remote_video_frame_ui(self, video_frame):
         # Record in data flow controller
         if self.main_window and hasattr(self.main_window, 'data_flow_controller'):
             self.main_window.data_flow_controller.record_remote_daq_data(len(video_frame.frame_data))
@@ -398,6 +568,14 @@ class StreamController(QObject):
         # Convert bytes to numpy array
         import numpy as np
         import cv2
+        
+        expected_len = video_frame.height * video_frame.width * video_frame.channels
+        if len(video_frame.frame_data) != expected_len:
+            self.logger.log(
+                f"Remote video frame size mismatch: got {len(video_frame.frame_data)}, expected {expected_len}",
+                "ERROR"
+            )
+            return
         
         frame_array = np.frombuffer(video_frame.frame_data, dtype=np.uint8)
         frame = frame_array.reshape((video_frame.height, video_frame.width, video_frame.channels))
@@ -407,60 +585,162 @@ class StreamController(QObject):
             self.main_window.camera_controller.display_remote_frame(frame)
     
     def add_remote_sensor_to_local(self, remote_sensor):
-        """Add remote sensor to local sensor controller"""
+        """Add or update a remote sensor in the local sensor controller (main thread)."""
+        self._ingest_remote_sensor(
+            sensor_id=remote_sensor.id,
+            name=remote_sensor.name,
+            unit=remote_sensor.unit,
+            value=remote_sensor.current_value,
+            timestamp_ms=None,
+        )
+
+    def _find_local_remote_sensor(self, remote_id, name):
+        """Find an existing local SensorModel for a remote sensor."""
+        if not hasattr(self.main_window, 'sensor_controller'):
+            return None
+        sc = self.main_window.sensor_controller
+        for sensor in sc.sensors:
+            if getattr(sensor, 'is_remote', False) and getattr(sensor, 'remote_id', None) == remote_id:
+                return sensor
+        return sc.get_sensor_by_name(f"Remote: {name}")
+
+    def _ingest_remote_sensor(self, sensor_id, name, unit, value, timestamp_ms=None,
+                              update_table_on_create=True):
+        """Create/update SensorModel and push sample into the DCC pipeline."""
+        sample_ts = (timestamp_ms / 1000.0) if timestamp_ms else time.time()
+
+        remote_sensor = RemoteSensor(
+            id=sensor_id,
+            name=name,
+            unit=unit or "",
+            current_value=value,
+            interface_type="remote_stream",
+            available=True,
+            color="#FF6B6B",
+        )
+        self.remote_sensors[sensor_id] = remote_sensor
+
         if not hasattr(self.main_window, 'sensor_controller'):
             return
-        
-        # Check if sensor already exists
-        existing_sensor = self.main_window.sensor_controller.get_sensor_by_name(
-            f"Remote: {remote_sensor.name}"
-        )
-        
-        if not existing_sensor:
-            # Create new sensor
+
+        sc = self.main_window.sensor_controller
+        sensor = self._find_local_remote_sensor(sensor_id, name)
+        created = False
+
+        if sensor:
+            if unit and sensor.unit != unit:
+                sensor.unit = unit
+        else:
             from app.models.sensor_model import SensorModel
-            
+
             sensor = SensorModel(
-                name=f"Remote: {remote_sensor.name}",
+                name=f"Remote: {name}",
                 interface_type="remote_stream",
-                unit=remote_sensor.unit,
-                color=remote_sensor.color
+                unit=unit or "",
+                color="#FF6B6B",
             )
             sensor.is_remote = True
-            sensor.remote_id = remote_sensor.id
-            
-            self.main_window.sensor_controller.sensors.append(sensor)
-            self.main_window.sensor_controller.update_sensor_table()
+            sensor.remote_id = sensor_id
+            sc.sensors.append(sensor)
+            created = True
+
+        if value is not None:
+            sensor.set_value(value)
+            sensor.last_update_time = sample_ts
+            self._push_remote_sample_to_dcc(sensor, value, sample_ts)
+
+        if created and update_table_on_create:
+            sc.update_sensor_table()
+
+    def _push_remote_sample_to_dcc(self, sensor, value, sample_ts):
+        """Write remote sample into combined_data and historical_buffer (mirror MQTT path)."""
+        if not hasattr(self.main_window, 'data_collection_controller'):
+            return
+
+        dcc = self.main_window.data_collection_controller
+        sc = self.main_window.sensor_controller
+        key = sc.get_historical_buffer_key(sensor)
+        if not key:
+            return
+
+        store_data = dcc.collecting_data
+
+        with QMutexLocker(dcc.combined_data_mutex):
+            dcc.combined_data[key] = value
+            dcc._last_sensor_update[key] = sample_ts
+
+            if store_data:
+                with QMutexLocker(dcc.historical_buffer_mutex):
+                    try:
+                        dcc.historical_buffer[key].append((sample_ts, float(value)))
+                    except (ValueError, TypeError):
+                        pass
+                if 'timestamp' not in dcc.combined_data or sample_ts > dcc.combined_data.get('timestamp', 0):
+                    dcc.combined_data['timestamp'] = sample_ts
     
-    def disconnect_from_stream(self, stream_name):
-        """Disconnect from a stream"""
+    def disconnect_from_stream(self, stream_name=None):
+        """Disconnect from a stream (STR-R-08: empty/mismatch closes all)."""
         try:
-            if stream_name in self.connected_streams:
-                channel = self.connected_streams[stream_name]
-                channel.close()
-                del self.connected_streams[stream_name]
-            
+            self.client_stop_event.set()
+
+            # Notify master before tearing down channel
+            if self.client_stub and self.client_session_id:
+                try:
+                    metadata = self._stream_metadata()
+                    self.client_stub.DisconnectFromStream(
+                        daq_service_pb2.DisconnectRequest(), timeout=3, metadata=metadata
+                    )
+                except Exception:
+                    pass
+
+            targets = []
+            if stream_name and stream_name in self.connected_streams:
+                targets = [stream_name]
+            elif self.connected_streams:
+                targets = list(self.connected_streams.keys())
+
+            for name in targets:
+                channel = self.connected_streams.pop(name, None)
+                if channel is not None:
+                    try:
+                        channel.close()
+                    except Exception:
+                        pass
+
             self.is_client = False
             self.client_stub = None
-            
-            # Clear current connection info
+            self.client_session_id = None
+            self.receive_threads.clear()
+
+            self._cleanup_remote_sensors()
+            self._pending_sensor_data.clear()
+            self._pending_video_frame = None
+            self._ui_coalesce_timer.stop()
+
+            disconnected_name = stream_name or self.current_stream_name or "stream"
             self.current_master_address = ""
             self.current_stream_name = ""
             self.current_stream_password = ""
             self.current_client_name = ""
             self.current_request_audio = False
-            
-            self.logger.log(f"Disconnected from stream: {stream_name}", "INFO")
+
+            self.logger.log(f"Disconnected from stream: {disconnected_name}", "INFO")
             self.stream_disconnected.emit()
             self.status_changed.emit()
-            
 
-            
             return True, "Disconnected successfully"
-            
+
         except Exception as e:
             self.logger.log(f"Failed to disconnect: {str(e)}", "ERROR")
             return False, str(e)
+
+    def _cleanup_remote_sensors(self):
+        """Remove remote sensors from local controller and clear remote registry."""
+        if hasattr(self.main_window, 'sensor_controller'):
+            sc = self.main_window.sensor_controller
+            sc.sensors = [s for s in sc.sensors if not getattr(s, 'is_remote', False)]
+            sc.update_sensor_table()
+        self.remote_sensors.clear()
     
     def stop_master_streaming(self):
         """Stop master streaming"""
@@ -468,7 +748,11 @@ class StreamController(QObject):
             if self.grpc_server:
                 self.grpc_server.stop(0)
                 self.grpc_server = None
-            
+            if self.grpc_executor:
+                self.grpc_executor.shutdown(wait=False)
+                self.grpc_executor = None
+            self.service_servicer = None
+
             self.is_master = False
             
             # Clear current stream info
@@ -496,6 +780,19 @@ class StreamController(QObject):
     
     def update_status(self):
         """Update connection status"""
+        # REM-UI-01: update remote card label text
+        if hasattr(self, 'remote_status_label') and self.remote_status_label:
+            if self.is_master:
+                self.remote_status_label.setText(f"Master: {self.current_stream_name}")
+            elif self.is_client:
+                self.remote_status_label.setText(f"Client: {self.current_stream_name}")
+            else:
+                self.remote_status_label.setText("LAN / VPN only")
+
+        # REM-UI-03: track remote_stream interface connection
+        if hasattr(self.main_window, 'interface_connections'):
+            self.main_window.interface_connections['remote_stream'] = self.is_client or self.is_master
+
         # Update the remote DAQ button text to show status
         if hasattr(self, 'remote_container') and self.remote_container:
             if self.is_master:
@@ -531,10 +828,6 @@ class StreamController(QObject):
                 self.main_window.statusBar().showMessage(f"🟢 STREAMING: {self.current_stream_name} (Master Mode)")
             elif self.is_client:
                 self.main_window.statusBar().showMessage(f"🔵 CONNECTED: {self.current_stream_name} (Client Mode)")
-            else:
-                # Only clear if we're not streaming (don't override other status messages)
-                if not self.is_master and not self.is_client:
-                    self.main_window.statusBar().showMessage("Ready")
     
     def get_status(self):
         """Get current streaming status"""
@@ -567,53 +860,110 @@ else:
 class DAQServiceServicer(DAQServiceBase):
     """gRPC service implementation for DAQ streaming"""
     
-    def __init__(self, main_window, stream_name, password, enable_audio=False):
+    def __init__(self, main_window, stream_name, password,
+                 enable_sensors=True, enable_video=True, enable_audio=False):
         self.main_window = main_window
         self.stream_name = stream_name
         self.password = password
+        self.enable_sensors = enable_sensors
+        self.enable_video = enable_video
+        self.enable_audio = enable_audio
         self.connected_clients = {}
         self.logger = Logger("DAQServiceServicer")
-        self.enable_audio = enable_audio
-    
+
+    def _get_session_id_from_metadata(self, context):
+        md = dict(context.invocation_metadata())
+        return md.get('session-id') or md.get('session_id')
+
+    def _require_session(self, context):
+        """GRPC-01: abort if session-id metadata is missing or unknown."""
+        session_id = self._get_session_id_from_metadata(context)
+        if not session_id or session_id not in self.connected_clients:
+            context.abort(grpc.StatusCode.UNAUTHENTICATED, "Missing or invalid session-id")
+        return session_id
+
+    def _register_stream(self, session_id):
+        if session_id in self.connected_clients:
+            self.connected_clients[session_id]['active_streams'] = (
+                self.connected_clients[session_id].get('active_streams', 0) + 1
+            )
+
+    def _unregister_stream(self, session_id):
+        if session_id not in self.connected_clients:
+            return
+        count = self.connected_clients[session_id].get('active_streams', 1) - 1
+        if count <= 0:
+            del self.connected_clients[session_id]
+            self.logger.log(f"Pruned client session: {session_id}", "INFO")
+        else:
+            self.connected_clients[session_id]['active_streams'] = count
+
+    def _snapshot_sensors(self):
+        """GRPC-06: thread-safe snapshot of enabled sensors."""
+        if not hasattr(self.main_window, 'sensor_controller'):
+            return []
+        try:
+            sensors = list(self.main_window.sensor_controller.sensors)
+            return [
+                (
+                    f"{s.interface_type}_{s.name}",
+                    s.name,
+                    s.unit or "",
+                    s.current_value,
+                    s.enabled,
+                    getattr(s, 'last_update_time', 0),
+                    s.interface_type,
+                    getattr(s, 'color', '#4CAF50'),
+                )
+                for s in sensors
+            ]
+        except Exception as e:
+            self.logger.log(f"Sensor snapshot error: {e}", "WARNING")
+            return []
+
     def ConnectToStream(self, request, context):
         """Handle client connection requests"""
+        # GRPC-09: validate stream name
+        if not request.stream_name or request.stream_name != self.stream_name:
+            return daq_service_pb2.ConnectResponse(
+                success=False,
+                message="Invalid stream name"
+            )
         if request.password != self.password:
             return daq_service_pb2.ConnectResponse(
                 success=False,
                 message="Invalid password"
             )
-        
-        # Add client to connected list
+
         client_id = f"{request.client_name}_{int(time.time())}"
         self.connected_clients[client_id] = {
             "name": request.client_name,
             "connected_at": time.time(),
             "request_sensors": request.request_sensors,
             "request_video": request.request_video,
-            "request_audio": getattr(request, "request_audio", False)
+            "request_audio": getattr(request, "request_audio", False),
+            "active_streams": 0,
         }
-        
-        # Get available sensors
+
         available_sensors = []
-        if hasattr(self.main_window, 'sensor_controller'):
-            for sensor in self.main_window.sensor_controller.sensors:
-                # Create a unique ID for the sensor
-                sensor_id = f"{sensor.interface_type}_{sensor.name}"
-                available_sensors.append(daq_service_pb2.RemoteSensor(
-                    id=sensor_id,
-                    name=sensor.name,
-                    unit=sensor.unit or "",
-                    current_value=sensor.current_value or 0.0,
-                    interface_type=sensor.interface_type,
-                    available=sensor.enabled,
-                    color=sensor.color
-                ))
-        
-        # Check if video/audio are available
-        video_available = hasattr(self.main_window, 'camera_controller') and \
-                         self.main_window.camera_controller.is_connected
+        for sensor_id, name, unit, value, enabled, _, iface, color in self._snapshot_sensors():
+            available_sensors.append(daq_service_pb2.RemoteSensor(
+                id=sensor_id,
+                name=name,
+                unit=unit,
+                current_value=value or 0.0,
+                interface_type=iface,
+                available=enabled,
+                color=color,
+            ))
+
+        video_available = (
+            self.enable_video
+            and hasattr(self.main_window, 'camera_controller')
+            and self.main_window.camera_controller.any_connected()
+        )
         audio_available = bool(self.enable_audio)
-        
+
         return daq_service_pb2.ConnectResponse(
             success=True,
             message="Connected successfully",
@@ -622,68 +972,90 @@ class DAQServiceServicer(DAQServiceBase):
             video_available=video_available,
             audio_available=audio_available
         )
-    
+
+    def DisconnectFromStream(self, request, context):
+        """REM-01: remove client session on explicit disconnect."""
+        session_id = self._get_session_id_from_metadata(context)
+        if session_id and session_id in self.connected_clients:
+            del self.connected_clients[session_id]
+            self.logger.log(f"Client disconnected: {session_id}", "INFO")
+            return daq_service_pb2.DisconnectResponse(
+                success=True, message="Disconnected"
+            )
+        return daq_service_pb2.DisconnectResponse(
+            success=False, message="Session not found"
+        )
+
     def StreamSensorData(self, request, context):
         """Stream sensor data to clients"""
-        while context.is_active():
-            if hasattr(self.main_window, 'sensor_controller'):
-                for sensor in self.main_window.sensor_controller.sensors:
-                    if sensor.enabled and sensor.current_value is not None:
-                        # Create a unique ID for the sensor
-                        sensor_id = f"{sensor.interface_type}_{sensor.name}"
+        session_id = self._require_session(context)
+        if not self.enable_sensors:
+            return
+        self._register_stream(session_id)
+        try:
+            while context.is_active():
+                for sensor_id, name, unit, value, enabled, last_ts, _, _ in self._snapshot_sensors():
+                    if enabled and value is not None:
+                        ts_ms = int(last_ts * 1000) if last_ts else int(time.time() * 1000)
                         yield daq_service_pb2.SensorData(
                             sensor_id=sensor_id,
-                            value=sensor.current_value,
-                            unit=sensor.unit or "",
-                            timestamp=int(time.time() * 1000),
-                            sensor_name=sensor.name
+                            value=value,
+                            unit=unit,
+                            timestamp=ts_ms,
+                            sensor_name=name
                         )
-            time.sleep(0.1)  # 10 FPS
-    
+                time.sleep(0.1)
+        finally:
+            self._unregister_stream(session_id)
+
     def StreamVideo(self, request, context):
         """Stream video data to clients"""
-        while context.is_active():
-            if hasattr(self.main_window, 'camera_controller') and \
-               self.main_window.camera_controller.is_connected:
-                
-                # Get current frame from camera
-                frame = self.main_window.camera_controller.get_current_frame()
-                if frame is not None:
-                    yield daq_service_pb2.VideoFrame(
-                        frame_data=frame.tobytes(),
-                        timestamp=int(time.time() * 1000),
-                        width=frame.shape[1],
-                        height=frame.shape[0],
-                        channels=frame.shape[2] if len(frame.shape) > 2 else 1
-                    )
-            time.sleep(0.033)  # ~30 FPS
+        session_id = self._require_session(context)
+        if not self.enable_video:
+            return
+        self._register_stream(session_id)
+        try:
+            while context.is_active():
+                cc = getattr(self.main_window, 'camera_controller', None)
+                if cc and cc.any_connected():
+                    frame = cc.get_streaming_numpy_frame()
+                    if frame is not None:
+                        yield daq_service_pb2.VideoFrame(
+                            frame_data=frame.tobytes(),
+                            timestamp=int(time.time() * 1000),
+                            width=frame.shape[1],
+                            height=frame.shape[0],
+                            channels=frame.shape[2] if len(frame.shape) > 2 else 1
+                        )
+                time.sleep(0.033)
+        finally:
+            self._unregister_stream(session_id)
 
     def StreamAudio(self, request, context):
         """Stream audio data (PCM) to clients when enabled"""
+        session_id = self._require_session(context)
         if not self.enable_audio:
             self.logger.log("Audio streaming requested but not enabled on server", "WARNING")
             return
-        
+        self._register_stream(session_id)
         try:
             try:
                 import sounddevice as sd
             except ImportError:
                 self.logger.log("sounddevice not available; cannot stream audio", "ERROR")
                 return
-            
+
             sample_rate = 44100
             channels = 1
             blocksize = 1024
             audio_queue = queue.Queue(maxsize=10)
-            
+
             def audio_callback(indata, frames, time_info, status):
                 try:
-                    # Ensure we push a copy (int16) to the queue
                     audio_queue.put_nowait(indata.copy())
                 except queue.Full:
-                    # Drop if clients cannot keep up
                     pass
-            
+
             with sd.InputStream(
                 samplerate=sample_rate,
                 channels=channels,
@@ -696,7 +1068,6 @@ class DAQServiceServicer(DAQServiceBase):
                         chunk = audio_queue.get(timeout=1.0)
                     except queue.Empty:
                         continue
-                    
                     try:
                         yield daq_service_pb2.AudioFrame(
                             pcm_data=chunk.tobytes(),
@@ -707,9 +1078,79 @@ class DAQServiceServicer(DAQServiceBase):
                     except Exception as e:
                         self.logger.log(f"Error yielding audio chunk: {e}", "ERROR")
                         break
-        
         except Exception as e:
             self.logger.log(f"Audio streaming error: {str(e)}", "ERROR")
+        finally:
+            self._unregister_stream(session_id)
+
+    # REM-01: stub unimplemented remote-control RPCs
+    def StartStreaming(self, request, context):
+        self.logger.log("StartStreaming RPC not implemented", "INFO")
+        return daq_service_pb2.StreamingResponse(
+            success=False, message="Not implemented; use local master UI"
+        )
+
+    def StopStreaming(self, request, context):
+        self.logger.log("StopStreaming RPC not implemented", "INFO")
+        return daq_service_pb2.StopResponse(success=False, message="Not implemented")
+
+    def GetStreamingStatus(self, request, context):
+        self.logger.log("GetStreamingStatus RPC not implemented", "INFO")
+        return daq_service_pb2.StreamingStatusResponse(is_streaming=True, stream_name=self.stream_name)
+
+    def GetAvailableSensors(self, request, context):
+        self.logger.log("GetAvailableSensors RPC not implemented", "INFO")
+        return daq_service_pb2.AvailableSensorsResponse()
+
+    def GetAvailableVideo(self, request, context):
+        self.logger.log("GetAvailableVideo RPC not implemented", "INFO")
+        return daq_service_pb2.AvailableVideoResponse(available=self.enable_video)
+
+    def StreamCombinedData(self, request, context):
+        self.logger.log("StreamCombinedData RPC not implemented", "INFO")
+        if False:
+            yield None
+
+    def SendRemoteCommand(self, request, context):
+        self.logger.log("SendRemoteCommand not implemented", "INFO")
+        return daq_service_pb2.CommandResponse(
+            success=False, message="Remote control not implemented"
+        )
+
+    def RequestRemoteControl(self, request, context):
+        self.logger.log("RequestRemoteControl not implemented", "INFO")
+        return daq_service_pb2.ControlResponse(
+            granted=False, message="Remote control not implemented"
+        )
+
+    def Authenticate(self, request, context):
+        self.logger.log("Authenticate RPC not implemented", "INFO")
+        return daq_service_pb2.AuthResponse(
+            success=False, message="Use ConnectToStream for authentication"
+        )
+
+    def ValidatePermission(self, request, context):
+        self.logger.log("ValidatePermission RPC not implemented", "INFO")
+        return daq_service_pb2.PermissionResponse(
+            granted=False, message="Not implemented"
+        )
+
+
+class _ConnectWorker(QThread):
+    """Background worker for non-blocking gRPC connect (GRPC-03)."""
+
+    finished_with_result = pyqtSignal(bool, str)
+
+    def __init__(self, controller, master_address, stream_name, password,
+                 client_name, request_sensors, request_video, request_audio):
+        super().__init__()
+        self._controller = controller
+        self._args = (master_address, stream_name, password, client_name,
+                      request_sensors, request_video, request_audio)
+
+    def run(self):
+        success, message = self._controller._connect_to_master_stream_sync(*self._args)
+        self.finished_with_result.emit(success, message)
 
 
 class StreamConnectionDialog(QDialog):
@@ -1080,17 +1521,25 @@ class StreamConnectionDialog(QDialog):
         
         self.status_label.setText("Connecting...")
         self.connect_btn.setEnabled(False)
-        
-        success, message = self.stream_controller.connect_to_master_stream(
-            master_address=master_address,
-            stream_name=stream_name,
-            password=password,
-            client_name=client_name,
-            request_sensors=self.request_sensors_check.isChecked(),
-            request_video=self.request_video_check.isChecked(),
-            request_audio=self.request_audio_check.isChecked()
+
+        self._connect_params = (
+            master_address, stream_name, password, client_name,
+            self.request_sensors_check.isChecked(),
+            self.request_video_check.isChecked(),
+            self.request_audio_check.isChecked(),
         )
-        
+        self.stream_controller.connect_finished.connect(self._on_connect_finished)
+        if not self.stream_controller.begin_connect_to_master_stream(*self._connect_params):
+            self.stream_controller.connect_finished.disconnect(self._on_connect_finished)
+            self.status_label.setText("Connection already in progress")
+            self.connect_btn.setEnabled(True)
+
+    def _on_connect_finished(self, success, message):
+        try:
+            self.stream_controller.connect_finished.disconnect(self._on_connect_finished)
+        except TypeError:
+            pass
+        stream_name = self._connect_params[1]
         if success:
             self.status_label.setText(f"Connected to: {stream_name}")
             self.update_ui_from_stream_status()
@@ -1174,11 +1623,11 @@ class StreamConnectionDialog(QDialog):
             self.disconnect_btn.setEnabled(False)
     
     def disconnect_from_stream(self):
-        """Disconnect from stream"""
-        # Get current stream name (simplified)
-        stream_name = self.client_stream_name_edit.text().strip()
-        
-        success, message = self.stream_controller.disconnect_from_stream(stream_name)
+        """Disconnect from stream (STR-R-08: use controller state, not text field)."""
+        controller = self.stream_controller
+        stream_name = controller.current_stream_name or None
+
+        success, message = controller.disconnect_from_stream(stream_name)
         
         if success:
             self.status_label.setText("Disconnected")

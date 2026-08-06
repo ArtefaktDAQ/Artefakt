@@ -8,7 +8,7 @@ import pyqtgraph as pg
 # Enable performance optimizations for pyqtgraph
 pg.setConfigOptions(antialias=False) # Antialiasing is slow for many points
 from PyQt6.QtGui import QColor, QFont, QDesktopServices
-from PyQt6.QtWidgets import QGraphicsRectItem, QGraphicsLineItem, QMenu # Import necessary QtWidgets
+from PyQt6.QtWidgets import QGraphicsRectItem, QGraphicsLineItem, QMenu, QToolButton # Import necessary QtWidgets
 import time
 import os
 import csv
@@ -42,6 +42,15 @@ class GraphController:
         self.dashboard_graph_widget = None # Will be set in start_live_dashboard_update
         self.last_plot_update_time = 0 # Time of the last visual plot update
         self.plot_update_interval = self.settings_model.get_float("graph_update_interval", 0.3)
+        self.dashboard_follow_all_view = True
+        self._dashboard_ignore_range_change = False
+        self._dashboard_view_range_connected = False
+        self._dashboard_view_all_button = None
+        self._dashboard_original_resize_event = None
+        self._dashboard_sig_resized_handler = None
+        self._replay_sig_resized_handler = None
+        self._main_sig_resized_handler = None
+        self._signals_connected = False
         
         # Store automation event markers for graph visualization
         self.event_markers = []  # List of event dictionaries with timestamps
@@ -269,13 +278,20 @@ class GraphController:
                     pass
 
     def connect_signals(self):
-        """Connect UI signals to controller methods"""
+        """Connect UI signals to controller methods (idempotent)."""
+        if getattr(self, '_signals_connected', False):
+            return
+        self._signals_connected = True
+
         if hasattr(self.main_window, 'graph_type_combo'):
             self.main_window.graph_type_combo.currentIndexChanged.connect(self.on_graph_type_changed)
             self.main_window.graph_primary_sensor.currentIndexChanged.connect(self.update_graph)
             self.main_window.graph_secondary_sensor.currentIndexChanged.connect(self.update_graph)
             self.main_window.graph_timespan.currentIndexChanged.connect(self.on_timespan_changed)
             self.main_window.dashboard_timespan.currentIndexChanged.connect(self.on_dashboard_timespan_changed)
+
+        if hasattr(self.main_window, 'multi_sensor_list'):
+            self.main_window.multi_sensor_list.itemSelectionChanged.connect(self.update_graph)
         
         # Setup custom context menu for graph widget to override "View All"
         if hasattr(self.main_window, 'graph_widget'):
@@ -462,6 +478,155 @@ class GraphController:
         else:
             # Only auto-range Y axis
             graph_widget.enableAutoRange(axis='y')
+
+    def _tear_down_dashboard_view_controls(self):
+        """Disconnect dashboard view-range tracking and restore patched resize handlers."""
+        graph_widget = self.dashboard_graph_widget
+        if graph_widget:
+            view_box = graph_widget.getViewBox()
+            if view_box and self._dashboard_view_range_connected:
+                try:
+                    view_box.sigRangeChanged.disconnect(self._on_dashboard_view_range_changed)
+                except (TypeError, RuntimeError):
+                    pass
+            if view_box and self._dashboard_sig_resized_handler is not None:
+                try:
+                    view_box.sigResized.disconnect(self._dashboard_sig_resized_handler)
+                except (TypeError, RuntimeError):
+                    pass
+            if self._dashboard_original_resize_event is not None:
+                graph_widget.resizeEvent = self._dashboard_original_resize_event
+        self._dashboard_view_range_connected = False
+        self._dashboard_original_resize_event = None
+        self._dashboard_sig_resized_handler = None
+
+    def _connect_sig_resized(self, view_box, handler_attr, handler):
+        """Connect ViewBox.sigResized once, replacing any previous handler for this attr."""
+        old = getattr(self, handler_attr, None)
+        if old is not None:
+            try:
+                view_box.sigResized.disconnect(old)
+            except (TypeError, RuntimeError):
+                pass
+        view_box.sigResized.connect(handler)
+        setattr(self, handler_attr, handler)
+
+    def _setup_dashboard_view_controls(self):
+        """Create the dashboard graph overlay button and track manual range changes."""
+        graph_widget = self.dashboard_graph_widget
+        if not graph_widget:
+            return
+
+        view_box = graph_widget.getViewBox()
+        if view_box and not self._dashboard_view_range_connected:
+            try:
+                view_box.sigRangeChanged.connect(self._on_dashboard_view_range_changed)
+                self._dashboard_view_range_connected = True
+            except Exception as e:
+                self._debug(f"Could not connect dashboard view range tracking: {e}")
+
+        if self._dashboard_view_all_button is None or self._dashboard_view_all_button.parent() is not graph_widget:
+            button = QToolButton(graph_widget)
+            button.setText("All")
+            button.setToolTip("Show all data and follow live updates")
+            button.setFixedSize(48, 24)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setStyleSheet("""
+                QToolButton {
+                    background: rgba(30, 30, 40, 190);
+                    color: #f0f0f0;
+                    border: 1px solid rgba(180, 180, 180, 140);
+                    border-radius: 6px;
+                    font-size: 11px;
+                    font-weight: bold;
+                    padding: 2px 6px;
+                }
+                QToolButton:hover {
+                    background: rgba(60, 90, 130, 220);
+                    border-color: rgba(210, 230, 255, 190);
+                }
+            """)
+            button.clicked.connect(self._resume_dashboard_all_view)
+            self._dashboard_view_all_button = button
+
+        if self._dashboard_original_resize_event is None:
+            self._dashboard_original_resize_event = graph_widget.resizeEvent
+
+            def resize_event(event):
+                self._dashboard_original_resize_event(event)
+                self._position_dashboard_view_all_button()
+
+            graph_widget.resizeEvent = resize_event
+
+        self._position_dashboard_view_all_button()
+        self._update_dashboard_view_all_button()
+
+    def _position_dashboard_view_all_button(self):
+        """Keep the dashboard 'All' overlay button in the lower right corner."""
+        button = self._dashboard_view_all_button
+        graph_widget = self.dashboard_graph_widget
+        if not button or not graph_widget:
+            return
+
+        margin = 12
+        x = max(margin, graph_widget.width() - button.width() - margin)
+        y = max(margin, graph_widget.height() - button.height() - margin)
+        button.move(x, y)
+        button.raise_()
+
+    def _update_dashboard_view_all_button(self):
+        """Show the overlay button only when live 'All' follow mode was paused."""
+        button = self._dashboard_view_all_button
+        if not button:
+            return
+
+        show_button = (
+            self.live_plotting_active
+            and self._dashboard_timespan_is_all()
+            and not self.dashboard_follow_all_view
+        )
+        button.setVisible(show_button)
+        if show_button:
+            self._position_dashboard_view_all_button()
+
+    def _dashboard_timespan_is_all(self):
+        """Return True when the dashboard timespan is the unbounded 'All' view."""
+        if not hasattr(self.main_window, 'dashboard_timespan'):
+            return False
+        selected = self.main_window.dashboard_timespan.currentText()
+        return self._parse_timespan_string(selected) is None
+
+    def _on_dashboard_view_range_changed(self, *args):
+        """Pause live all-data following when the user manually pans or zooms."""
+        if self._dashboard_ignore_range_change or not self.live_plotting_active:
+            return
+        if not self._dashboard_timespan_is_all():
+            return
+
+        view_box = self.dashboard_graph_widget.getViewBox() if self.dashboard_graph_widget else None
+        auto_range = getattr(view_box, 'state', {}).get('autoRange', [False, False]) if view_box else [False, False]
+        x_auto_range = bool(auto_range[0]) if auto_range else False
+        y_auto_range = bool(auto_range[1]) if len(auto_range) > 1 else False
+
+        if (not x_auto_range or not y_auto_range) and self.dashboard_follow_all_view:
+            self.dashboard_follow_all_view = False
+            self._update_dashboard_view_all_button()
+
+    def _resume_dashboard_all_view(self):
+        """Return the dashboard graph to live 'All' follow mode."""
+        if not self.dashboard_graph_widget:
+            return
+
+        self.dashboard_follow_all_view = True
+        self._dashboard_ignore_range_change = True
+        try:
+            self.dashboard_graph_widget.enableAutoRange(axis='x', enable=True)
+            self.dashboard_graph_widget.enableAutoRange(axis='y', enable=True)
+            if hasattr(self, 'secondary_vb') and self.secondary_vb:
+                self.secondary_vb.enableAutoRange(axis='y', enable=True)
+        finally:
+            self._dashboard_ignore_range_change = False
+        self._update_dashboard_view_all_button()
     
     def _setup_graph_context_menu(self, graph_widget):
         """
@@ -533,10 +698,15 @@ class GraphController:
         view_box.getMenu = custom_get_menu
     
     def on_graph_type_changed(self):
-        """Handle graph type change"""
+        """Handle graph type change.
+
+        Always redraw via MainWindow.update_graph() — user explicitly changed the
+        view, so we must not be blocked by the live/replay activity gate.
+        """
         if hasattr(self.main_window, 'update_graph_ui_elements'):
             self.main_window.update_graph_ui_elements()
-        self.update_graph()
+        if hasattr(self.main_window, 'update_graph'):
+            self.main_window.update_graph()
     
     def on_timespan_changed(self):
         """Handle timespan change for main graph"""
@@ -544,6 +714,10 @@ class GraphController:
     
     def on_dashboard_timespan_changed(self):
         """Handle timespan change for dashboard graph"""
+        if self._dashboard_timespan_is_all():
+            self.dashboard_follow_all_view = True
+            self._update_dashboard_view_all_button()
+
         # Update the visuals immediately based on the new timespan
         if self.live_plotting_active:
             self._update_all_plot_visuals()
@@ -557,16 +731,23 @@ class GraphController:
         if not hasattr(self.main_window, 'data_collection_controller'):
             return
 
-        # Update if data collection is active OR if we are in replay/review mode
+        # Allow updates during live acquisition, dashboard live monitor, replay
+        # playback, or when a run is loaded for review (with historical data).
         collecting = self.main_window.data_collection_controller.collecting_data
         replay_mode = getattr(self.main_window, 'replay_mode_enabled', False)
+        live_monitor = bool(self.live_plotting_active)
+        review_mode = bool(getattr(self.main_window, 'is_replay_mode', False))
+        has_hist = bool(getattr(self.main_window.data_collection_controller, 'csv_historical_data', None))
 
-        if not collecting and not replay_mode:
-            self._debug("Skipping main graph update as neither collection nor replay is active")
+        if not (collecting or replay_mode or live_monitor or review_mode or has_hist):
+            self._debug("Skipping main graph update as neither collection, replay, nor loaded data is active")
             return
 
         if hasattr(self.main_window, 'logger'):
-            self.main_window.logger.debug(f"Updating main graph (collecting={collecting}, replay={replay_mode})")
+            self.main_window.logger.debug(
+                f"Updating main graph (collecting={collecting}, replay={replay_mode}, "
+                f"live_monitor={live_monitor}, review={review_mode})"
+            )
         
         # Trigger the main window's update method which gathers params and calls update_specific_graph
         if hasattr(self.main_window, 'update_graph'):
@@ -616,7 +797,8 @@ class GraphController:
             self.main_window.logger.log("Dashboard graph widget not found.", "ERROR")
             print("ERROR: Dashboard graph widget not found.")
             return
-            
+
+        self._tear_down_dashboard_view_controls()
         self.dashboard_graph_widget = self.main_window.dashboard_graph_widget    
         self.dashboard_graph_widget.clear()
         
@@ -658,6 +840,7 @@ class GraphController:
             self._debug(f"Graph: start_live_dashboard_update - set dashboard_start_time={self.dashboard_start_time}")
             
         self.live_plotting_active = True
+        self.dashboard_follow_all_view = True
         self.replay_dataset_loaded = False
         self.replay_playhead_line = None
         print(f"DEBUG: Set live_plotting_active={self.live_plotting_active}, dashboard_start_time={self.dashboard_start_time}")
@@ -723,18 +906,23 @@ class GraphController:
             legend.update()
         
         self.dashboard_graph_widget.showGrid(x=True, y=True, alpha=0.3)
+        self._setup_dashboard_view_controls()
         
         # Add event markers to dashboard graph
         start_time = self._resolve_start_time(self.dashboard_start_time, allow_now=self.show_automation_markers)
         self._add_event_markers_to_graph(self.dashboard_graph_widget, start_time, force=self.show_automation_markers)
         
         # Set auto range on the plot so it updates as new data comes in
-        self.dashboard_graph_widget.enableAutoRange()
-        # Make sure viewbox is set to auto-range for both axes
-        view_box = self.dashboard_graph_widget.getViewBox()
-        if view_box:
-            view_box.setAutoVisible(x=True, y=True)
-            view_box.enableAutoRange(axis='xy', enable=True)
+        self._dashboard_ignore_range_change = True
+        try:
+            self.dashboard_graph_widget.enableAutoRange()
+            # Make sure viewbox is set to auto-range for both axes
+            view_box = self.dashboard_graph_widget.getViewBox()
+            if view_box:
+                view_box.setAutoVisible(x=True, y=True)
+                view_box.enableAutoRange(axis='xy', enable=True)
+        finally:
+            self._dashboard_ignore_range_change = False
         
         # Set antialiasing for smoother lines
         self.dashboard_graph_widget.setAntialiasing(True)
@@ -783,7 +971,7 @@ class GraphController:
             def update_views():
                 if hasattr(self, 'secondary_vb') and self.secondary_vb:
                     self.secondary_vb.setGeometry(plot_item.vb.sceneBoundingRect())
-            plot_item.vb.sigResized.connect(update_views)
+            self._connect_sig_resized(plot_item.vb, '_dashboard_sig_resized_handler', update_views)
             update_views() # Initial call
         # ----------------------------
 
@@ -907,6 +1095,9 @@ class GraphController:
         self.main_window.logger.log("Stopping live dashboard graph updates.", "INFO")
         self.live_plotting_active = False
         self.dashboard_start_time = None
+        self.dashboard_follow_all_view = True
+        self._update_dashboard_view_all_button()
+        self._tear_down_dashboard_view_controls()
         if hasattr(self, 'dashboard_update_timer'):
             self.dashboard_update_timer.stop()
         # Keep the plot data and items, don't clear graph here
@@ -1025,7 +1216,7 @@ class GraphController:
             def update_views():
                 if hasattr(self, 'secondary_vb') and self.secondary_vb:
                     self.secondary_vb.setGeometry(plot_item.vb.sceneBoundingRect())
-            plot_item.vb.sigResized.connect(update_views)
+            self._connect_sig_resized(plot_item.vb, '_replay_sig_resized_handler', update_views)
             update_views()
 
         # 5. Process Rows
@@ -1166,7 +1357,9 @@ class GraphController:
         
     def plot_new_data(self, data):
         """Plot new incoming data point(s)."""
-        # In review mode, ignore live incoming data; only accept replay-tagged payloads
+        # When replay_mode_enabled (run loaded for review), ignore live hardware packets
+        # so the historical graph is not overwritten. User can switch to Live Monitor
+        # (clears replay_mode_enabled) or start a new acquisition to see live data again.
         if hasattr(self.main_window, "replay_mode_enabled") and self.main_window.replay_mode_enabled:
             if data.get("_source") != "replay":
                 return
@@ -1451,18 +1644,23 @@ class GraphController:
         else:
             # "All" selected or invalid timespan - show all data
             if self.dashboard_graph_widget:
-                # If we have an override (replay playhead scrubbing), we might want to keep the current range
-                # but for "All" it's usually best to auto-range
-                if elapsed_time_override is None:
-                    self.dashboard_graph_widget.enableAutoRange(axis='x', enable=True)
-                    self.dashboard_graph_widget.enableAutoRange(axis='y', enable=True)
-                    if hasattr(self, 'secondary_vb') and self.secondary_vb:
-                        # ONLY auto-range Y for secondary axis; X is linked to main
-                        self.secondary_vb.enableAutoRange(axis='y', enable=True)
+                # Only keep live "All" mode following when the user has not manually
+                # panned or zoomed away from the full-data view.
+                if elapsed_time_override is None and self.dashboard_follow_all_view:
+                    self._dashboard_ignore_range_change = True
+                    try:
+                        self.dashboard_graph_widget.enableAutoRange(axis='x', enable=True)
+                        self.dashboard_graph_widget.enableAutoRange(axis='y', enable=True)
+                        if hasattr(self, 'secondary_vb') and self.secondary_vb:
+                            # ONLY auto-range Y for secondary axis; X is linked to main
+                            self.secondary_vb.enableAutoRange(axis='y', enable=True)
+                    finally:
+                        self._dashboard_ignore_range_change = False
                 else:
                     # In scrubbing mode, ensure secondary Y still auto-ranges
-                    if hasattr(self, 'secondary_vb') and self.secondary_vb:
+                    if elapsed_time_override is not None and hasattr(self, 'secondary_vb') and self.secondary_vb:
                         self.secondary_vb.enableAutoRange(axis='y', enable=True)
+                self._update_dashboard_view_all_button()
 
         # min_time_val is used for data slicing below
         min_time_val = -np.inf
@@ -1960,7 +2158,7 @@ class GraphController:
                         def update_main_views():
                             if hasattr(self, 'main_secondary_vb') and self.main_secondary_vb:
                                 self.main_secondary_vb.setGeometry(plot_item.vb.sceneBoundingRect())
-                        plot_item.vb.sigResized.connect(update_main_views)
+                        self._connect_sig_resized(plot_item.vb, '_main_sig_resized_handler', update_main_views)
                         update_main_views()
                 # ---------------------------------------------
 

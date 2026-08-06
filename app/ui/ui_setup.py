@@ -451,13 +451,10 @@ def setup_ui(self):
     # Set initial style (start)
     self.toggle_btn.setStyleSheet(self.start_btn_style)
 
-    # Create blink timer for the "Running..." text
-    self.blink_timer = QTimer()
-    self.blink_timer.setInterval(1000)  # 1Hz
+    # blink_timer is created once in main_window.init_timers()
     self.blink_visible = True
-    self.blink_timer.timeout.connect(self.update_running_text)
     
-    # Connect toggle button
+    # Connect toggle button (only here; not also in connect_signals)
     self.toggle_btn.clicked.connect(self.on_toggle_clicked)
 
     control_buttons.addWidget(self.toggle_btn)
@@ -882,9 +879,10 @@ def setup_ui(self):
     """)
     
     # Upper Part: Metrics + Graph (Horizontal Splitter)
-    upper_splitter = QSplitter(Qt.Orientation.Horizontal)
-    upper_splitter.setChildrenCollapsible(True) # Allow sections to be collapsed completely (hiding metrics)
-    upper_splitter.setStyleSheet(f"""
+    self.dashboard_upper_splitter = QSplitter(Qt.Orientation.Horizontal)
+    self.dashboard_upper_splitter.setChildrenCollapsible(True) # Allow sections to be collapsed completely (hiding metrics)
+    self.dashboard_upper_splitter.setHandleWidth(2)
+    self.dashboard_upper_splitter.setStyleSheet(f"""
         QSplitter::handle {{
             background-color: {COLORS.BORDER_DEFAULT};
             width: 2px;
@@ -897,14 +895,23 @@ def setup_ui(self):
     # Left side: Live Metrics Grid
     metrics_group = QGroupBox("Live Metrics")
     metrics_group.setStyleSheet(GroupBoxStyles.tight())
-    metrics_group.setMinimumWidth(200)
+    # Allow the splitter to shrink this panel down to roughly one card (+ chrome).
+    # QScrollArea defaults to Expanding and otherwise fights the splitter with a large sizeHint.
+    metrics_group.setMinimumWidth(0)
+    metrics_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
     metrics_layout = QVBoxLayout(metrics_group)
+    metrics_layout.setContentsMargins(4, 4, 4, 4)
     
     self.metrics_scroll = QScrollArea()
     self.metrics_scroll.setWidgetResizable(True)
+    self.metrics_scroll.setFrameShape(QFrame.Shape.NoFrame)
+    self.metrics_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    self.metrics_scroll.setMinimumWidth(0)
+    self.metrics_scroll.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
     self.metrics_scroll.setStyleSheet("background: transparent; border: none;")
     self.metrics_container = QWidget()
     self.metrics_container.setStyleSheet("background: transparent;")
+    self.metrics_container.setMinimumWidth(0)
     self.metrics_grid = QGridLayout(self.metrics_container)
     self.metrics_grid.setContentsMargins(0, 0, 0, 0)
     self.metrics_grid.setSpacing(8)
@@ -913,10 +920,10 @@ def setup_ui(self):
     self.metrics_scroll.setWidget(self.metrics_container)
     metrics_layout.addWidget(self.metrics_scroll)
     
-    # Add an event filter to the container to handle responsive column layout
-    self.metrics_container.installEventFilter(self)
+    # Resize on the viewport: that is the real usable width for column decisions
+    self.metrics_scroll.viewport().installEventFilter(self)
     
-    upper_splitter.addWidget(metrics_group)
+    self.dashboard_upper_splitter.addWidget(metrics_group)
     
     # Right side: Graph Area
     graph_container_widget = QWidget()
@@ -947,6 +954,16 @@ def setup_ui(self):
     self.replay_play_btn = QPushButton("Play")
     self.replay_play_btn.setCheckable(True)
     self.replay_play_btn.setFixedWidth(60)
+
+    # Switch review mode: Replay blocks live graph packets; Live Monitor allows them
+    # while a run stays selected (notes/context unchanged).
+    self.replay_live_monitor_btn = QPushButton("Live")
+    self.replay_live_monitor_btn.setCheckable(True)
+    self.replay_live_monitor_btn.setFixedWidth(50)
+    self.replay_live_monitor_btn.setToolTip(
+        "Leave replay graph mode and show live hardware data. "
+        "Click Play again to reload replay for the selected run."
+    )
     
     self.replay_step_back_btn = QPushButton("◀")
     self.replay_step_back_btn.setFixedWidth(30)
@@ -966,6 +983,7 @@ def setup_ui(self):
     replay_controls_layout.addWidget(QLabel("Replay:"))
     replay_controls_layout.addWidget(self.replay_step_back_btn)
     replay_controls_layout.addWidget(self.replay_play_btn)
+    replay_controls_layout.addWidget(self.replay_live_monitor_btn)
     replay_controls_layout.addWidget(self.replay_step_forward_btn)
     replay_controls_layout.addWidget(QLabel("Speed"))
     replay_controls_layout.addWidget(self.replay_speed)
@@ -975,12 +993,17 @@ def setup_ui(self):
     
     graph_container_layout.addWidget(replay_controls)
     
-    upper_splitter.addWidget(graph_container_widget)
+    graph_container_widget.setMinimumWidth(0)
+    graph_container_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    self.dashboard_upper_splitter.addWidget(graph_container_widget)
     
-    # Set initial sizes for the horizontal splitter (e.g., 20% metrics, 80% graph)
-    upper_splitter.setSizes([280, 1000])
+    # Metrics keep their width; extra space always goes to the graph
+    self.dashboard_upper_splitter.setStretchFactor(0, 0)
+    self.dashboard_upper_splitter.setStretchFactor(1, 1)
+    # Compact start: ~1–2 cards; user can widen for more columns
+    self.dashboard_upper_splitter.setSizes([160, 1000])
     
-    self.dashboard_splitter.addWidget(upper_splitter)
+    self.dashboard_splitter.addWidget(self.dashboard_upper_splitter)
     
     # Lower part - Automation Status and Camera Preview with Splitter
     self.lower_widget = QWidget()
@@ -2556,13 +2579,6 @@ def setup_ui(self):
     ])
     graph_type_layout.addWidget(self.graph_type_combo)
     
-    # Connect graph type combo to update UI elements and info text
-    self.graph_type_combo.currentIndexChanged.connect(lambda: [
-        self.update_graph_ui_elements(),
-        update_graph_info(),
-        self.update_graph()
-    ])
-    
     # Graph info area - compact description for selected type only
     graph_info_text = QLabel()
     graph_info_text.setWordWrap(True)
@@ -2572,7 +2588,6 @@ def setup_ui(self):
     graph_info_text.setText("📊 Standard Time Series: Shows raw sensor values over time. Select multiple sensors to compare.")
     graph_type_layout.addWidget(graph_info_text)
     
-    # Connect graph type combo to update info text
     def update_graph_info():
         graph_type = self.graph_type_combo.currentText()
         info_texts = {
@@ -2587,6 +2602,7 @@ def setup_ui(self):
         }
         graph_info_text.setText(info_texts.get(graph_type, "Select a graph type for description."))
     
+    # UI-only reaction; graph update/visibility is handled by GraphController
     self.graph_type_combo.currentIndexChanged.connect(update_graph_info)
     
     # Sensor selection
@@ -2598,7 +2614,6 @@ def setup_ui(self):
     primary_sensor_layout = QHBoxLayout()
     primary_sensor_layout.addWidget(QLabel("Primary Sensor:"))
     self.graph_primary_sensor = QComboBox()
-    self.graph_primary_sensor.currentIndexChanged.connect(self.update_graph)
     primary_sensor_layout.addWidget(self.graph_primary_sensor)
     sensor_selection_layout.addLayout(primary_sensor_layout)
     
@@ -2608,7 +2623,6 @@ def setup_ui(self):
     multi_sensor_layout = QVBoxLayout(self.multi_sensor_group)
     self.multi_sensor_list = QListWidget()
     self.multi_sensor_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
-    self.multi_sensor_list.itemSelectionChanged.connect(self.update_graph)
     multi_sensor_layout.addWidget(self.multi_sensor_list)
     sensor_selection_layout.addWidget(self.multi_sensor_group)
     
@@ -2618,7 +2632,6 @@ def setup_ui(self):
     self.secondary_sensor_label.setObjectName("secondary_sensor_label")
     secondary_sensor_layout.addWidget(self.secondary_sensor_label)
     self.graph_secondary_sensor = QComboBox()
-    self.graph_secondary_sensor.currentIndexChanged.connect(self.update_graph)
     secondary_sensor_layout.addWidget(self.graph_secondary_sensor)
     sensor_selection_layout.addLayout(secondary_sensor_layout)
     
@@ -2746,12 +2759,15 @@ def setup_ui(self):
     self.graph_downsampling_checkbox.stateChanged.connect(on_downsampling_toggled)
     plot_format_layout.addWidget(self.graph_downsampling_checkbox, 1, 0, 1, 2)
     
-    # Connect to the apply_plot_formatting function and then update graphs
-    self.plot_style_preset.currentIndexChanged.connect(lambda: [
-        self.apply_plot_formatting(),
-        self.update_graph(),
-        self.update_dashboard_graph() if hasattr(self, 'dashboard_graph_widget') else None
-    ])
+    # Connect to save setting, apply formatting, then update graphs
+    def on_plot_style_changed():
+        if hasattr(self, 'settings_model'):
+            self.settings_model.set_value("plot_style_preset", self.plot_style_preset.currentText())
+        self.apply_plot_formatting()
+        self.update_graph()
+        if hasattr(self, 'dashboard_graph_widget'):
+            self.update_dashboard_graph()
+    self.plot_style_preset.currentIndexChanged.connect(on_plot_style_changed)
     
     plot_format_layout.addWidget(self.plot_style_preset, 0, 1)
     
@@ -2762,12 +2778,14 @@ def setup_ui(self):
     self.plot_font_size.setValue(10)
     self.plot_font_size.setSuffix(" pt")
     
-    # Connect to the apply_plot_formatting function and then update graphs
-    self.plot_font_size.valueChanged.connect(lambda: [
-        self.apply_plot_formatting(),
-        self.update_graph(),
-        self.update_dashboard_graph() if hasattr(self, 'dashboard_graph_widget') else None
-    ])
+    def on_plot_font_changed(value):
+        if hasattr(self, 'settings_model'):
+            self.settings_model.set_value("plot_font_size", value)
+        self.apply_plot_formatting()
+        self.update_graph()
+        if hasattr(self, 'dashboard_graph_widget'):
+            self.update_dashboard_graph()
+    self.plot_font_size.valueChanged.connect(on_plot_font_changed)
     
     plot_format_layout.addWidget(self.plot_font_size, 2, 1)
     
@@ -2778,12 +2796,14 @@ def setup_ui(self):
     self.plot_line_width.setValue(2)  # Will be overridden by load_settings
     self.plot_line_width.setSuffix(" px")
     
-    # Connect to the apply_plot_formatting function and then update graphs
-    self.plot_line_width.valueChanged.connect(lambda: [
-        self.apply_plot_formatting(),
-        self.update_graph(),
-        self.update_dashboard_graph() if hasattr(self, 'dashboard_graph_widget') else None
-    ])
+    def on_plot_line_width_changed(value):
+        if hasattr(self, 'settings_model'):
+            self.settings_model.set_value("plot_line_width", value)
+        self.apply_plot_formatting()
+        self.update_graph()
+        if hasattr(self, 'dashboard_graph_widget'):
+            self.update_dashboard_graph()
+    self.plot_line_width.valueChanged.connect(on_plot_line_width_changed)
     
     plot_format_layout.addWidget(self.plot_line_width, 3, 1)
     
@@ -3514,7 +3534,7 @@ def setup_ui(self):
     self.apply_settings_btn.setStyleSheet(action_btn_style)
     self.apply_settings_btn.setMinimumWidth(110)
     self.apply_settings_btn.setToolTip("Apply current interface/settings changes (sampling, devices, etc.)")
-    self.apply_settings_btn.clicked.connect(self.apply_settings)
+    # UI-03: clicked connected once in main_window.connect_signals()
     project_actions_layout.addWidget(self.apply_settings_btn)
     
     project_actions_layout.addStretch()
@@ -3700,17 +3720,12 @@ def setup_ui(self):
     set_large_font_for_groupbox(run_group, 11, True)
     set_large_font_for_groupbox(project_actions_group, 11, True)
 
-    # Connect navigation buttons to switch stacked widget pages
-    for i, btn in enumerate(self.nav_buttons):
-        btn.clicked.connect(lambda checked, index=i: self.stacked_widget.setCurrentIndex(index)) 
+    # UI-01/UI-02: nav buttons + tab-change connected once in main_window.connect_signals()
 
     def set_timespan_to_all():
         self.graph_timespan.setCurrentText("All")
 
     self.graph_type_combo.currentIndexChanged.connect(set_timespan_to_all) 
-
-    # Connect tab change signal to handle tab-specific initialization
-    self.stacked_widget.currentChanged.connect(self.on_tab_changed) 
 
     # Connect LabJack button
     self.labjack_connect_btn.clicked.connect(self.connect_labjack)
@@ -3786,10 +3801,8 @@ def setup_ui(self):
             self.stacked_widget.removeWidget(widget)
             self.stacked_widget.insertWidget(i, widget)
 
-    # Connect navigation buttons to switch stacked widget pages (fix index mapping)
-    for i, btn in enumerate(self.nav_buttons):
-        btn.clicked.connect(lambda checked, index=i: self.stacked_widget.setCurrentIndex(index))
-    
+    # UI-02: nav buttons connected once in main_window.connect_signals() (after tab reorder)
+
     # Create Data Flow Monitor page (hidden from navigation, accessed via status bar or Ctrl+Shift+D)
     self.data_flow_widget = DataFlowWidget()
     self.stacked_widget.addWidget(self.data_flow_widget)

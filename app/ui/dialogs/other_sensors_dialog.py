@@ -132,6 +132,18 @@ class AddEditSensorDialog(QDialog):
         btn_layout.addWidget(cancel_btn)
         layout.addRow(btn_layout)
 
+    def accept(self):
+        try:
+            float(self.offset_edit.text().strip() or 0.0)
+            float(self.conversion_factor_edit.text().strip() or 1.0)
+        except ValueError:
+            QMessageBox.warning(
+                self, "Validation Error",
+                "Offset and Multiplier must be valid numbers."
+            )
+            return
+        super().accept()
+
     def update_color_button(self):
         """Update the color button's background to match the current color"""
         color = QColor(self.color_edit.text())
@@ -368,9 +380,6 @@ class OtherSensorsDialog(QDialog):
         
         # Check connection status for button state
         self.update_connect_button_state()
-        
-        # Handle autoconnect if needed
-        QTimer.singleShot(500, self.handle_autoconnect)
 
     def update_sequences_table(self):
         self.sequences_table.setRowCount(len(self.sequences))
@@ -749,9 +758,13 @@ class OtherSensorsDialog(QDialog):
         super().accept()
 
     def save_current_config_to_parent(self):
-        # Implement the logic to save the current configuration to the parent
-        # This method should be implemented based on your specific requirements
-        pass
+        """Sync current dialog state to parent so connect works before OK."""
+        parent = self.parent()
+        if not parent:
+            return
+        parent.other_sensors = self.sensors
+        parent.other_sequences = self.sequences
+        parent.other_sensors_autoconnect = self.autoconnect_checkbox.isChecked()
 
 # Dialog für Sequenz hinzufügen/bearbeiten
 class AddEditActionDialog(QDialog):
@@ -1087,6 +1100,18 @@ class AddEditSequenceDialog(QDialog):
         ok_cancel_layout.addWidget(cancel_btn)
         layout.addRow(ok_cancel_layout)
 
+    def accept(self):
+        try:
+            int(self.baud_edit.text().strip() or 9600)
+            float(self.poll_interval_edit.text().strip() or 1.0)
+        except ValueError:
+            QMessageBox.warning(
+                self, "Validation Error",
+                "Baud rate must be an integer and poll interval must be a valid number."
+            )
+            return
+        super().accept()
+
     def get_serial_ports(self):
         ports = []
         try:
@@ -1186,11 +1211,16 @@ class AddEditSequenceDialog(QDialog):
             self.actions_table.selectRow(row+1)
 
     def get_sequence(self):
+        try:
+            baud = int(self.baud_edit.text().strip() or 9600)
+            poll_interval = float(self.poll_interval_edit.text().strip() or 1.0)
+        except ValueError:
+            raise ValueError("Baud rate must be an integer and poll interval must be a valid number.")
         return {
             "name": self.name_edit.text().strip(),
             "port": self.port_combo.currentData(),
-            "baud": int(self.baud_edit.text().strip() or 9600),
-            "poll_interval": float(self.poll_interval_edit.text().strip() or 1.0),
+            "baud": baud,
+            "poll_interval": poll_interval,
             "auto_connect": self.auto_connect_checkbox.isChecked(),
             "actions": self.sequence["actions"],
         }

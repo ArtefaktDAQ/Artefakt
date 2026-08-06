@@ -8,6 +8,7 @@ import datetime
 import json
 import os
 import traceback
+import ast
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal, QThreadPool, QRunnable
 from enum import Enum
 
@@ -158,6 +159,16 @@ class TimeSpecificTrigger(BaseTrigger):
         self._armed_today = False
         if hasattr(self, '_last_check_date'):
             delattr(self, '_last_check_date')
+
+    def rearm_for_step(self):
+        """Re-arm when a step becomes active again (e.g. loop). Once-per-day after target time is preserved."""
+        now = datetime.datetime.now()
+        current_time = now.time()
+        target_time = datetime.time(self.hour, self.minute)
+        if current_time < target_time:
+            # Looped back before today's target — allow firing when clock reaches target
+            self.triggered_today = False
+            self._armed_today = True
 
     def check(self, context=None): # Context not needed
         now = datetime.datetime.now()
@@ -481,9 +492,12 @@ class OpticalEventTrigger(BaseTrigger):
             dy = abs(y - self._last_position[1])
             distance = (dx**2 + dy**2) ** 0.5
             
-            if distance > threshold:
+            if distance > threshold and not self._triggered:
                 self._last_position = (x, y)
+                self._triggered = True
                 return True
+            elif distance <= threshold:
+                self._triggered = False
             return False
         
         return False
@@ -771,13 +785,17 @@ class CompoundTrigger(BaseTrigger):
     def check(self, context):
         if not self.triggers:
             return False
-            
-        results = [t.check(context) for t in self.triggers]
-        
+
         if self.logic == 'AND':
-            return all(results)
-        else:
-            return any(results)
+            for t in self.triggers:
+                if not t.check(context):
+                    return False
+            return True
+
+        for t in self.triggers:
+            if t.check(context):
+                return True
+        return False
             
     def reset(self):
         for t in self.triggers:
@@ -1112,12 +1130,18 @@ class PluginCommandAction(BaseAction):
                 resolved_command = resolve_func(self.command)
                 resolved_plugin_name = resolve_func(self.plugin_name)
                 
-                # Directly check interface_threads for the plugin
+                # Prefer the live polling thread; fall back to a stored instance
+                # so commands still work if the thread was stopped but the
+                # plugin interface remains connected.
                 plugin_instance = None
                 if resolved_plugin_name in dcc.interface_threads:
                     thread = dcc.interface_threads[resolved_plugin_name]
                     if hasattr(thread, 'interface'):
                         plugin_instance = thread.interface
+                if plugin_instance is None:
+                    state = dcc.interfaces.get(resolved_plugin_name, {})
+                    if isinstance(state, dict):
+                        plugin_instance = state.get('instance')
                 
                 if plugin_instance:
                     if not plugin_instance.is_connected():
@@ -1217,6 +1241,12 @@ class SystemAction(BaseAction):
             self.description += f" ('{self.parameters.get('message', '')[:20]}...')"
         elif self.specific_action_type == "play_sound":
              self.description += f" ({self.parameters.get('sound', 'beep')})"
+
+    def _refresh_app_state_context(self, main_window):
+        """Refresh live is_running / is_recording flags after system state changes."""
+        automation_controller = getattr(main_window, 'automation_controller', None)
+        if automation_controller and hasattr(automation_controller, 'manager'):
+            automation_controller.manager.update_context({})
              
     def execute(self, context):
         main_window = context.get('main_window')
@@ -1235,14 +1265,23 @@ class SystemAction(BaseAction):
                     resolved_params[key] = value # Keep non-strings as is
 
             # Find the appropriate controller/method on main_window or its controllers
-            if self.specific_action_type == "start_recording" and hasattr(main_window, 'camera_controller'):
+            if self.specific_action_type == "start_recording":
+                if not hasattr(main_window, 'camera_controller'):
+                    self.action_failed.emit(self, "camera_controller not available")
+                    return
                 main_window.camera_controller.start_recording()
-            elif self.specific_action_type == "stop_recording" and hasattr(main_window, 'camera_controller'):
+                self._refresh_app_state_context(main_window)
+            elif self.specific_action_type == "stop_recording":
+                if not hasattr(main_window, 'camera_controller'):
+                    self.action_failed.emit(self, "camera_controller not available")
+                    return
                 main_window.camera_controller.stop_recording()
-            elif self.specific_action_type == "take_snapshot" and hasattr(main_window, 'camera_controller'):
-                # Check for camera_index in parameters
+                self._refresh_app_state_context(main_window)
+            elif self.specific_action_type == "take_snapshot":
+                if not hasattr(main_window, 'camera_controller'):
+                    self.action_failed.emit(self, "camera_controller not available")
+                    return
                 camera_index = resolved_params.get("camera_index")
-                # Capture the snapshot path to include in automation event
                 self.last_image_path = main_window.camera_controller.take_snapshot(index=camera_index)
             elif self.specific_action_type == "display_message":
                 from PyQt6.QtWidgets import QMessageBox
@@ -1286,18 +1325,21 @@ class SystemAction(BaseAction):
                         main_window.run_testers.setText("Automation")
                         print(f"[Automation] Set default run testers")
 
-                # Trigger the start acquisition logic directly
                 if hasattr(main_window, 'start_acquisition'):
                     main_window.start_acquisition()
+                    self._refresh_app_state_context(main_window)
                 else:
-                    print("Error: main_window.start_acquisition not found")
+                    self.action_failed.emit(self, "main_window.start_acquisition not found")
+                    return
 
             elif self.specific_action_type == "stop_acquisition":
                 print(f"[Automation] Action: STOP ACQUISITION")
                 if hasattr(main_window, 'stop_acquisition'):
                     main_window.stop_acquisition()
+                    self._refresh_app_state_context(main_window)
                 else:
-                    print("Error: main_window.stop_acquisition not found")
+                    self.action_failed.emit(self, "main_window.stop_acquisition not found")
+                    return
             else:
                 raise NotImplementedError(f"System action '{self.specific_action_type}' not implemented")
                 
@@ -1419,19 +1461,7 @@ class ConditionAction(BaseAction):
         try:
             # Resolve variables in the expression
             resolved = variable_manager.resolve_variables(self.condition_expression)
-            
-            # Simple evaluation for conditions (supporting <, >, ==, !=, <=, >=)
-            # We'll use a slightly more permissive regex for conditions
-            import re
-            if not re.match(r'^[0-9.+\-*/%() !<>=&|]*$', resolved):
-                 # Fallback to direct comparison if it's not a mathy condition
-                 # (e.g., "{status} == 'OK'")
-                 # This is still very basic.
-                 pass
-            
-            # Use eval for the condition
-            # Note: We should probably use a safer way, but following the pattern for now.
-            is_true = eval(resolved, {"__builtins__": None}, {})
+            is_true = bool(variable_manager._safe_eval_condition_ast(resolved))
             
             if is_true:
                 sequence.current_step_index = self.if_true_step - 1
@@ -1739,16 +1769,53 @@ class AutomationSequence(QObject):
         self.steps = steps
         self._connect_step_signals()
 
+    def _rearm_trigger_for_step(self, trigger):
+        """Prepare trigger state when its step becomes active."""
+        if isinstance(trigger, TimeDurationTrigger):
+            trigger.reset()
+        elif isinstance(trigger, TimeSpecificTrigger):
+            # Intentionally not calling full reset(): once-per-day after target time
+            # is enforced in check(); day rollover clears triggered_today there.
+            trigger.rearm_for_step()
+        elif isinstance(trigger, CompoundTrigger):
+            for sub_trigger in trigger.triggers:
+                self._rearm_trigger_for_step(sub_trigger)
+
     def _prepare_current_step(self):
         """Prepare per-step trigger state when a step becomes active."""
         if 0 <= self.current_step_index < len(self.steps):
             current_step = self.steps[self.current_step_index]
             current_step.is_running = False
-            if isinstance(current_step.trigger, TimeDurationTrigger):
-                current_step.trigger.reset()
+            self._rearm_trigger_for_step(current_step.trigger)
 
     def set_context(self, context):
         self._context = context
+
+    def _execution_context(self):
+        """
+        Build a per-sequence view of the shared app context.
+
+        Sensors/events stay shared by reference; sequence identity is isolated
+        so concurrent sequences do not overwrite each other's JUMP/CONDITION target.
+        """
+        ctx = dict(self._context) if self._context else {}
+        ctx['current_sequence'] = self
+        ctx['current_sequence_name'] = self.name
+
+        # Refresh live app-state flags on every poll so triggers see current values
+        main_window = ctx.get('main_window')
+        if main_window:
+            ctx['is_running'] = getattr(main_window, 'running', False)
+            is_rec = False
+            if hasattr(main_window, 'camera_controller'):
+                recording_state = main_window.camera_controller.is_recording
+                if isinstance(recording_state, list):
+                    is_rec = any(recording_state)
+                else:
+                    is_rec = recording_state
+            ctx['is_recording'] = is_rec
+
+        return ctx
         
     def start(self, check_interval_ms=100):
         """Start executing the sequence."""
@@ -1820,20 +1887,26 @@ class AutomationSequence(QObject):
              return
              
         current_step = self.steps[self.current_step_index]
+        exec_context = self._execution_context()
+
+        if not current_step.enabled:
+            print(f"[Automation] Sequence '{self.name}' Step {self.current_step_index + 1}: Skipping disabled step.")
+            self._handle_step_completed(current_step)
+            return
         
         # Only proceed if the step is not already running its action
         if not current_step.is_running:
              # Check the trigger for the current step
-             trigger_met = current_step.check_trigger(self._context)
+             trigger_met = current_step.check_trigger(exec_context)
              
              if trigger_met:
                  # Trigger condition met - log trigger event
                  print(f"[Automation] Sequence '{self.name}' Step {self.current_step_index + 1}: Trigger met ({current_step.trigger.name})")
-                 self._log_trigger_event(current_step, self._context)
+                 self._log_trigger_event(current_step, exec_context)
                  # Execute the action
                  try:
                      print(f"[Automation] Sequence '{self.name}' Step {self.current_step_index + 1}: Executing action ({current_step.action.name})")
-                     current_step.execute_action(self._context)
+                     current_step.execute_action(exec_context)
                  except Exception as e:
                      error_msg = f"Exception during action execution: {e}"
                      print(f"Error in sequence '{self.name}', step {self.current_step_index + 1}: {error_msg}")
@@ -1931,18 +2004,7 @@ class AutomationSequence(QObject):
             step.cleanup()
 
     def to_dict(self):
-        # Serialize steps with error handling
-        steps_data = []
-        for i, step in enumerate(self.steps):
-            try:
-                step_dict = step.to_dict()
-                steps_data.append(step_dict)
-            except Exception as e:
-                print(f"Error serializing step {i} in sequence '{self.name}': {e}")
-                traceback.print_exc()
-                # Skip this step but continue with others
-                continue
-        
+        steps_data = [step.to_dict() for step in self.steps]
         return {
             'name': self.name,
             'loop': self.loop,
@@ -2083,15 +2145,27 @@ class AutomationManager(QObject):
         placeholders = re.findall(r"\{([^}]+)\}", text)
         for placeholder in placeholders:
             var_name = placeholder.strip()
-            # Try to resolve from variables or sensors
-            value = self.get_variable(var_name)
-            
-            # If not in variables, check sensors in app_context
-            if value is None:
+            found = False
+            value = None
+
+            # 1) Explicit automation variables (including False/0/"")
+            if var_name in self.variables:
+                value = self.variables[var_name]
+                found = True
+            else:
+                # 2) Live sensor readings
                 sensors = self.app_context.get('sensors', {})
-                value = sensors.get(var_name)
-                
-            if value is not None:
+                if isinstance(sensors, dict) and var_name in sensors:
+                    value = sensors[var_name]
+                    found = True
+                else:
+                    # 3) App state flags such as {is_running} / {is_recording}
+                    ctx_val = self.app_context.get(var_name)
+                    if isinstance(ctx_val, (bool, int, float, str)):
+                        value = ctx_val
+                        found = True
+
+            if found:
                 resolved_text = resolved_text.replace(f"{{{placeholder}}}", str(value))
             else:
                  print(f"[Automation] Warning: Variable/Sensor '{var_name}' not found for substitution in '{text}'")
@@ -2114,13 +2188,134 @@ class AutomationManager(QObject):
             return resolved
             
         try:
-            # Using a very restricted eval is still slightly risky, 
-            # but the regex above only allows safe characters.
-            return eval(resolved, {"__builtins__": None}, {})
+            return self._safe_eval_math_ast(resolved)
         except Exception as e:
             print(f"[Automation] Error evaluating expression '{expression}' (resolved as '{resolved}'): {e}")
             return resolved
-        
+
+    def _safe_eval_math_ast(self, expression):
+        """Evaluate a math expression using AST with only safe numeric operators."""
+        node = ast.parse(expression, mode='eval')
+
+        def _eval(node):
+            if isinstance(node, ast.Expression):
+                return _eval(node.body)
+            if isinstance(node, ast.Constant):
+                if isinstance(node.value, (int, float)):
+                    return node.value
+                raise ValueError(f"Unsupported constant type: {type(node.value)}")
+            if isinstance(node, ast.UnaryOp):
+                operand = _eval(node.operand)
+                if isinstance(node.op, ast.UAdd):
+                    return +operand
+                if isinstance(node.op, ast.USub):
+                    return -operand
+                raise ValueError(f"Unsupported unary operator: {type(node.op)}")
+            if isinstance(node, ast.BinOp):
+                left = _eval(node.left)
+                right = _eval(node.right)
+                if isinstance(node.op, ast.Add):
+                    return left + right
+                if isinstance(node.op, ast.Sub):
+                    return left - right
+                if isinstance(node.op, ast.Mult):
+                    return left * right
+                if isinstance(node.op, ast.Div):
+                    return left / right
+                if isinstance(node.op, ast.Mod):
+                    return left % right
+                raise ValueError(f"Unsupported binary operator: {type(node.op)}")
+            raise ValueError(f"Unsupported expression node: {type(node)}")
+
+        return _eval(node)
+
+    def _safe_eval_condition_ast(self, expression):
+        """Evaluate a condition expression using AST with safe operators only."""
+        node = ast.parse(expression, mode='eval')
+
+        def _eval(node):
+            if isinstance(node, ast.Expression):
+                return _eval(node.body)
+            if isinstance(node, ast.Constant):
+                return node.value
+            if isinstance(node, ast.Name):
+                if node.id == 'True':
+                    return True
+                if node.id == 'False':
+                    return False
+                if node.id == 'None':
+                    return None
+                raise ValueError(f"Unsupported name: {node.id}")
+            if isinstance(node, ast.UnaryOp):
+                operand = _eval(node.operand)
+                if isinstance(node.op, ast.Not):
+                    return not operand
+                if isinstance(node.op, ast.UAdd):
+                    return +operand
+                if isinstance(node.op, ast.USub):
+                    return -operand
+                raise ValueError(f"Unsupported unary operator: {type(node.op)}")
+            if isinstance(node, ast.BoolOp):
+                values = [_eval(v) for v in node.values]
+                if isinstance(node.op, ast.And):
+                    result = True
+                    for value in values:
+                        result = result and value
+                        if not result:
+                            break
+                    return result
+                if isinstance(node.op, ast.Or):
+                    result = False
+                    for value in values:
+                        result = result or value
+                        if result:
+                            break
+                    return result
+                raise ValueError(f"Unsupported bool operator: {type(node.op)}")
+            if isinstance(node, ast.Compare):
+                left = _eval(node.left)
+                for op, comparator in zip(node.ops, node.comparators):
+                    right = _eval(comparator)
+                    if isinstance(op, ast.Eq):
+                        if not (left == right):
+                            return False
+                    elif isinstance(op, ast.NotEq):
+                        if not (left != right):
+                            return False
+                    elif isinstance(op, ast.Lt):
+                        if not (left < right):
+                            return False
+                    elif isinstance(op, ast.LtE):
+                        if not (left <= right):
+                            return False
+                    elif isinstance(op, ast.Gt):
+                        if not (left > right):
+                            return False
+                    elif isinstance(op, ast.GtE):
+                        if not (left >= right):
+                            return False
+                    else:
+                        raise ValueError(f"Unsupported comparison: {type(op)}")
+                    left = right
+                return True
+            if isinstance(node, ast.BinOp):
+                left = _eval(node.left)
+                right = _eval(node.right)
+                if isinstance(node.op, ast.Add):
+                    return left + right
+                if isinstance(node.op, ast.Sub):
+                    return left - right
+                if isinstance(node.op, ast.Mult):
+                    return left * right
+                if isinstance(node.op, ast.Div):
+                    return left / right
+                if isinstance(node.op, ast.Mod):
+                    return left % right
+                raise ValueError(f"Unsupported binary operator: {type(node.op)}")
+            raise ValueError(f"Unsupported expression node: {type(node)}")
+
+        return _eval(node)
+
     # --- Sequence Management ---
     def add_sequence(self, sequence):
         if isinstance(sequence, AutomationSequence):
@@ -2192,17 +2387,19 @@ class AutomationManager(QObject):
             
     def start_sequence(self, sequence):
         if sequence in self.sequences and sequence not in self.active_sequences:
-            self.active_sequences.add(sequence)
-            # Pass the current context to the sequence
             self.update_context({}) # Ensure latest context vars are included
-            # Add sequence info to context for event logging and flow control
-            self.app_context['current_sequence_name'] = sequence.name
-            self.app_context['current_sequence'] = sequence
+            # Shared context keeps sensors/events; per-sequence identity is
+            # injected in AutomationSequence._execution_context() so concurrent
+            # sequences do not overwrite each other's JUMP/CONDITION target.
             sequence.set_context(self.app_context)
             # Store reference to manager in sequence for event logging
             sequence.manager = self
             sequence.start()
-            self.status_changed.emit()
+            if sequence.is_running:
+                self.active_sequences.add(sequence)
+                self.status_changed.emit()
+            else:
+                print(f"[Automation] Sequence '{sequence.name}' failed to start; not added to active set.")
         elif sequence in self.active_sequences:
              print(f"Sequence '{sequence.name}' is already running.")
         else:
@@ -2229,7 +2426,11 @@ class AutomationManager(QObject):
             print("Error: No sequence file path set for saving.")
             return
 
-        # Check for replay mode via app_context
+        # Check for review/idle-with-loaded-run via is_replay_mode (NOT replay_mode_enabled).
+        # While reviewing, save to the MASTER/global sequences file so edits become the
+        # template for the next run — same pattern as sensors.json → ~/.artefakt_daq.
+        # Do not overwrite the historical run's automation_sequences.json.
+        # New-run setup copies/points sequences via automation_controller.update_sequence_path().
         main_window = self.app_context.get('main_window')
         is_replay = getattr(main_window, 'is_replay_mode', False) if main_window else False
 
@@ -2239,23 +2440,22 @@ class AutomationManager(QObject):
             if directory:
                 os.makedirs(directory, exist_ok=True)
             
-            # Serialize sequences with error handling for each sequence
             sequences_data = []
             for i, seq in enumerate(self.sequences):
                 try:
-                    seq_dict = seq.to_dict()
-                    sequences_data.append(seq_dict)
+                    sequences_data.append(seq.to_dict())
                 except Exception as e:
                     print(f"Error serializing sequence {i} '{getattr(seq, 'name', 'Unknown')}': {e}")
                     traceback.print_exc()
-                    # Skip this sequence but continue with others
-                    continue
+                    raise ValueError(
+                        f"Aborting save: failed to serialize sequence '{getattr(seq, 'name', 'Unknown')}'"
+                    ) from e
             
             # Use atomic write: write to temporary file first, then rename
             # This ensures the file is either completely written or not at all
             
-            # If in replay mode, we skip saving to the specific run file (sequences_file)
-            # and instead save directly to the master file if it exists.
+            # Review/idle: write master template. Live/new-run: write sequences_file
+            # (usually the run folder), and also sync master below when different.
             target_file = self.master_file if is_replay and self.master_file else self.sequences_file
             
             if not target_file:

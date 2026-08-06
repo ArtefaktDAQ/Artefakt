@@ -600,6 +600,9 @@ class SensorCalibrationTool(QWidget):
         elif len(self.calibration_points) < 2:
             QMessageBox.warning(self, "Insufficient Points",
                               "Please add at least 2 calibration points for regression.")
+            self.calibration_result = None
+            self.apply_btn.setEnabled(False)
+            self._update_results_display()
             return
         elif method_id == 0:  # Linear
             self._calculate_linear()
@@ -641,6 +644,9 @@ class SensorCalibrationTool(QWidget):
         if len(self.calibration_points) <= degree:
             QMessageBox.warning(self, "Insufficient Points",
                               f"Need at least {degree + 1} points for degree {degree} polynomial.")
+            self.calibration_result = None
+            self.apply_btn.setEnabled(False)
+            self._update_results_display()
             return
         
         # Polynomial regression
