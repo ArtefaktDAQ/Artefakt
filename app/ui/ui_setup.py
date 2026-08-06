@@ -960,6 +960,7 @@ def setup_ui(self):
     self.replay_live_monitor_btn = QPushButton("Live")
     self.replay_live_monitor_btn.setCheckable(True)
     self.replay_live_monitor_btn.setFixedWidth(50)
+    self.replay_live_monitor_btn.setStyleSheet(ButtonStyles.live_monitor("small"))
     self.replay_live_monitor_btn.setToolTip(
         "Leave replay graph mode and show live hardware data. "
         "Click Play again to reload replay for the selected run."

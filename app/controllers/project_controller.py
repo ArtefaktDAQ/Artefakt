@@ -1516,6 +1516,14 @@ class ProjectController(QObject):
             except Exception as e:
                 self.main_window.logger.log(f"Error initializing replay after loading run: {str(e)}", "WARN")
 
+        # Belt-and-suspenders: always reload snapshots for this run_dir after replay
+        # init, in case an early return in on_replay_load_clicked left them cleared.
+        if hasattr(self.main_window, "load_snapshots_for_run"):
+            try:
+                self.main_window.load_snapshots_for_run(run_dir)
+            except Exception as e:
+                self.main_window.logger.log(f"Error loading snapshots for run: {str(e)}", "WARN")
+
         # Also trigger a refresh of the main graph based on current UI selections
         # We do this AFTER on_replay_load_clicked so dashboard_start_time is set
         if hasattr(self.main_window, 'update_graph'):

@@ -817,6 +817,43 @@ class ButtonStyles:
             }}
         """
 
+    @staticmethod
+    def live_monitor(size: str = "small") -> str:
+        """
+        Checkable Live-Monitor toggle for the dashboard replay bar.
+        Neutral when off; bright green when active so the state is obvious.
+        """
+        s = ButtonStyles._SIZES.get(size, ButtonStyles._SIZES["small"])
+        return f"""
+            QPushButton {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 {COLORS.BG_ELEVATED}, stop:1 {COLORS.BG_CARD});
+                color: {COLORS.TEXT_SECONDARY};
+                border: 1px solid {COLORS.BORDER_DEFAULT};
+                border-radius: {s['border_radius']};
+                padding: {s['padding']};
+                font-weight: 600;
+                font-size: {s['font_size']};
+            }}
+            QPushButton:hover {{
+                background: {COLORS.BG_ELEVATED};
+                color: {COLORS.TEXT_PRIMARY};
+                border-color: {COLORS.BORDER_HOVER};
+            }}
+            QPushButton:checked {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #5CFFA0, stop:0.45 {COLORS.SUCCESS_BRIGHT}, stop:1 #00B85A);
+                color: #0A1A10;
+                border: 1px solid #7DFFB5;
+                font-weight: 800;
+            }}
+            QPushButton:checked:hover {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #7DFFB5, stop:0.45 #2EE87A, stop:1 {COLORS.SUCCESS_BRIGHT});
+                border-color: #A8FFCD;
+            }}
+        """
+
 
 # =============================================================================
 # CARD STYLES (Dashboard-Karten, Stat-Cards, Info-Cards)

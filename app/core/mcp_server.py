@@ -50,7 +50,94 @@ class MCPServer(QObject):
         "list_serial_ports",
         "get_serial_sequence",
         "list_serial_sequences",
+        "list_camera_overlays",
     ]
+
+    # Central permission map: tool name -> QSettings key (ai_allow_*).
+    # Tools not listed here are always allowed (docs, status, discovery helpers).
+    TOOL_PERMISSIONS = {
+        # Sensor data
+        "get_sampling_rate": "ai_allow_sensor_data",
+        "query_sensor_data": "ai_allow_sensor_data",
+        "get_sensor_statistics": "ai_allow_sensor_data",
+        "get_data_summary": "ai_allow_sensor_data",
+        "get_available_sensors": "ai_allow_sensor_data",
+        "get_live_interface_data": "ai_allow_sensor_data",
+        "get_csv_preview": "ai_allow_sensor_data",
+        "get_audio_sensor_preview": "ai_allow_sensor_data",
+        # Notes
+        "get_notes": "ai_allow_notes",
+        "get_notes_html": "ai_allow_notes",
+        "edit_notes": "ai_allow_notes",
+        "insert_note_media": "ai_allow_notes",
+        "add_quick_note": "ai_allow_notes",
+        # Automation
+        "get_automation_info": "ai_allow_automation",
+        "save_automation_sequence": "ai_allow_automation",
+        "remove_automation_sequence": "ai_allow_automation",
+        "control_automation": "ai_allow_automation",
+        # Vision / camera
+        "get_graph_screenshot": "ai_allow_vision",
+        "list_camera_sources": "ai_allow_vision",
+        "connect_camera": "ai_allow_vision",
+        "disconnect_camera": "ai_allow_vision",
+        "get_camera_frame": "ai_allow_vision",
+        "get_optical_sensor_preview": "ai_allow_vision",
+        "manage_camera_overlay": "ai_allow_vision",
+        "list_camera_overlays": "ai_allow_vision",
+        "take_camera_snapshot": "ai_allow_vision",
+        "start_camera_recording": "ai_allow_vision",
+        "stop_camera_recording": "ai_allow_vision",
+        "set_camera_properties": "ai_allow_vision",
+        "set_motion_detection_settings": "ai_allow_vision",
+        # Projects / replay
+        "get_projects_list": "ai_allow_projects",
+        "set_active_project": "ai_allow_projects",
+        "configure_next_run": "ai_allow_projects",
+        "export_run": "ai_allow_projects",
+        "import_run": "ai_allow_projects",
+        "control_playback": "ai_allow_projects",
+        # Config / hardware / UI settings
+        "add_sensor": "ai_allow_config",
+        "remove_sensor": "ai_allow_config",
+        "edit_sensor": "ai_allow_config",
+        "update_sensor_settings": "ai_allow_config",
+        "configure_sensor_calibration": "ai_allow_config",
+        "toggle_interface_connection": "ai_allow_config",
+        "configure_interface": "ai_allow_config",
+        "configure_serial_sequence": "ai_allow_config",
+        "remove_serial_sequence": "ai_allow_config",
+        "update_interface_config": "ai_allow_config",
+        "test_serial_command": "ai_allow_config",
+        "write_mqtt_message": "ai_allow_config",
+        "set_graph_config": "ai_allow_config",
+        "set_dashboard_config": "ai_allow_config",
+        "update_app_settings": "ai_allow_config",
+        "save_plugin_code": "ai_allow_config",
+        "list_plugins": "ai_allow_config",
+        "read_plugin_code": "ai_allow_config",
+    }
+
+    PERMISSION_DENIED_MESSAGES = {
+        "ai_allow_sensor_data": "Sensor data access is disabled by the user.",
+        "ai_allow_notes": "Notes access is disabled by the user.",
+        "ai_allow_automation": "Automation control is disabled by the user.",
+        "ai_allow_vision": "Camera/vision control is disabled by the user.",
+        "ai_allow_projects": "Project and replay control is disabled by the user.",
+        "ai_allow_config": "Configuration changes are disabled by the user.",
+    }
+
+    # Settings the assistant must not change (privilege / connection hijack).
+    BLOCKED_APP_SETTINGS = frozenset({
+        "ai_api_key",
+        "ai_url",
+        "ai_model",
+        "ai_system_prompt",
+        "ai_timeout",
+        "ai_max_tool_iterations",
+        "ai_max_image_width",
+        "ai_image_quality",
+    })
 
     def __init__(self, main_window):
         super().__init__()
@@ -70,6 +157,13 @@ class MCPServer(QObject):
             val = self.main_window.settings.value(setting_key, "true")
             return str(val).lower() == "true"
         return True
+
+    def _permission_error(self, setting_key: str) -> Dict[str, Any]:
+        """Return a standard permission-denied payload for a setting key."""
+        msg = self.PERMISSION_DENIED_MESSAGES.get(
+            setting_key, "This action is disabled by the user."
+        )
+        return {"error": msg}
 
     def _app_root(self):
         import sys
@@ -141,6 +235,9 @@ class MCPServer(QObject):
         - timespan: one of ["10s", "30s", "1min", "5min", "15min", "30min", "1h", "3h", "6h", "12h", "24h", "All"].
         - camera_slots: list of 4 booleans for Cam 1-4.
         """
+        if not self._check_permission("ai_allow_config"):
+            return self._permission_error("ai_allow_config")
+
         if not self.main_window:
             return {"error": "Main window not available"}
             
@@ -197,6 +294,9 @@ class MCPServer(QObject):
         - control_run_offset: float (seconds) to shift control run data in time.
         - line_width: integer for plot line thickness.
         """
+        if not self._check_permission("ai_allow_config"):
+            return self._permission_error("ai_allow_config")
+
         if not self.main_window:
             return {"error": "Main window not available"}
             
@@ -272,6 +372,9 @@ class MCPServer(QObject):
         - position: time string like "12:21" or "12m 21s" or "0".
         - step_frames: integer (positive for forward, negative for backward).
         """
+        if not self._check_permission("ai_allow_projects"):
+            return self._permission_error("ai_allow_projects")
+
         if not self.main_window:
             return {"error": "Main window not available"}
             
@@ -321,6 +424,9 @@ class MCPServer(QObject):
 
     def add_quick_note(self, text: str) -> Dict[str, Any]:
         """Add a quick timestamped note to the current run or replay."""
+        if not self._check_permission("ai_allow_notes"):
+            return self._permission_error("ai_allow_notes")
+
         if not self.main_window:
             return {"error": "Main window not available"}
             
@@ -331,22 +437,72 @@ class MCPServer(QObject):
 
     def update_app_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Update application settings.
-        - settings: dictionary of key-value pairs to update in SettingsManager.
+        Update application settings via SettingsModel / QSettings.
+        - settings: dictionary of key-value pairs (flat keys, e.g. 'theme', 'plot_line_width').
         """
         if not self._check_permission("ai_allow_config"):
-            return {"error": "Configuration changes are disabled by the user."}
+            return self._permission_error("ai_allow_config")
 
-        if not hasattr(self.main_window, 'settings_manager'):
-            return {"error": "Settings manager not available"}
-            
-        results = []
+        sm = getattr(self.main_window, 'settings_model', None)
+        qsettings = getattr(self.main_window, 'settings', None)
+        if sm is None and qsettings is None:
+            return {"error": "Settings model not available"}
+
+        if not isinstance(settings, dict) or not settings:
+            return {"error": "settings must be a non-empty object of key-value pairs"}
+
+        # Keys known to SettingsModel plus a few commonly used QSettings keys
+        known_keys = set(sm.defaults.keys()) if sm is not None else set()
+        known_keys.update({
+            "global_sampling_rate",
+            "base_directory",
+            "camera_preview_fps",
+            "use_hw_accel",
+            "camera_auto_connect",
+        })
+
+        updated = []
+        errors = []
         for key, value in settings.items():
-            self.main_window.settings_manager.set(key, value)
-            results.append(f"Setting '{key}' set to {value}")
-            
-        self.main_window.settings_manager.save_settings()
-        return {"message": "; ".join(results) if results else "No changes applied"}
+            if not isinstance(key, str) or not key.strip():
+                errors.append(f"Invalid setting key: {key!r}")
+                continue
+            key = key.strip()
+
+            if key.startswith("ai_allow_") or key in self.BLOCKED_APP_SETTINGS:
+                errors.append(f"Setting '{key}' cannot be changed via the assistant")
+                continue
+
+            if key not in known_keys:
+                # Allow updating an already-existing QSettings key even if not in defaults
+                existing = qsettings.value(key, None) if qsettings is not None else None
+                if existing is None:
+                    errors.append(f"Unknown setting '{key}'")
+                    continue
+
+            # Persist booleans as "true"/"false" strings to match app convention
+            store_value = value
+            if isinstance(value, bool):
+                store_value = "true" if value else "false"
+
+            if sm is not None:
+                sm.set_value(key, store_value)
+            else:
+                qsettings.setValue(key, store_value)
+            updated.append(f"Setting '{key}' set to {store_value}")
+
+        if sm is not None:
+            sm.save_settings()
+        elif qsettings is not None:
+            qsettings.sync()
+
+        if not updated and errors:
+            return {"error": "; ".join(errors)}
+
+        result = {"message": "; ".join(updated) if updated else "No changes applied"}
+        if errors:
+            result["warnings"] = errors
+        return result
 
     def save_plugin_code(self, filename: str, code: str) -> Dict[str, Any]:
         """
@@ -1160,6 +1316,9 @@ class MCPServer(QObject):
 
     def list_camera_sources(self) -> Dict[str, Any]:
         """List all available local cameras and NDI sources."""
+        if not self._check_permission("ai_allow_vision"):
+            return self._permission_error("ai_allow_vision")
+
         if not hasattr(self.main_window, 'camera_controller'):
             return {"error": "Camera controller not available"}
             
@@ -1527,6 +1686,9 @@ class MCPServer(QObject):
 
     def get_audio_sensor_preview(self, sensor_name: str) -> Dict[str, Any]:
         """Get audio spectrum and level summary for a specific audio sensor interface."""
+        if not self._check_permission("ai_allow_sensor_data"):
+            return self._permission_error("ai_allow_sensor_data")
+
         sc = getattr(self.main_window, 'sensor_controller', None)
         if not sc:
             return {"error": "Sensor controller not available."}
@@ -1688,6 +1850,9 @@ class MCPServer(QObject):
 
     def list_camera_overlays(self, slot_index: int) -> Dict[str, Any]:
         """List all active overlays for a specific camera slot."""
+        if not self._check_permission("ai_allow_vision"):
+            return self._permission_error("ai_allow_vision")
+
         if not hasattr(self.main_window, 'camera_controller'):
             return {"error": "Camera controller not available"}
         
@@ -1828,6 +1993,9 @@ class MCPServer(QObject):
             manual_exposure: Set to True for manual exposure, False for auto.
             exposure_value: Exposure value (usually negative for webcams, e.g. -5 to -7).
         """
+        if not self._check_permission("ai_allow_vision"):
+            return self._permission_error("ai_allow_vision")
+
         if not hasattr(self.main_window, 'camera_controller'):
             return {"error": "Camera controller not available"}
             
@@ -1874,6 +2042,9 @@ class MCPServer(QObject):
             sensitivity: 0-100 (lower is more sensitive for background subtraction).
             min_area: Minimum pixel area for a moving object to trigger detection (e.g. 500).
         """
+        if not self._check_permission("ai_allow_vision"):
+            return self._permission_error("ai_allow_vision")
+
         if not hasattr(self.main_window, 'camera_controller'):
             return {"error": "Camera controller not available"}
             
@@ -1918,6 +2089,9 @@ class MCPServer(QObject):
         Args:
             slot_index: 0-3.
         """
+        if not self._check_permission("ai_allow_vision"):
+            return self._permission_error("ai_allow_vision")
+
         if not hasattr(self.main_window, 'camera_controller'):
             return {"error": "Camera controller not available"}
             
@@ -1971,6 +2145,9 @@ class MCPServer(QObject):
         """
         Update sensor management settings like activation, smoothing, stale timeout, and axis assignment.
         """
+        if not self._check_permission("ai_allow_config"):
+            return self._permission_error("ai_allow_config")
+
         sc = getattr(self.main_window, 'sensor_controller', None)
         dcc = getattr(self.main_window, 'data_collection_controller', None)
         
@@ -2090,6 +2267,9 @@ class MCPServer(QObject):
         """
         Edit core sensor properties like name, hardware port, or measurement unit.
         """
+        if not self._check_permission("ai_allow_config"):
+            return self._permission_error("ai_allow_config")
+
         sc = getattr(self.main_window, 'sensor_controller', None)
         if not sc:
             return {"error": "Sensor controller not available."}
@@ -2818,6 +2998,9 @@ class MCPServer(QObject):
 
     def configure_sensor_calibration(self, sensor_name: str, offset: Optional[float] = None, factor: Optional[float] = None, unit: Optional[str] = None) -> Dict[str, Any]:
         """Update calibration parameters (offset, factor, unit) for a sensor."""
+        if not self._check_permission("ai_allow_config"):
+            return self._permission_error("ai_allow_config")
+
         sc = getattr(self.main_window, 'sensor_controller', None)
         if not sc:
             return {"error": "Sensor controller not available."}
@@ -3049,6 +3232,9 @@ class MCPServer(QObject):
         Update the global configuration for a hardware interface (e.g., change baud rate, port).
         Note: This might require a reconnection to take effect.
         """
+        if not self._check_permission("ai_allow_config"):
+            return self._permission_error("ai_allow_config")
+
         # For built-in interfaces, update SettingsModel
         built_ins = {
             "Arduino": {"port": "arduino_port", "baud_rate": "arduino_baud", "poll_interval": "arduino_poll_interval"},
@@ -3158,6 +3344,9 @@ class MCPServer(QObject):
         """
         Configure hardware-specific settings for a sensor's interface (e.g., ROI for optical, gain for audio).
         """
+        if not self._check_permission("ai_allow_config"):
+            return self._permission_error("ai_allow_config")
+
         sc = getattr(self.main_window, 'sensor_controller', None)
         if not sc:
             return {"error": "Sensor controller not available."}
@@ -3552,6 +3741,9 @@ class MCPServer(QObject):
         """
         Permanently remove a custom serial sequence.
         """
+        if not self._check_permission("ai_allow_config"):
+            return self._permission_error("ai_allow_config")
+
         dcc = getattr(self.main_window, 'data_collection_controller', None)
         if not dcc:
             return {"error": "Data collection controller not available."}
@@ -3933,6 +4125,11 @@ class MCPServer(QObject):
                 "parameters": {"type": "object", "properties": {}}
             },
             {
+                "name": "get_sampling_rate",
+                "description": "Get the current global sampling rate in Hz.",
+                "parameters": {"type": "object", "properties": {}}
+            },
+            {
                 "name": "set_graph_config",
                 "description": "Configure the main graph view options including type, sensors, and styling. CRITICAL: Only include the parameters that the user explicitly asked to change or that are strictly necessary for the new view. Do NOT change styling (like style_preset) unless requested.",
                 "parameters": {
@@ -4178,6 +4375,46 @@ class MCPServer(QObject):
                 }
             },
             {
+                "name": "list_camera_overlays",
+                "description": "List all active overlays for a camera slot. Use this to find overlay_id before update/remove.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "slot_index": {"type": "integer", "description": "0-3. 0='cam1', 1='cam2', etc."}
+                    },
+                    "required": ["slot_index"]
+                }
+            },
+            {
+                "name": "set_camera_properties",
+                "description": "Adjust camera hardware properties like focus and exposure for a connected camera slot.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "slot_index": {"type": "integer", "description": "0-3"},
+                        "manual_focus": {"type": "boolean", "description": "True for manual focus, False for auto"},
+                        "focus_value": {"type": "integer", "description": "0-255 when manual_focus is True"},
+                        "manual_exposure": {"type": "boolean", "description": "True for manual exposure, False for auto"},
+                        "exposure_value": {"type": "integer", "description": "Exposure value (often negative for webcams, e.g. -5 to -7)"}
+                    },
+                    "required": ["slot_index"]
+                }
+            },
+            {
+                "name": "set_motion_detection_settings",
+                "description": "Configure motion detection for a camera slot (enable/disable, sensitivity, min area).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "slot_index": {"type": "integer", "description": "0-3"},
+                        "enabled": {"type": "boolean"},
+                        "sensitivity": {"type": "integer", "description": "0-100 (lower is more sensitive)"},
+                        "min_area": {"type": "integer", "description": "Minimum pixel area to trigger detection (e.g. 500)"}
+                    },
+                    "required": ["slot_index"]
+                }
+            },
+            {
                 "name": "take_camera_snapshot",
                 "description": "Capture a high-quality frame from a camera and save it to the project's Snapshots folder.",
                 "parameters": {
@@ -4292,11 +4529,11 @@ class MCPServer(QObject):
             },
             {
                 "name": "update_app_settings",
-                "description": "Update application settings (e.g., video quality, log levels).",
+                "description": "Update application settings stored in SettingsModel/QSettings (e.g. theme, plot_line_width, graph_update_interval, camera_framerate). Pass flat key-value pairs. Cannot change AI permission or connection settings.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "settings": {"type": "object", "description": "Key-value pairs of settings to update"}
+                        "settings": {"type": "object", "description": "Key-value pairs of settings to update (e.g. {\"theme\": \"dark\", \"plot_line_width\": 3})"}
                     },
                     "required": ["settings"]
                 }
@@ -4434,6 +4671,9 @@ class MCPServer(QObject):
             "write_mqtt_message": self.write_mqtt_message,
             "get_csv_preview": self.get_csv_preview,
             "manage_camera_overlay": self.manage_camera_overlay,
+            "list_camera_overlays": self.list_camera_overlays,
+            "set_camera_properties": self.set_camera_properties,
+            "set_motion_detection_settings": self.set_motion_detection_settings,
             "take_camera_snapshot": self.take_camera_snapshot,
             "start_camera_recording": self.start_camera_recording,
             "stop_camera_recording": self.stop_camera_recording,
@@ -4465,6 +4705,11 @@ class MCPServer(QObject):
             "read_plugin_code": self.read_plugin_code
         }
         
+        # Central permission gate (covers tools that forgot method-level checks)
+        required_perm = self.TOOL_PERMISSIONS.get(clean_name)
+        if required_perm and not self._check_permission(required_perm):
+            return self._permission_error(required_perm)
+
         func = mapping.get(clean_name)
         
         if func:

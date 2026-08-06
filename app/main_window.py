@@ -5957,6 +5957,17 @@ class DAQApp(QMainWindow):
         # Load metadata and sync first frame
         self._load_replay_video_metadata(run_dir)
         self._update_replay_frame(0.0, update_sliders=True, force_video_seek=True)
+
+        # After seek-to-0, keep a visible snapshot preview (first image) so runs
+        # whose first capture is late (e.g. ~35s) are not shown as empty.
+        if getattr(self, "snapshot_paths", None):
+            if self.current_snapshot_index < 0:
+                self.current_snapshot_index = 0
+            self._update_snapshot_display()
+            try:
+                QTimer.singleShot(150, self._update_snapshot_display)
+            except Exception:
+                pass
         
         # Ensure audio UI is in sync after loading
         self._apply_media_audio_state()
@@ -7019,6 +7030,10 @@ class DAQApp(QMainWindow):
 
     def load_snapshots_for_run(self, run_dir):
         """Load all snapshots from the run directory's Snapshots subfolder."""
+        # Always invalidate pixmap cache so the next display reloads from disk
+        self._current_snapshot_pixmap_cache = None
+        self._current_snapshot_path_cache = None
+
         if not run_dir or not os.path.exists(run_dir):
             self.snapshot_paths = []
             self.snapshot_data = []
@@ -7034,6 +7049,8 @@ class DAQApp(QMainWindow):
             self.current_snapshot_index = -1
             self.last_sync_snapshot_index = -1
             self._update_snapshot_display()
+            if hasattr(self, 'logger'):
+                self.logger.log(f"No Snapshots folder in run: {run_dir}", "INFO")
             return
 
         # Get run start time for relative sync
@@ -7047,26 +7064,67 @@ class DAQApp(QMainWindow):
             for f in os.listdir(snapshots_dir):
                 if f.lower().endswith(('.png', '.jpg', '.jpeg')):
                     path = os.path.join(snapshots_dir, f)
-                    mtime = os.path.getmtime(path)
-                    # Estimate relative time from run start
-                    rel_time = max(0.0, mtime - run_start_ts) if run_start_ts > 0 else 0.0
+                    rel_time = self._snapshot_rel_time(path, f, run_start_ts)
                     files_data.append({"path": path, "rel_time": rel_time})
             
             # Sort by relative time (chronological)
-            files_data.sort(key=lambda x: x["rel_time"])
+            files_data.sort(key=lambda x: (x["rel_time"], x["path"]))
             self.snapshot_data = files_data
             self.snapshot_paths = [x["path"] for x in files_data]
             
+            # Always show the first snapshot when any exist so loading a historical
+            # run never leaves the Image panel blank just because the playhead is
+            # still before the first capture time (often 10–40s into the run).
             if self.snapshot_paths:
-                self.current_snapshot_index = len(self.snapshot_paths) - 1 # Show latest by default
+                self.current_snapshot_index = 0
             else:
                 self.current_snapshot_index = -1
             
             self.last_sync_snapshot_index = -1
             self._update_snapshot_display()
+            if hasattr(self, 'logger'):
+                self.logger.log(
+                    f"Loaded {len(self.snapshot_paths)} snapshot(s) from {snapshots_dir}"
+                    + (f" (first at {files_data[0]['rel_time']:.1f}s)" if files_data else ""),
+                    "INFO",
+                )
         except Exception as e:
             if hasattr(self, 'logger'):
                 self.logger.log(f"Error loading snapshots: {e}", "ERROR")
+
+    def _snapshot_rel_time(self, path: str, filename: str, run_start_ts: float) -> float:
+        """Estimate snapshot time relative to run start.
+
+        Prefer the timestamp encoded in the filename
+        (snapshot_cam1_YYYYMMDD_HHMMSS_mmm.ext); fall back to file mtime.
+        """
+        parsed_ts = None
+        try:
+            stem = os.path.splitext(filename)[0]
+            # snapshot_cam1_20260112_174514_510  OR  snapshot_20260112_174514_510
+            parts = stem.split("_")
+            if len(parts) >= 4:
+                # Find YYYYMMDD + HHMMSS pair
+                for i in range(len(parts) - 1):
+                    date_part, time_part = parts[i], parts[i + 1]
+                    if len(date_part) == 8 and date_part.isdigit() and len(time_part) == 6 and time_part.isdigit():
+                        dt = datetime.datetime.strptime(f"{date_part}_{time_part}", "%Y%m%d_%H%M%S")
+                        parsed_ts = dt.timestamp()
+                        if i + 2 < len(parts) and parts[i + 2].isdigit():
+                            parsed_ts += int(parts[i + 2]) / 1000.0
+                        break
+        except Exception:
+            parsed_ts = None
+
+        if parsed_ts is None:
+            try:
+                parsed_ts = os.path.getmtime(path)
+            except OSError:
+                return 0.0
+
+        if run_start_ts and run_start_ts > 0:
+            return max(0.0, parsed_ts - run_start_ts)
+        return 0.0
 
     def _sync_snapshots_to_replay(self, rel_time):
         """Automatically switch snapshots based on replay playhead time."""
@@ -7074,16 +7132,23 @@ class DAQApp(QMainWindow):
             return
 
         # Find the latest snapshot that was taken before or at rel_time
-        # Since snapshot_data is sorted by rel_time, we can just iterate
         found_index = -1
         for i, snap in enumerate(self.snapshot_data):
             if snap["rel_time"] <= rel_time:
                 found_index = i
             else:
                 break
-        
-        # If the snapshot has changed and we found one, update the display
-        if found_index != -1 and found_index != self.last_sync_snapshot_index:
+
+        if found_index < 0:
+            # Playhead is before the first capture. Keep a preview of the first
+            # image so the panel is not blank after loading a run.
+            if self.current_snapshot_index != 0:
+                self.current_snapshot_index = 0
+                self._update_snapshot_display()
+            self.last_sync_snapshot_index = -1
+            return
+
+        if found_index != self.last_sync_snapshot_index:
             self.current_snapshot_index = found_index
             self.last_sync_snapshot_index = found_index
             self._update_snapshot_display()
@@ -7097,8 +7162,9 @@ class DAQApp(QMainWindow):
             path = self.snapshot_paths[self.current_snapshot_index]
             
             # Cache the pixmap to avoid repeated disk reads during resize events
-            if not hasattr(self, '_current_snapshot_pixmap_cache') or \
-               getattr(self, '_current_snapshot_path_cache', None) != path:
+            cache_missing = getattr(self, '_current_snapshot_pixmap_cache', None) is None
+            cache_stale = getattr(self, '_current_snapshot_path_cache', None) != path
+            if cache_missing or cache_stale:
                 self._current_snapshot_pixmap_cache = QPixmap(path)
                 self._current_snapshot_path_cache = path
                 
@@ -7132,10 +7198,12 @@ class DAQApp(QMainWindow):
                 self.dashboard_snapshot_label.setText("Error loading image")
                 self.dashboard_snapshot_label.setPixmap(QPixmap())
                 self._current_snapshot_pixmap_cache = None
+                self._current_snapshot_path_cache = None
         else:
             self.dashboard_snapshot_label.setText("No image available")
             self.dashboard_snapshot_label.setPixmap(QPixmap())
             self._current_snapshot_pixmap_cache = None
+            self._current_snapshot_path_cache = None
             if hasattr(self, 'dashboard_snapshot_group'):
                 self.dashboard_snapshot_group.setTitle("Last Images")
 
