@@ -5,16 +5,21 @@ A comprehensive Data Acquisition (DAQ) system built with Python and PyQt6.
 ## Features
 
 - **Multi-device Support**: Compatible with Arduino, LabJack U3 and T-series devices (T4, T7) and other serial devices by a configurable interface
-- **Real-time Data Visualization**: Live plotting and monitoring capabilities
+- **Plugin System**: Modular inbound (sensor) and outbound plugins via the `plugins/` directory, without modifying core code
+- **Outbound Interfaces**: Push live data to external consumers (includes a demo outbound plugin)
+- **CSV as a Sensor Source**: Import external CSV data as sensor signals
+- **AI Assistant & MCP Server**: Built-in AI chat assistant with MCP tool access for project management, hardware control, data analysis, and plugin development
+- **Multi-Camera Support**: Run and manage multiple cameras in parallel, with per-camera auto-record
+- **Real-time Data Visualization**: Live plotting and monitoring, including dual Y-axis graphs for signals with different scales
 - **Video Integration**: NDI video streaming and FFmpeg-based video processing
 - **Webcam + Microphone Devices**: Treat built-in webcam and microphone as sensors with optical modes for Light Events, Brightness, Color Tracking, Position Tracking, Particle Counter, and Fill Level
 - **Remote DAQ (gRPC)**: Stream live sensor data and video feeds between Artefakt instances over LAN/VPN for distributed acquisition and remote monitoring
 - **Control Run Overlay**: Load previous runs as control data, time-align them, and overlay control signals on live graphs for side-by-side comparison
 - **Replay with Video Sync**: Play back recorded runs with time-synchronized video/audio and sensor data using a replay playhead and speed controls
 - **Data Export**: Export data in various formats (CSV, JSON, etc.)
-- **Modern UI**: Dark-themed interface with intuitive controls
+- **Modern UI**: Dark-themed interface with intuitive controls and resizable layout
 - **Configurable Settings**: Customizable acquisition parameters and device settings
-- **Automation Capabilities**: Comprehensive automation framework with time-based triggers (specific times, duration intervals), sensor value thresholds, event-driven sequences, and multi-step programmable control workflows for unattended operation
+- **Automation Capabilities**: Comprehensive automation framework with time-based triggers, sensor thresholds, multi-step workflows, and reusable automation templates
 - **On-Demand Tools Window (Ctrl+Shift+T)**: FFT analyzer, sensor calibration, stats dashboard, diagnostics, calculator
 
 ## Requirements
@@ -39,10 +44,10 @@ You can use Artefakt DAQ in two ways: as a standalone executable or by running f
 ### Option 1: Standalone Executable (Recommended for End Users)
 
 #### Download and Setup
-1. Download the latest `Artefakt_DAQ_v0.3.0.exe` from the [releases section](https://github.com/ArtefaktDAQ/Artefakt/releases)
+1. Download the latest `Artefakt_DAQ_v0.4.0.exe` from the [releases section](https://github.com/ArtefaktDAQ/Artefakt/releases)
 2. Create a folder for the application (e.g., `C:\Artefakt_DAQ\`)
 3. Place the executable in this folder
-4. Double-click `Artefakt_DAQ_v0.3.0.exe` to launch
+4. Double-click `Artefakt_DAQ_v0.4.0.exe` to launch
 
 ### Option 2: Running from Source Code
 
@@ -85,15 +90,16 @@ python main.py
 
 #### Key Features
 - **Dashboard**: Overview of all connected devices and current status
-- **Sensors**: Configure and monitor sensor inputs
-- **Camera**: Video capture and recording with overlay support
+- **Sensors**: Configure and monitor sensor inputs, including CSV sources and plugins
+- **Camera**: Multi-camera capture and recording with overlay support and NDI
 - **Microphone**: Capture audio as a first-class sensor for analysis and synchronized recording
 - **Webcam as Device**: Record webcam video with sensor overlays and optional microphone audio; optical sensor modes include Light Events, Brightness, Color Tracking, Position Tracking, Particle Counter, and Fill Level
+- **AI Assistant**: Chat-based help and control via the built-in MCP server
 - **Remote DAQ (gRPC)**: Connect to another Artefakt instance on the network to stream data and video in real time
 - **Control Runs**: Load a prior experiment as a control, shift its start time, and overlay its signals on live plots
 - **Replay**: Time-synced playback of recorded data with linked video/audio and adjustable speed
 - **Tools Window**: Popup toolbox (Ctrl+Shift+T) for diagnostics, calibration, and analysis aids
-- **Automation**: Set up sequences to automate things
+- **Automation**: Set up sequences and templates to automate experiments
 - **Projects**: Organize and manage different experimental setups
 - **Settings**: Configure devices, file paths, and application preferences
 
@@ -122,12 +128,13 @@ The executable will be created in the `dist/` folder as `Artefakt_DAQ.exe`.
 
 ```
 ├── app/                    # Main application package
-│   ├── core/              # Core functionality
+│   ├── core/              # Core functionality (incl. MCP server, docs)
 │   ├── ui/                # User interface components
 │   ├── controllers/       # Device controllers
 │   ├── models/           # Data models
 │   ├── utils/            # Utility functions
 │   └── settings/         # Configuration management
+├── plugins/              # Inbound/outbound plugin examples
 ├── assets/               # Images and icons
 ├── data/                 # Data storage directory
 ├── templates/            # Template files

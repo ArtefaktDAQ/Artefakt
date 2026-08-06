@@ -2,15 +2,15 @@
 Artefakt DAQ Application Package
 """
 
-__version__ = "0.3.1-beta"
+__version__ = "0.4.0"
 __author__ = "Artefakt"
 __description__ = "Data Acquisition System for Laboratory Equipment"
 __license__ = "GPL-3.0"
 
 # Version components for programmatic access
 VERSION_MAJOR = 0
-VERSION_MINOR = 3
-VERSION_PATCH = 1
+VERSION_MINOR = 4
+VERSION_PATCH = 0
 VERSION_BUILD = None  # For development builds
 
 def get_version_string():

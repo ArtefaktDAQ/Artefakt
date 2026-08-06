@@ -1,16 +1,24 @@
 # Changelog
 
-## Version 0.3.1-beta - 2026-01-05
+## Version 0.4.0 - 2026-08-06
 
-### Changes:
-- **Addition of CSV as a sensor source**: Allows importing external data as sensor signals.
-- **Upgraded NDI functions**: Enhanced Network Device Interface support for better video streaming and discovery.
+### Major Features & Improvements:
+- **AI Assistant & MCP Server**: Integrated AI chat assistant with MCP tool access for project management, hardware control, data analysis, and plugin development.
+- **Plugin System**: Modular inbound (sensor) and outbound plugin architecture via the `plugins/` directory, without modifying core code.
+- **Outbound Interfaces**: Push live data to external consumers; includes demo outbound plugin.
+- **Multi-Camera Support**: Run and manage multiple cameras in parallel, with per-camera auto-record.
+- **CSV as a Sensor Source**: Import external CSV data as sensor signals.
+- **Upgraded NDI**: Enhanced Network Device Interface support for video streaming and discovery.
+- **Dual Y-Axis Graphs**: Second Y-axis for comparing signals with different scales.
+- **Automation Templates**: Reusable automation sequence templates for faster setup.
+- **UI & Performance**: Taller/resizable layout, Data Flow tab updates, camera/UI speed optimizations, graph refresh rate in settings.
 
-## Version 0.3 - 2026-01-03
-
-### Changes:
-- Initial release
-
+### Fixes:
+- Automation sequence step advancement and Arduino automation command handling
+- Camera cleanup when NDI is active; loading camera settings from older versions
+- Graph view switching, replay snapshot display, and AI tool permissions/catalog
+- MQTT template and CSV delimiter handling
+- FFmpeg update
 
 ## Version 0.3.0 - 2026-01-01
 
@@ -38,5 +46,3 @@
 - Added build and release scripts
 - Added trademark clarification in README
 - Initial commit: Artefakt DAQ (5af6887)
-
-
